@@ -403,3 +403,19 @@ class AttestationResponse(BaseModel):
 class AttestationListResponse(BaseModel):
     items: list[AttestationResponse]
     count: int
+
+
+class TrustEvaluationResponse(BaseModel):
+    """An on-demand trust evaluation of a claim or evidence bundle.
+
+    The count is the number of distinct verified signer subjects attesting
+    the exact target; the decision is ``"trusted"`` once that count reaches
+    ``min_signers`` and ``"untrusted"`` otherwise. The evaluation persists
+    nothing: it has no resource id and creates no audit event.
+    """
+
+    target_type: Literal["claim", "evidence_bundle"]
+    target_id: str
+    min_signers: int
+    qualified_signer_count: int
+    decision: Literal["trusted", "untrusted"]

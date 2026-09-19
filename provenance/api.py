@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
-from provenance import pagination, service
+from provenance import pagination, service, signing
 from provenance.errors import LineageValidationError
 from provenance.models import RELATION_DERIVED_FROM, RELATION_VERSION_OF
 from provenance.pagination import InvalidCursorError
@@ -34,6 +34,7 @@ from provenance.schemas import (
     EvidenceBundleListResponse,
     EvidenceBundlePageResponse,
     EvidenceBundleResponse,
+    TrustEvaluationResponse,
 )
 
 router = APIRouter(prefix="/v1")
@@ -564,3 +565,66 @@ def list_attestations(
         items=[_attestation_response(item) for item in items],
         count=len(items),
     )
+
+
+_TRUST_EVALUATION_PARAMS = frozenset({"target_type", "target_id", "min_signers"})
+
+
+@router.get("/trust-evaluations", response_model=TrustEvaluationResponse)
+def get_trust_evaluation(
+    request: Request, session: DbSession
+) -> TrustEvaluationResponse:
+    # Raw multi-values are inspected deliberately like the other query APIs:
+    # a repeated scalar is rejected instead of silently taking the last
+    # value, blank identifiers are never normalized away, and a
+    # ``min_signers`` such as "+1" or " 1 " is never coerced.
+    raw = request.query_params
+
+    for field in raw.keys():
+        if field not in _TRUST_EVALUATION_PARAMS:
+            # Unknown parameters are malformed input rather than silently
+            # ignored: nothing is defaulted on the reviewer's behalf.
+            raise _query_validation_error(
+                field, "unknown query parameter", "value_error.unknown"
+            )
+
+    target_type = _parse_once(raw, "target_type")
+    if target_type is None:
+        raise _query_validation_error(
+            "target_type", "Field required", "value_error.missing"
+        )
+    if target_type not in signing.ATTESTATION_TARGET_TYPES:
+        # Covers missing values, whitespace/blank strings, and anything other
+        # than the two literal target types.
+        raise _query_validation_error(
+            "target_type",
+            "target_type must be 'claim' or 'evidence_bundle'",
+            "value_error",
+        )
+
+    target_id = _parse_once(raw, "target_id")
+    if target_id is None:
+        raise _query_validation_error(
+            "target_id", "Field required", "value_error.missing"
+        )
+    if not target_id.strip():
+        # A blank identifier is invalid rather than matched against nothing.
+        raise _query_validation_error(
+            "target_id", "target_id must not be empty", "value_error"
+        )
+
+    min_signers = _parse_int_param(
+        raw,
+        "min_signers",
+        service.DEFAULT_TRUST_MIN_SIGNERS,
+        service.MIN_TRUST_MIN_SIGNERS,
+        service.MAX_TRUST_MIN_SIGNERS,
+    )
+
+    # Parameters are fully validated first; a structurally valid request for
+    # an unknown target is then a missing resource (404 by declared type),
+    # never an "untrusted" evaluation of nothing.
+    result = service.evaluate_trust(
+        session, target_type, target_id, min_signers
+    )
+    return TrustEvaluationResponse(**result)
