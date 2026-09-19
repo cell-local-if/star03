@@ -46,11 +46,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.engine = engine
     app.state.session_factory = session_factory
-    # Per-process HMAC secret for opaque lineage pagination cursors. Cursors
-    # are stateless and only valid within the process that minted them; a
-    # restart rotates the secret and renders outstanding cursors invalid
-    # (reported as 422 validation_error) rather than guessable.
+    # Per-process HMAC secrets for opaque pagination cursors. Each cursor
+    # family holds its own secret, so a token minted for one read endpoint
+    # can never authenticate against another even though both are signed
+    # tokens. Cursors are stateless and only valid within the process that
+    # minted them; a restart rotates the secrets and renders outstanding
+    # cursors invalid (reported as 422 validation_error) rather than
+    # guessable.
     app.state.lineage_cursor_secret = secrets.token_bytes(32)
+    app.state.evidence_bundle_cursor_secret = secrets.token_bytes(32)
 
     register_exception_handlers(app)
     app.include_router(v1_router)

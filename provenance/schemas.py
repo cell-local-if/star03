@@ -300,6 +300,19 @@ class EvidenceBundleListResponse(BaseModel):
     count: int
 
 
+class EvidenceBundlePageResponse(BaseModel):
+    """A filtered page of evidence bundles for one content.
+
+    ``count`` is the total number of bundles matching the (possibly empty)
+    filter set, independent of the page returned; ``next_cursor`` is an
+    opaque server token for the next page or ``None`` on the final page.
+    """
+
+    items: list[EvidenceBundleResponse]
+    count: int
+    next_cursor: str | None = None
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)

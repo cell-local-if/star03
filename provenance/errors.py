@@ -126,11 +126,13 @@ class AttestationVerificationError(DomainError):
         super().__init__(details=details)
 
 
-class LineageValidationError(DomainError):
-    """A malformed lineage query (``direction`` / ``max_depth``).
+class QueryValidationError(DomainError):
+    """A malformed read-only list/traversal query (query-string parameters).
 
     Renders with the same ``validation_error`` code and issue-shaped details
-    as request-body validation failures.
+    as request-body validation failures, so missing, blank, illegal,
+    repeated, or mismatching query parameters are indistinguishable to
+    clients from any other 422.
     """
 
     status_code = 422
@@ -139,6 +141,11 @@ class LineageValidationError(DomainError):
 
     def __init__(self, issues: list[dict]):
         super().__init__(details={"issues": issues})
+
+
+# Backwards-compatible alias for the lineage-era name; the rendered error
+# code and structure are unchanged.
+LineageValidationError = QueryValidationError
 
 
 def _validation_body(exc: RequestValidationError) -> dict:
