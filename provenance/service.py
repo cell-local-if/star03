@@ -636,22 +636,33 @@ DEFAULT_LINEAGE_MAX_DEPTH = 8
 MIN_LINEAGE_MAX_DEPTH = 1
 MAX_LINEAGE_MAX_DEPTH = 32
 
+DEFAULT_LINEAGE_MIN_DEPTH = 1
+MIN_LINEAGE_MIN_DEPTH = 1
+MAX_LINEAGE_MIN_DEPTH = 32
+
+DEFAULT_LINEAGE_LIMIT = 50
+MIN_LINEAGE_LIMIT = 1
+MAX_LINEAGE_LIMIT = 100
+
 
 def get_content_lineage(
     session: Session,
     content_id: str,
     direction: str,
     max_depth: int = DEFAULT_LINEAGE_MAX_DEPTH,
-) -> list[tuple[Content, int]]:
-    """Return reachable contents as ``(content, depth)`` pairs.
+) -> list[tuple[Content, int, str]]:
+    """Return reachable contents as ``(content, depth, relation_type)`` triples.
 
     Ancestor traversal follows edges from a content to its direct source
     (``content_id -> parent_content_id``); descendant traversal follows them
     in reverse. The origin is never included. Only contents reachable within
     ``max_depth`` edges are returned; each content appears once at its
-    shortest depth. Pairs are ordered by depth ascending; within one depth,
+    shortest depth. Triples are ordered by depth ascending; within one depth,
     contents are ordered by the stable creation order of the edge through
-    which they were first reached.
+    which they were first reached. The third element is the
+    ``relation_type`` of that first-discovery edge; it is recorded for
+    filtering but never changes the visited set, reachability, shortest-depth
+    computation, or ordering.
 
     The traversal is read-only and tracks a visited set, so even anomalous
     history containing a cycle terminates and the walk is bounded by
@@ -670,40 +681,41 @@ def get_content_lineage(
 
     visited: set[str] = {content_id}
     frontier: list[str] = [content_id]
-    reached: list[tuple[str, int]] = []
+    # id -> (shortest depth, first-discovery edge type); discovery order is
+    # the dictionary insertion order itself.
+    reached: dict[str, tuple[int, str]] = {}
     for depth in range(1, max_depth + 1):
         if not frontier:
             break
         # Ordering every edge leaving the current frontier by its stable
         # creation order fixes each level's first-discovery order, including
         # converging paths whose discovering edges differ.
-        neighbor_ids = session.execute(
-            select(neighbor_col)
+        rows = session.execute(
+            select(neighbor_col, ContentRelation.relation_type)
             .where(source_col.in_(frontier))
             .order_by(*_CONTENT_RELATION_ORDER)
-        ).scalars().all()
+        ).all()
         next_frontier: list[str] = []
-        for neighbor_id in neighbor_ids:
+        for neighbor_id, relation_type in rows:
             if neighbor_id in visited:
                 # Already reached at an equal or shorter depth; also what
                 # makes an anomalous cycle terminate.
                 continue
             visited.add(neighbor_id)
             next_frontier.append(neighbor_id)
-            reached.append((neighbor_id, depth))
+            reached[neighbor_id] = (depth, relation_type)
         frontier = next_frontier
 
     if not reached:
         return []
 
     contents = (
-        session.execute(
-            select(Content).where(
-                Content.id.in_([reached_id for reached_id, _ in reached])
-            )
-        )
+        session.execute(select(Content).where(Content.id.in_(list(reached))))
         .scalars()
         .all()
     )
     by_id = {content.id: content for content in contents}
-    return [(by_id[reached_id], depth) for reached_id, depth in reached]
+    return [
+        (by_id[reached_id], reached_depth, relation_type)
+        for reached_id, (reached_depth, relation_type) in reached.items()
+    ]

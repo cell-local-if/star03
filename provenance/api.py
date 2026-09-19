@@ -9,8 +9,10 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
-from provenance import service
+from provenance import pagination, service
 from provenance.errors import LineageValidationError
+from provenance.models import RELATION_DERIVED_FROM, RELATION_VERSION_OF
+from provenance.pagination import InvalidCursorError
 from provenance.schemas import (
     ActorCreate,
     ActorResponse,
@@ -138,6 +140,39 @@ def _lineage_query_error(field: str, msg: str, error_type: str):
     )
 
 
+def _parse_once(raw, field: str) -> str | None:
+    """Return a query parameter provided at most once, else raise 422."""
+    values = raw.getlist(field)
+    if len(values) > 1:
+        raise _lineage_query_error(
+            field,
+            f"query parameter {field} must be provided exactly once",
+            "value_error.repeated",
+        )
+    return values[0] if values else None
+
+
+def _parse_int_param(raw, field: str, default: int, minimum: int, maximum: int):
+    """Parse a strictly-formatted integer query parameter in [minimum, maximum]."""
+    value = _parse_once(raw, field)
+    if value is None:
+        return default
+    if not _INTEGER_RE.fullmatch(value):
+        raise _lineage_query_error(
+            field,
+            f"{field} must be an integer",
+            "value_error.integer",
+        )
+    parsed = int(value)
+    if not (minimum <= parsed <= maximum):
+        raise _lineage_query_error(
+            field,
+            f"{field} must be between {minimum} and {maximum}",
+            "value_error.range",
+        )
+    return parsed
+
+
 @router.get(
     "/contents/{content_id}/lineage",
     response_model=ContentLineageResponse,
@@ -148,20 +183,18 @@ def get_content_lineage(
     session: DbSession,
     direction: str | None = Query(default=None),
     max_depth: str | None = Query(default=None),
+    relation_type: str | None = Query(default=None),
+    min_depth: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
 ) -> ContentLineageResponse:
     # Raw multi-values are inspected deliberately: FastAPI otherwise keeps
     # only the last value of a repeated scalar parameter and Pydantic coerces
     # "8.0" to 8, both of which must be rejected rather than silently
     # defaulted or normalized.
     raw = request.query_params
-    for field in ("direction", "max_depth"):
-        if len(raw.getlist(field)) > 1:
-            raise _lineage_query_error(
-                field,
-                f"query parameter {field} must be provided exactly once",
-                "value_error.repeated",
-            )
 
+    direction = _parse_once(raw, "direction")
     if direction is None:
         raise _lineage_query_error(
             "direction", "Field required", "value_error.missing"
@@ -175,31 +208,117 @@ def get_content_lineage(
             "value_error",
         )
 
-    if max_depth is None:
-        depth = service.DEFAULT_LINEAGE_MAX_DEPTH
-    else:
-        if not _INTEGER_RE.fullmatch(max_depth):
-            raise _lineage_query_error(
-                "max_depth",
-                "max_depth must be an integer",
-                "value_error.integer",
+    depth = _parse_int_param(
+        raw,
+        "max_depth",
+        service.DEFAULT_LINEAGE_MAX_DEPTH,
+        service.MIN_LINEAGE_MAX_DEPTH,
+        service.MAX_LINEAGE_MAX_DEPTH,
+    )
+    min_level = _parse_int_param(
+        raw,
+        "min_depth",
+        service.DEFAULT_LINEAGE_MIN_DEPTH,
+        service.MIN_LINEAGE_MIN_DEPTH,
+        service.MAX_LINEAGE_MIN_DEPTH,
+    )
+    if min_level > depth:
+        raise _lineage_query_error(
+            "min_depth",
+            "min_depth must not be greater than max_depth",
+            "value_error.range",
+        )
+
+    relation_type = _parse_once(raw, "relation_type")
+    if relation_type is not None and relation_type not in (
+        RELATION_VERSION_OF,
+        RELATION_DERIVED_FROM,
+    ):
+        # Only the two literal edge types are accepted; blanks and casing
+        # variants are rejected rather than normalized.
+        raise _lineage_query_error(
+            "relation_type",
+            "relation_type must be 'version_of' or 'derived_from'",
+            "value_error",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_LINEAGE_LIMIT,
+        service.MIN_LINEAGE_LIMIT,
+        service.MAX_LINEAGE_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_cursor(
+                request.app.state.lineage_cursor_secret, cursor
             )
-        depth = int(max_depth)
-        if not (
-            service.MIN_LINEAGE_MAX_DEPTH
-            <= depth
-            <= service.MAX_LINEAGE_MAX_DEPTH
-        ):
+        except InvalidCursorError as exc:
             raise _lineage_query_error(
-                "max_depth",
-                "max_depth must be between 1 and 32",
-                "value_error.range",
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the effective
+        # parameters (including their defaults) and the origin must match
+        # exactly. A mismatch is a client validation error, not a new query.
+        expected = {
+            "content_id": content_id,
+            "direction": direction,
+            "max_depth": depth,
+            "min_depth": min_level,
+            "relation_type": relation_type,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _lineage_query_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Traversal reachability, shortest depths, and first-discovery order are
+    # computed without any filter; filtering only removes returned rows.
+    rows = service.get_content_lineage(session, content_id, direction, depth)
+    filtered = [
+        (content, reached_depth)
+        for content, reached_depth, edge_type in rows
+        if reached_depth >= min_level
+        and (relation_type is None or edge_type == relation_type)
+    ]
+    total = len(filtered)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = filtered[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_cursor(
+                request.app.state.lineage_cursor_secret,
+                {
+                    "content_id": content_id,
+                    "direction": direction,
+                    "max_depth": depth,
+                    "min_depth": min_level,
+                    "relation_type": relation_type,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
             )
 
-    items = service.get_content_lineage(session, content_id, direction, depth)
     return ContentLineageResponse(
-        items=[_lineage_item(content, d) for content, d in items],
-        count=len(items),
+        items=[_lineage_item(content, d) for content, d in page],
+        count=total,
+        next_cursor=next_cursor,
     )
 
 

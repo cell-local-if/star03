@@ -159,7 +159,12 @@ class ContentLineageItem(ContentResponse):
 
 class ContentLineageResponse(BaseModel):
     items: list[ContentLineageItem]
+    #: Total number of items after relation/depth filtering, independent of
+    #: pagination; not merely the size of the returned page.
     count: int
+    #: Opaque server cursor for the next page, or null when the final page
+    #: has been returned.
+    next_cursor: str | None = None
 
 
 class ClaimCreate(BaseModel):
