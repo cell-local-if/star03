@@ -36,6 +36,16 @@ Versioned JSON routes under `/v1`:
 - `GET /v1/contents/{content_id}` — full public fields, or `404 content_not_found`.
 - `GET /v1/contents?actor_id=...` — contents in stable creation order, optionally filtered by source actor.
 
+## Immutable content claims
+
+Claims attach a typed, digest-committed statement by an actor to a registered content identity. Claims are immutable and append-only: there is no update or delete path.
+
+- `POST /v1/claims` — create a claim with `content_id`, `actor_id`, non-empty `claim_type`, and a JSON-object `payload`. Both the content and the actor must already exist; the claiming actor need not be the content's registering actor. The server computes a SHA-256 digest over a deterministic canonical JSON serialization of the payload (sorted keys, minimal separators, UTF-8) and stores only the digest — the raw payload is never persisted or echoed. The first creation returns `201` with the stable claim id, associations, digest algorithm and value, and UTC `created_at`; a repeat submission with the same content, actor, claim type, and canonical payload returns `200` with the existing claim and adds no audit event. Any different field combination forms an independent claim.
+- `GET /v1/claims/{claim_id}` — full public fields, or `404 claim_not_found`.
+- `GET /v1/contents/{content_id}/claims` — that content's claims only, in stable creation order as `{"items", "count"}`; an unknown content id is `404 content_not_found`.
+
+The first claim creation and its `claim.created` audit event commit in a single transaction. Non-object payloads, blank claim types, and malformed JSON are `422 validation_error`; unknown contents and actors remain `404 content_not_found` / `unknown_actor`.
+
 Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), and `validation_error` (422). Every successful actor creation and first content creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
 
 ## Tests

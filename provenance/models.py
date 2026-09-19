@@ -29,6 +29,7 @@ SUPPORTED_DIGEST_ALGORITHMS = frozenset({"sha256"})
 # Audit event types.
 EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
+EVENT_CLAIM_CREATED = "claim.created"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -84,6 +85,52 @@ class Content(Base):
     )
 
     actor: Mapped[Actor] = relationship(back_populates="contents")
+
+
+class Claim(Base):
+    """An immutable provenance claim about a content identity by an actor.
+
+    The raw payload is never persisted: only its deterministic canonical-JSON
+    digest is stored, so a claim commits to its payload without retaining it.
+    Claims are append-only; there is deliberately no update or delete path.
+    """
+
+    __tablename__ = "claims"
+    __table_args__ = (
+        UniqueConstraint(
+            "content_id",
+            "actor_id",
+            "claim_type",
+            "payload_digest_hex",
+            name="uq_claims_identity",
+        ),
+        Index("ix_claims_content_order", "content_id", "created_at", "seq"),
+        Index("ix_claims_actor_id", "actor_id"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("clm_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    content_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("contents.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The claiming actor; need not be the content's registering actor.
+    actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    claim_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: Digest algorithm of the canonical payload digest ("sha256").
+    payload_digest_algorithm: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    content: Mapped[Content] = relationship()
+    actor: Mapped[Actor] = relationship()
 
 
 class AuditEvent(Base):

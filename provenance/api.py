@@ -11,6 +11,9 @@ from provenance import service
 from provenance.schemas import (
     ActorCreate,
     ActorResponse,
+    ClaimCreate,
+    ClaimListResponse,
+    ClaimResponse,
     ContentCreate,
     ContentListResponse,
     ContentResponse,
@@ -64,5 +67,33 @@ def list_contents(
     items = service.list_contents(session, actor_id)
     return ContentListResponse(
         items=[ContentResponse.model_validate(item) for item in items],
+        count=len(items),
+    )
+
+
+@router.post("/claims", response_model=ClaimResponse)
+def create_claim(
+    payload: ClaimCreate, session: DbSession, response: Response
+) -> ClaimResponse:
+    claim, created = service.create_claim(session, payload)
+    # First creation -> 201; an idempotent repeat submission -> 200, and the
+    # existing immutable claim is returned unchanged.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return ClaimResponse.model_validate(claim)
+
+
+@router.get("/claims/{claim_id}", response_model=ClaimResponse)
+def get_claim(claim_id: str, session: DbSession) -> ClaimResponse:
+    claim = service.get_claim(session, claim_id)
+    return ClaimResponse.model_validate(claim)
+
+
+@router.get("/contents/{content_id}/claims", response_model=ClaimListResponse)
+def list_content_claims(content_id: str, session: DbSession) -> ClaimListResponse:
+    items = service.list_claims_for_content(session, content_id)
+    return ClaimListResponse(
+        items=[ClaimResponse.model_validate(item) for item in items],
         count=len(items),
     )

@@ -65,6 +65,15 @@ class ContentNotFoundError(DomainError):
         super().__init__(details={"content_id": content_id})
 
 
+class ClaimNotFoundError(DomainError):
+    status_code = 404
+    code = "claim_not_found"
+    message = "The requested claim does not exist."
+
+    def __init__(self, claim_id: str):
+        super().__init__(details={"claim_id": claim_id})
+
+
 def _validation_body(exc: RequestValidationError) -> dict:
     # Keep the payload small, stable, and JSON-safe: loc/msg/type per error.
     issues = [

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from provenance.canonical import canonical_json_bytes
 from provenance.models import SUPPORTED_DIGEST_ALGORITHMS
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -112,4 +114,58 @@ class ContentResponse(BaseModel):
 
 class ContentListResponse(BaseModel):
     items: list[ContentResponse]
+    count: int
+
+
+class ClaimCreate(BaseModel):
+    content_id: str = Field(..., min_length=1, max_length=80)
+    actor_id: str = Field(..., min_length=1, max_length=255)
+    claim_type: str = Field(..., min_length=1, max_length=128)
+    #: Must be a JSON object; arrays, scalars, and null are rejected.
+    payload: dict[str, Any]
+
+    @field_validator("content_id")
+    @classmethod
+    def _content_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "content_id")
+
+    @field_validator("actor_id")
+    @classmethod
+    def _actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "actor_id")
+
+    @field_validator("claim_type")
+    @classmethod
+    def _claim_type_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "claim_type")
+
+    @field_validator("payload")
+    @classmethod
+    def _payload_canonicalizable(cls, v: dict[str, Any]) -> dict[str, Any]:
+        try:
+            canonical_json_bytes(v)
+        except (TypeError, ValueError):
+            # Non-finite numbers (NaN/Infinity) have no canonical JSON form.
+            raise ValueError(
+                "payload must be a JSON object with finite numbers"
+            ) from None
+        return v
+
+
+class ClaimResponse(BaseModel):
+    """Public claim view: associations, digest, and timestamps — no payload."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    content_id: str
+    actor_id: str
+    claim_type: str
+    payload_digest_algorithm: str
+    payload_digest_hex: str
+    created_at: datetime
+
+
+class ClaimListResponse(BaseModel):
+    items: list[ClaimResponse]
     count: int

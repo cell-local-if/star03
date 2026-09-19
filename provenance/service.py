@@ -11,24 +11,28 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from provenance import ids
+from provenance import canonical, ids
 from provenance.errors import (
     ActorAlreadyExistsError,
+    ClaimNotFoundError,
     ContentNotFoundError,
     UnknownActorError,
 )
 from provenance.models import (
     EVENT_ACTOR_CREATED,
+    EVENT_CLAIM_CREATED,
     EVENT_CONTENT_CREATED,
     Actor,
     AuditEvent,
+    Claim,
     Content,
 )
-from provenance.schemas import ActorCreate, ContentCreate
+from provenance.schemas import ActorCreate, ClaimCreate, ContentCreate
 
 # Stable creation order: timestamp first, with the monotonic sequence as a
 # deterministic tiebreaker.
 _CONTENT_ORDER = (Content.created_at.asc(), Content.seq.asc())
+_CLAIM_ORDER = (Claim.created_at.asc(), Claim.seq.asc())
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -123,4 +127,96 @@ def list_contents(session: Session, actor_id: str | None = None) -> list[Content
     if actor_id is not None:
         stmt = stmt.where(Content.actor_id == actor_id)
     stmt = stmt.order_by(*_CONTENT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
+def _claim_identity_select(payload: ClaimCreate, digest_hex: str):
+    return select(Claim).where(
+        Claim.content_id == payload.content_id,
+        Claim.actor_id == payload.actor_id,
+        Claim.claim_type == payload.claim_type,
+        Claim.payload_digest_hex == digest_hex,
+    )
+
+
+def create_claim(session: Session, payload: ClaimCreate) -> tuple[Claim, bool]:
+    """Create an immutable claim, returning ``(claim, created)``.
+
+    Both the content and the claiming actor must already exist; the actor
+    need not be the content's registering actor. The payload is committed to
+    via its canonical-JSON SHA-256 digest and is never stored. A repeat
+    submission of the same content, actor, claim type, and canonical payload
+    returns the existing claim with ``created=False`` and writes no row or
+    audit event. The claim row and its ``claim.created`` audit event commit
+    in a single transaction.
+    """
+    content = session.execute(
+        select(Content).where(Content.id == payload.content_id)
+    ).scalar_one_or_none()
+    if content is None:
+        raise ContentNotFoundError(payload.content_id)
+    actor = session.get(Actor, payload.actor_id)
+    if actor is None:
+        raise UnknownActorError(payload.actor_id)
+
+    digest_hex = canonical.payload_digest_hex(payload.payload)
+    existing = session.execute(
+        _claim_identity_select(payload, digest_hex)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    claim = Claim(
+        id=ids.claim_id(
+            payload.content_id, payload.actor_id, payload.claim_type, digest_hex
+        ),
+        content_id=payload.content_id,
+        actor_id=payload.actor_id,
+        claim_type=payload.claim_type,
+        payload_digest_algorithm=canonical.CANONICAL_DIGEST_ALGORITHM,
+        payload_digest_hex=digest_hex,
+    )
+    session.add(claim)
+    session.add(AuditEvent(event_type=EVENT_CLAIM_CREATED, resource_id=claim.id))
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical claim won the race: return its resource.
+        session.rollback()
+        raced = session.execute(
+            _claim_identity_select(payload, digest_hex)
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(claim)
+    return claim, True
+
+
+def get_claim(session: Session, claim_id: str) -> Claim:
+    """Return a claim by its stable id or raise :class:`ClaimNotFoundError`."""
+    claim = session.execute(
+        select(Claim).where(Claim.id == claim_id)
+    ).scalar_one_or_none()
+    if claim is None:
+        raise ClaimNotFoundError(claim_id)
+    return claim
+
+
+def list_claims_for_content(session: Session, content_id: str) -> list[Claim]:
+    """Return claims for one content in stable creation order.
+
+    The content must exist; an unknown content id is a missing resource, not
+    an empty collection.
+    """
+    content = session.execute(
+        select(Content).where(Content.id == content_id)
+    ).scalar_one_or_none()
+    if content is None:
+        raise ContentNotFoundError(content_id)
+    stmt = (
+        select(Claim)
+        .where(Claim.content_id == content_id)
+        .order_by(*_CLAIM_ORDER)
+    )
     return list(session.execute(stmt).scalars().all())
