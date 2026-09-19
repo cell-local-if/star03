@@ -315,6 +315,21 @@ class ContentRelationListResponse(BaseModel):
     count: int
 
 
+class ContentLineageItem(ContentResponse):
+    """A content reached by a multi-hop lineage traversal.
+
+    Carries every public content field plus the 1-based hop ``depth`` from
+    the traversal origin (which is never included).
+    """
+
+    depth: int
+
+
+class ContentLineageResponse(BaseModel):
+    items: list[ContentLineageItem]
+    count: int
+
+
 class AttestationCreate(BaseModel):
     # Attestation requests carry exactly the declared verification material;
     # undeclared fields are rejected rather than silently discarded.

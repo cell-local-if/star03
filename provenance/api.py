@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import re
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 
 from provenance import service
@@ -19,6 +21,8 @@ from provenance.schemas import (
     ClaimListResponse,
     ClaimResponse,
     ContentCreate,
+    ContentLineageItem,
+    ContentLineageResponse,
     ContentListResponse,
     ContentRelationCreate,
     ContentRelationListResponse,
@@ -117,6 +121,85 @@ def list_content_relations(
         items=[ContentRelationResponse.model_validate(item) for item in items],
         count=len(items),
     )
+
+
+def _duplicate_query_error(param: str) -> RequestValidationError:
+    # Rendered by the same handler as FastAPI's own query validation:
+    # 422 ``validation_error`` with a stable ``("query", param)`` loc.
+    return RequestValidationError(
+        [
+            {
+                "loc": ("query", param),
+                "msg": "query parameter must be provided at most once",
+                "type": "value_error",
+            }
+        ]
+    )
+
+
+# A plain canonical decimal integer with no sign, whitespace, or leading
+# zeros beyond the single digit "0". Whitespace, "01", "+1", and floats never
+# match; parsing is done in the handler rather than via FastAPI's int
+# coercion, which silently accepts all of those non-canonical spellings.
+_INTEGER_QUERY = re.compile(r"^(0|[1-9][0-9]*)$")
+
+
+def _parse_max_depth(raw: str) -> int:
+    if not _INTEGER_QUERY.fullmatch(raw):
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("query", "max_depth"),
+                    "msg": "max_depth must be an integer",
+                    "type": "value_error",
+                }
+            ]
+        )
+    value = int(raw)
+    if not 1 <= value <= 32:
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("query", "max_depth"),
+                    "msg": "max_depth must be between 1 and 32",
+                    "type": "value_error",
+                }
+            ]
+        )
+    return value
+
+
+@router.get(
+    "/contents/{content_id}/lineage",
+    response_model=ContentLineageResponse,
+)
+def get_content_lineage(
+    content_id: str,
+    request: Request,
+    session: DbSession,
+    direction: Literal["ancestors", "descendants"],
+    max_depth: str | None = Query(default=None),
+) -> ContentLineageResponse:
+    # FastAPI silently keeps the last repeated scalar value; the contract
+    # forbids that, so reject any duplicate explicitly before traversal.
+    if len(request.query_params.getlist("direction")) > 1:
+        raise _duplicate_query_error("direction")
+    if len(request.query_params.getlist("max_depth")) > 1:
+        raise _duplicate_query_error("max_depth")
+
+    # Absent -> the documented default; present but blank/non-integer/out of
+    # range -> 422, never a silent default or coercion.
+    if max_depth is None:
+        depth = service.DEFAULT_LINEAGE_MAX_DEPTH
+    else:
+        depth = _parse_max_depth(max_depth)
+
+    pairs = service.list_content_lineage(session, content_id, direction, depth)
+    items: list[ContentLineageItem] = []
+    for content, hop in pairs:
+        fields = ContentResponse.model_validate(content).model_dump()
+        items.append(ContentLineageItem(**fields, depth=hop))
+    return ContentLineageResponse(items=items, count=len(items))
 
 
 @router.post("/claims", response_model=ClaimResponse)

@@ -625,3 +625,88 @@ def list_content_relations(
         .order_by(*_CONTENT_RELATION_ORDER)
     )
     return list(session.execute(stmt).scalars().all())
+
+
+# Lineage traversal directions. Edges point from a content to its direct
+# source (parent), so ancestors follow out-edges (content -> parent) and
+# descendants follow in-edges (parent -> content).
+LINEAGE_ANCESTORS = "ancestors"
+LINEAGE_DESCENDANTS = "descendants"
+
+DEFAULT_LINEAGE_MAX_DEPTH = 8
+
+
+def list_content_lineage(
+    session: Session,
+    content_id: str,
+    direction: str,
+    max_depth: int = DEFAULT_LINEAGE_MAX_DEPTH,
+) -> list[tuple[Content, int]]:
+    """Return reachable contents paired with their shortest hop depth.
+
+    Breadth-first traversal of the immutable relation graph. Ancestors are
+    reached by following edges ``content -> parent``; descendants by the
+    reverse edges ``parent -> content``. The origin itself is never
+    included; only contents at depths ``1..max_depth`` are returned.
+
+    At each depth the whole frontier's onward edges are scanned in one
+    globally stable relation creation order (``created_at`` then ``seq``),
+    so within a depth nodes are ordered by the edge on which they were
+    *first* discovered, and a content reached through several paths is kept
+    once at its shortest depth. Results are ordered by depth ascending.
+
+    Every visited node is recorded before expansion, so traversal is
+    bounded and terminates even if anomalous history contains a cycle. The
+    origin must exist (otherwise :class:`ContentNotFoundError`); the
+    operation is read-only and writes neither resources nor audit events.
+    """
+    _require_content(session, content_id)
+
+    if direction == LINEAGE_ANCESTORS:
+        neighbor_col = ContentRelation.parent_content_id
+        source_col = ContentRelation.content_id
+    else:
+        neighbor_col = ContentRelation.content_id
+        source_col = ContentRelation.parent_content_id
+
+    # Origin is visited from the start so it can never appear in results,
+    # and every reached node is recorded before it is expanded.
+    visited: set[str] = {content_id}
+    frontier: list[str] = [content_id]
+    results: list[tuple[Content, int]] = []
+    depth = 0
+    while frontier and depth < max_depth:
+        depth += 1
+        # All onward edges of the current frontier, in one globally stable
+        # edge-creation order; earlier rows win dedup and fix this depth's
+        # first-discovery ordering.
+        neighbors = (
+            session.execute(
+                select(neighbor_col)
+                .where(source_col.in_(frontier))
+                .order_by(*_CONTENT_RELATION_ORDER)
+            )
+            .scalars()
+            .all()
+        )
+        next_frontier: list[str] = []
+        for neighbor in neighbors:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                next_frontier.append(neighbor)
+
+        if next_frontier:
+            contents = session.execute(
+                select(Content).where(Content.id.in_(next_frontier))
+            ).scalars().all()
+            content_by_id = {content.id: content for content in contents}
+            for node in next_frontier:
+                # Defensive: in anomalous history a relation endpoint may
+                # reference a missing content row; the edge still participates
+                # in traversal but yields no result item.
+                content = content_by_id.get(node)
+                if content is not None:
+                    results.append((content, depth))
+        frontier = next_frontier
+
+    return results
