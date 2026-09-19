@@ -62,6 +62,26 @@ def evidence_bundle_id(
     return "evb_" + hashlib.sha256(material).hexdigest()
 
 
+def content_relation_id(
+    content_id: str,
+    parent_content_id: str,
+    relation_type: str,
+) -> str:
+    """Return a stable ``rel_``-prefixed identifier for a lineage edge.
+
+    The identity is exactly the idempotency key: child content, parent
+    (direct source) content, and relation type. As with other stable ids,
+    the material is a canonical JSON array so field separators cannot
+    collide.
+    """
+    material = json.dumps(
+        ["content_relation", content_id, parent_content_id, relation_type],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "rel_" + hashlib.sha256(material).hexdigest()
+
+
 def attestation_id(
     target_type: str,
     target_id: str,

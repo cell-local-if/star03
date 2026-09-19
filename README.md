@@ -72,7 +72,17 @@ Attestations cryptographically bind an existing signing actor to an existing cla
 
 The first attestation write and its `attestation.created` audit event commit in a single transaction. An unknown target is `404 claim_not_found` / `evidence_bundle_not_found` (matched by the declared `target_type`), and an unknown signing actor is `404 unknown_actor` even when the signature itself is valid. Bad Base64, wrong decoded lengths (32/64 bytes), blank identifiers, unknown `target_type`, undeclared fields, and malformed JSON are `422 validation_error`; a well-formed request whose signature fails verification is `422 attestation_verification_failed`, with no resource or audit write. Signature verification uses an RFC 8032 Ed25519 implementation in the Python standard library (no external crypto dependency).
 
-Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422). Every successful actor, content, claim, evidence bundle, and attestation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
+Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `content_relation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422). Every successful actor, content, claim, evidence bundle, attestation, and content relation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
+
+## Content lineage relations
+
+Relations connect revisions and derivatives into an append-only lineage graph. Each relation is an immutable directed edge: `content_id` is a new version or a derived content, and `parent_content_id` is its direct source. Relations are immutable — there is no update or delete path.
+
+- `POST /v1/content-relations` — create an edge with an existing `content_id`, an existing `parent_content_id`, and `relation_type`, which must be `"version_of"` or `"derived_from"`. The first creation returns `201` with the stable `rel_` id, the three request fields, and a UTC `created_at`; a repeat submission with the same content, parent, and relation type returns `200` with the original record and writes no row or audit event. The edge must not be a self loop and must not close a cycle in the existing lineage graph (adding an edge whose child is already reachable from the parent is rejected). The first creation and its `content_relation.created` audit event commit in a single transaction.
+- `GET /v1/content-relations/{relation_id}` — full public fields, or `404 content_relation_not_found`.
+- `GET /v1/contents/{content_id}/relations` — both inbound and outbound edges for the content (relations where it is the new version/derivative or the direct source), in stable creation order as `{"items", "count"}`; an unknown content id is `404 content_not_found`.
+
+A nonexistent endpoint content is `404 content_not_found`. Blank identifiers, an unknown `relation_type`, a self loop, and a cycle-introducing edge are `422 validation_error`; in every such case neither a relation nor an audit event is written.
 
 ## Tests
 

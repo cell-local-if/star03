@@ -12,7 +12,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from provenance.canonical import canonical_json_bytes
 from provenance.ed25519 import PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH
@@ -144,6 +144,45 @@ class ContentResponse(BaseModel):
 
 class ContentListResponse(BaseModel):
     items: list[ContentResponse]
+    count: int
+
+
+class ContentRelationCreate(BaseModel):
+    content_id: str = Field(..., min_length=1, max_length=80)
+    parent_content_id: str = Field(..., min_length=1, max_length=80)
+    relation_type: Literal["version_of", "derived_from"]
+
+    @field_validator("content_id")
+    @classmethod
+    def _content_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "content_id")
+
+    @field_validator("parent_content_id")
+    @classmethod
+    def _parent_content_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "parent_content_id")
+
+    @model_validator(mode="after")
+    def _reject_self_loop(self) -> "ContentRelationCreate":
+        # An edge from a content to itself is always invalid, whether or
+        # not the content exists.
+        if self.content_id == self.parent_content_id:
+            raise ValueError("content_id and parent_content_id must differ")
+        return self
+
+
+class ContentRelationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    content_id: str
+    parent_content_id: str
+    relation_type: Literal["version_of", "derived_from"]
+    created_at: datetime
+
+
+class ContentRelationListResponse(BaseModel):
+    items: list[ContentRelationResponse]
     count: int
 
 

@@ -34,6 +34,7 @@ EVENT_CONTENT_CREATED = "content.created"
 EVENT_CLAIM_CREATED = "claim.created"
 EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
 EVENT_ATTESTATION_CREATED = "attestation.created"
+EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -89,6 +90,64 @@ class Content(Base):
     )
 
     actor: Mapped[Actor] = relationship(back_populates="contents")
+
+
+class ContentRelation(Base):
+    """An immutable directed lineage edge between two content identities.
+
+    ``content_id`` is a new version or a derivative; ``parent_content_id``
+    is its direct source. The graph is kept acyclic on write: an edge may
+    neither start and end at the same content nor introduce a path back to
+    the child. Relations are append-only; there is deliberately no update
+    or delete path.
+    """
+
+    __tablename__ = "content_relations"
+    __table_args__ = (
+        UniqueConstraint(
+            "content_id",
+            "parent_content_id",
+            "relation_type",
+            name="uq_content_relations_identity",
+        ),
+        Index(
+            "ix_content_relations_content_order",
+            "content_id",
+            "created_at",
+            "seq",
+        ),
+        Index(
+            "ix_content_relations_parent_order",
+            "parent_content_id",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("rel_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The new version or derived content (edge head / child).
+    content_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("contents.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The direct source content (edge tail / parent).
+    parent_content_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("contents.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: "version_of" or "derived_from".
+    relation_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    content: Mapped[Content] = relationship(foreign_keys=[content_id])
+    parent_content: Mapped[Content] = relationship(
+        foreign_keys=[parent_content_id]
+    )
 
 
 class Claim(Base):

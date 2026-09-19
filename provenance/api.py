@@ -20,6 +20,9 @@ from provenance.schemas import (
     ClaimResponse,
     ContentCreate,
     ContentListResponse,
+    ContentRelationCreate,
+    ContentRelationListResponse,
+    ContentRelationResponse,
     ContentResponse,
     EvidenceBundleCreate,
     EvidenceBundleListResponse,
@@ -74,6 +77,47 @@ def list_contents(
     items = service.list_contents(session, actor_id)
     return ContentListResponse(
         items=[ContentResponse.model_validate(item) for item in items],
+        count=len(items),
+    )
+
+
+@router.post(
+    "/content-relations",
+    response_model=ContentRelationResponse,
+)
+def create_content_relation(
+    payload: ContentRelationCreate, session: DbSession, response: Response
+) -> ContentRelationResponse:
+    relation, created = service.create_content_relation(session, payload)
+    # First creation -> 201; an idempotent repeat submission -> 200, and the
+    # existing immutable relation is returned unchanged.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return ContentRelationResponse.model_validate(relation)
+
+
+@router.get(
+    "/content-relations/{relation_id}",
+    response_model=ContentRelationResponse,
+)
+def get_content_relation(
+    relation_id: str, session: DbSession
+) -> ContentRelationResponse:
+    relation = service.get_content_relation(session, relation_id)
+    return ContentRelationResponse.model_validate(relation)
+
+
+@router.get(
+    "/contents/{content_id}/relations",
+    response_model=ContentRelationListResponse,
+)
+def list_content_relations(
+    content_id: str, session: DbSession
+) -> ContentRelationListResponse:
+    items = service.list_relations_for_content(session, content_id)
+    return ContentRelationListResponse(
+        items=[ContentRelationResponse.model_validate(item) for item in items],
         count=len(items),
     )
 

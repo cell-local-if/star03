@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -20,6 +20,8 @@ from provenance.errors import (
     AttestationVerificationError,
     ClaimNotFoundError,
     ContentNotFoundError,
+    ContentRelationNotFoundError,
+    ContentRelationValidationError,
     EvidenceBundleNotFoundError,
     UnknownActorError,
 )
@@ -28,12 +30,14 @@ from provenance.models import (
     EVENT_ATTESTATION_CREATED,
     EVENT_CLAIM_CREATED,
     EVENT_CONTENT_CREATED,
+    EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     Actor,
     Attestation,
     AuditEvent,
     Claim,
     Content,
+    ContentRelation,
     EvidenceBundle,
 )
 from provenance.schemas import (
@@ -41,6 +45,7 @@ from provenance.schemas import (
     AttestationCreate,
     ClaimCreate,
     ContentCreate,
+    ContentRelationCreate,
     EvidenceBundleCreate,
 )
 
@@ -53,6 +58,10 @@ _EVIDENCE_BUNDLE_ORDER = (
     EvidenceBundle.seq.asc(),
 )
 _ATTESTATION_ORDER = (Attestation.created_at.asc(), Attestation.seq.asc())
+_CONTENT_RELATION_ORDER = (
+    ContentRelation.created_at.asc(),
+    ContentRelation.seq.asc(),
+)
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -147,6 +156,157 @@ def list_contents(session: Session, actor_id: str | None = None) -> list[Content
     if actor_id is not None:
         stmt = stmt.where(Content.actor_id == actor_id)
     stmt = stmt.order_by(*_CONTENT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
+def _content_exists(session: Session, content_id: str) -> bool:
+    return (
+        session.execute(
+            select(Content.seq).where(Content.id == content_id)
+        ).first()
+        is not None
+    )
+
+
+def _content_relation_identity_select(payload: ContentRelationCreate):
+    return select(ContentRelation).where(
+        ContentRelation.content_id == payload.content_id,
+        ContentRelation.parent_content_id == payload.parent_content_id,
+        ContentRelation.relation_type == payload.relation_type,
+    )
+
+
+def _would_form_cycle(session: Session, child_id: str, parent_id: str) -> bool:
+    """Return whether a child -> parent edge would close a directed cycle.
+
+    Edges point from a new version/derivative to its direct source, so the
+    new edge closes a cycle exactly when the child is already reachable
+    from the parent along existing ``content_id -> parent_content_id``
+    edges -- i.e. the parent already descends, via its lineage, back to the
+    child. Ancestors are expanded from the parent; a self edge is covered
+    because the parent itself is seeded into the frontier.
+    """
+    seen: set[str] = set()
+    frontier = [parent_id]
+    while frontier:
+        current = frontier.pop()
+        if current == child_id:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        parents = session.execute(
+            select(ContentRelation.parent_content_id).where(
+                ContentRelation.content_id == current
+            )
+        ).scalars().all()
+        frontier.extend(parents)
+    return False
+
+
+def create_content_relation(
+    session: Session, payload: ContentRelationCreate
+) -> tuple[ContentRelation, bool]:
+    """Create an immutable content lineage edge, returning ``(relation, created)``.
+
+    Both endpoint contents must already exist. The edge may not be a self
+    loop or close a cycle in the existing graph. A repeat submission of the
+    same content, parent, and relation type returns the existing relation
+    with ``created=False`` and writes no row or audit event. On first
+    creation, the relation row and its ``content_relation.created`` audit
+    event commit in a single transaction.
+    """
+    # Missing endpoints are missing resources, not validation errors; check
+    # both before any graph validation so the contract's precedence holds.
+    if not _content_exists(session, payload.content_id):
+        raise ContentNotFoundError(payload.content_id)
+    if not _content_exists(session, payload.parent_content_id):
+        raise ContentNotFoundError(payload.parent_content_id)
+
+    existing = session.execute(
+        _content_relation_identity_select(payload)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    if _would_form_cycle(session, payload.content_id, payload.parent_content_id):
+        raise ContentRelationValidationError(
+            "The relation would introduce a cycle in the content lineage graph.",
+            details={
+                "reason": "cycle_detected",
+                "content_id": payload.content_id,
+                "parent_content_id": payload.parent_content_id,
+            },
+        )
+
+    relation = ContentRelation(
+        id=ids.content_relation_id(
+            payload.content_id,
+            payload.parent_content_id,
+            payload.relation_type,
+        ),
+        content_id=payload.content_id,
+        parent_content_id=payload.parent_content_id,
+        relation_type=payload.relation_type,
+    )
+    session.add(relation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_CONTENT_RELATION_CREATED, resource_id=relation.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical relation won the race: return its resource.
+        session.rollback()
+        raced = session.execute(
+            _content_relation_identity_select(payload)
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(relation)
+    return relation, True
+
+
+def get_content_relation(
+    session: Session, relation_id: str
+) -> ContentRelation:
+    """Return a relation by id or raise :class:`ContentRelationNotFoundError`."""
+    relation = session.execute(
+        select(ContentRelation).where(ContentRelation.id == relation_id)
+    ).scalar_one_or_none()
+    if relation is None:
+        raise ContentRelationNotFoundError(relation_id)
+    return relation
+
+
+def list_relations_for_content(
+    session: Session, content_id: str
+) -> list[ContentRelation]:
+    """Return a content's inbound and outbound relations in creation order.
+
+    The content must exist; an unknown content id is a missing resource, not
+    an empty collection. Both edges where the content is the new version /
+    derivative (``content_id``) and where it is the direct source
+    (``parent_content_id``) are returned, ordered by stable creation order.
+    """
+    content = session.execute(
+        select(Content).where(Content.id == content_id)
+    ).scalar_one_or_none()
+    if content is None:
+        raise ContentNotFoundError(content_id)
+    stmt = (
+        select(ContentRelation)
+        .where(
+            or_(
+                ContentRelation.content_id == content_id,
+                ContentRelation.parent_content_id == content_id,
+            )
+        )
+        .order_by(*_CONTENT_RELATION_ORDER)
+    )
     return list(session.execute(stmt).scalars().all())
 
 
