@@ -135,6 +135,37 @@ class AttestationVerificationError(DomainError):
         super().__init__(details=details)
 
 
+class ProtectedAccessValidationError(DomainError):
+    """A malformed protected request (credentials or grant fields).
+
+    Renders with the same ``validation_error`` code as request-body
+    validation failures on both protected routes.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str):
+        super().__init__(details={"reason": reason})
+
+
+class ProtectedResourceNotFoundError(DomainError):
+    """Opaque 404 for the protected read route.
+
+    A missing attestation, an unauthenticated caller, and an unauthorized
+    caller all render identically so resource existence is never revealed
+    to a caller without access.
+    """
+
+    status_code = 404
+    code = "not_found"
+    message = "The requested resource does not exist."
+
+    def __init__(self) -> None:
+        super().__init__()
+
+
 class LineageValidationError(DomainError):
     """A malformed lineage query (``direction`` / ``max_depth``).
 

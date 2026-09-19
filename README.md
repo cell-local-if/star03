@@ -89,6 +89,25 @@ A revocation is an immutable, append-only record that an existing attestation is
 
 The first revocation write and its `attestation.revoked` audit event commit in a single transaction. An unknown attestation is `404 attestation_not_found` and an unknown revoking actor is `404 unknown_actor`. Blank or whitespace-only `attestation_id`, `revoker_actor_id`, or `reason`, malformed JSON, and any undeclared request field are `422 validation_error` and write neither a record nor an audit event. Because records are append-only, any attempt to update or delete a revocation is met with `405 method_not_allowed`; no such mutation path is provided.
 
+## Read-only proof access grants
+
+A read-only access grant authorizes another actor to read one existing attestation through a protected endpoint. Grants are immutable and append-only: there is no update or delete path, and a grant never mutates the attestation it references.
+
+Both protected routes authenticate every request with three headers:
+
+- `X-PA` — the calling actor id;
+- `X-PT` — the request timestamp as an RFC 3339 UTC instant (`Z` or an explicit `+00:00`; no naive or non-UTC value), no more than **300 seconds** from the server's current time;
+- `X-PS` — a standard-Base64 Ed25519 signature (64 raw bytes) over the exact UTF-8 compact JSON array (compact separators, non-ASCII emitted unescaped):
+
+  ```
+  ["provenance-access-v1",method,path,timestamp,body_sha256]
+  ```
+
+  `method` is the uppercase HTTP method, `path` is the request path without any query string, `timestamp` is the exact `X-PT` header value, and `body_sha256` is the lowercase-hex SHA-256 of the actual request body bytes — the digest of zero bytes for an empty (GET) body. The signature is accepted if it verifies under **any** public key of a non-revoked attestation created by the calling actor; a revoked attestation's key never authenticates.
+
+- `POST /v1/attestation-access-grants` — JSON body contains exactly `attestation_id` and `grantee_actor_id`; any undeclared field is rejected. Only the attestation's `signer_actor_id` (authenticated as above) may create a grant. The first creation returns `201` with exactly `{id, attestation_id, grantee_actor_id, created_at}` — a stable `aag_` id and a UTC `created_at`. A retried submission for the same `(attestation_id, grantee_actor_id)` pair returns `200` with the original record and writes no new row or audit event; a different grantee forms an independent, immutable record. The first grant write and its `attestation.access_granted` audit event commit in a single transaction. Missing credentials, an unparseable or out-of-window timestamp, malformed signature encoding, a signature no current key of the actor verifies, malformed fields or JSON, a missing attestation, a missing grantee actor, and a caller who is not the attestation's signer are all `422 validation_error`; no failure writes a resource or an audit event.
+- `GET /v1/protected/attestations/{attestation_id}` — read-only. Only the attestation's `signer_actor_id` or an actor holding an access grant for that exact attestation may call it; success returns the existing attestation's public view (the same fields as `GET /v1/attestations/{id}`). A missing target, an unauthenticated caller, and an unauthorized caller all return the **same opaque `404 not_found`**, so existence is never revealed to a caller without access. An unparseable/out-of-window timestamp or a signature that is not canonical Base64 of exactly 64 bytes is `422 validation_error`. The read writes no resource and no audit event.
+
 ## Content lineage relations
 
 Relations record how content identities descend from one another: `content_id` is the newer version or derived content, `parent_content_id` is its direct source, and `relation_type` is `version_of` or `derived_from`. Relations are immutable and append-only: there is no update or delete path.
@@ -100,7 +119,7 @@ Relations record how content identities descend from one another: `content_id` i
 
 The first relation creation and its `content_relation.created` audit event commit in a single transaction.
 
-Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `attestation_revocation_not_found` (404), `content_relation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422). Every successful actor, content, claim, evidence bundle, attestation, attestation revocation, and content relation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write; a revocation records the `attestation.revoked` event. All returned timestamps are timezone-aware UTC.
+Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `attestation_revocation_not_found` (404), `content_relation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422); the protected attestation read answers a missing target, an unauthenticated caller, and an unauthorized caller with one opaque `not_found` (404). Every successful actor, content, claim, evidence bundle, attestation, attestation revocation, attestation access grant, and content relation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write; a revocation records the `attestation.revoked` event and an access grant records the `attestation.access_granted` event. All returned timestamps are timezone-aware UTC.
 
 ## Tests
 

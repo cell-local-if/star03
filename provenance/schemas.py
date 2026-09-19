@@ -450,6 +450,38 @@ class AttestationRevocationListResponse(BaseModel):
     count: int
 
 
+class AttestationAccessGrantCreate(BaseModel):
+    # A grant carries exactly its declared fields; undeclared fields are
+    # rejected rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The existing attestation whose read access is being granted.
+    attestation_id: str = Field(..., min_length=1, max_length=80)
+    #: An already-registered actor receiving read-only access.
+    grantee_actor_id: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("attestation_id")
+    @classmethod
+    def _attestation_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "attestation_id")
+
+    @field_validator("grantee_actor_id")
+    @classmethod
+    def _grantee_actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "grantee_actor_id")
+
+
+class AttestationAccessGrantResponse(BaseModel):
+    """Public grant view: the proof, the grantee, and the UTC timestamp."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    attestation_id: str
+    grantee_actor_id: str
+    created_at: datetime
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 

@@ -9,14 +9,21 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
-from provenance import pagination, service
-from provenance.errors import LineageValidationError
+from provenance import access_signing, pagination, service
+from provenance.access_signing import AccessAuthError
+from provenance.errors import (
+    LineageValidationError,
+    ProtectedAccessValidationError,
+    ProtectedResourceNotFoundError,
+)
 from provenance.models import RELATION_DERIVED_FROM, RELATION_VERSION_OF
 from provenance.pagination import InvalidCursorError
 from provenance.signing import ATTESTATION_TARGET_TYPES
 from provenance.schemas import (
     ActorCreate,
     ActorResponse,
+    AttestationAccessGrantCreate,
+    AttestationAccessGrantResponse,
     AttestationCreate,
     AttestationListResponse,
     AttestationResponse,
@@ -614,6 +621,76 @@ def list_attestation_revocations(
 _TRUST_EVALUATION_PARAMS = frozenset(
     {"target_type", "target_id", "min_signers"}
 )
+
+
+async def _authenticate_protected(
+    request: Request, session: Session, body: bytes, *, read: bool
+) -> str:
+    """Authenticate an X-PA/X-PT/X-PS protected request.
+
+    On the write route every authentication failure is a ``422``. On the
+    read route only malformed credentials are ``422``; a missing or
+    unverifiable identity collapses into the same opaque ``404`` as a
+    missing target or an unauthorized caller.
+    """
+    try:
+        return access_signing.authenticate(session, request, body)
+    except AccessAuthError as exc:
+        if read and not exc.malformed:
+            raise ProtectedResourceNotFoundError() from exc
+        raise ProtectedAccessValidationError(exc.reason) from exc
+
+
+@router.post(
+    "/attestation-access-grants",
+    response_model=AttestationAccessGrantResponse,
+)
+async def create_attestation_access_grant(
+    request: Request,
+    payload: AttestationAccessGrantCreate,
+    session: DbSession,
+    response: Response,
+) -> AttestationAccessGrantResponse:
+    # The signature covers the exact bytes on the wire; FastAPI's parsed
+    # model is built from the same cached body, so body_sha256 matches what
+    # the client signed.
+    raw_body = await request.body()
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    grant, created = service.create_attestation_access_grant(
+        session, payload, caller
+    )
+    # First creation -> 201; a retried submission for the same
+    # (attestation_id, grantee_actor_id) pair -> 200 with the original
+    # record and no new audit event.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return AttestationAccessGrantResponse.model_validate(grant)
+
+
+@router.get(
+    "/protected/attestations/{attestation_id}",
+    response_model=AttestationResponse,
+)
+async def get_protected_attestation(
+    attestation_id: str, request: Request, session: DbSession
+) -> AttestationResponse:
+    # A GET carries no body; the signed body_sha256 is therefore the digest
+    # of zero bytes.
+    raw_body = await request.body()
+    actor = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+    # A missing target and an unauthorized caller are indistinguishable to
+    # the caller: both are the same opaque 404.
+    attestation = service.get_accessible_attestation(
+        session, attestation_id, actor
+    )
+    if attestation is None:
+        raise ProtectedResourceNotFoundError()
+    return _attestation_response(attestation)
 
 
 @router.get(
