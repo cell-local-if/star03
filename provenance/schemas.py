@@ -280,6 +280,41 @@ class EvidenceBundleListResponse(BaseModel):
     count: int
 
 
+class ContentRelationCreate(BaseModel):
+    content_id: str = Field(..., min_length=1, max_length=80)
+    parent_content_id: str = Field(..., min_length=1, max_length=80)
+    #: "version_of" (a new version of the source) or "derived_from" (derived
+    #: from the source); any other type is a validation error.
+    relation_type: Literal["version_of", "derived_from"]
+
+    @field_validator("content_id")
+    @classmethod
+    def _content_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "content_id")
+
+    @field_validator("parent_content_id")
+    @classmethod
+    def _parent_content_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "parent_content_id")
+
+
+class ContentRelationResponse(BaseModel):
+    """Public relation view: the two endpoints, the type, and the timestamp."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    content_id: str
+    parent_content_id: str
+    relation_type: Literal["version_of", "derived_from"]
+    created_at: datetime
+
+
+class ContentRelationListResponse(BaseModel):
+    items: list[ContentRelationResponse]
+    count: int
+
+
 class AttestationCreate(BaseModel):
     # Attestation requests carry exactly the declared verification material;
     # undeclared fields are rejected rather than silently discarded.

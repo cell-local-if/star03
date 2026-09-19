@@ -28,12 +28,18 @@ from provenance.time_utils import utc_now
 # Allowed content digest algorithms. Only SHA-256 is accepted in this version.
 SUPPORTED_DIGEST_ALGORITHMS = frozenset({"sha256"})
 
+# Allowed content relation (lineage edge) types.
+RELATION_VERSION_OF = "version_of"
+RELATION_DERIVED_FROM = "derived_from"
+SUPPORTED_RELATION_TYPES = frozenset({RELATION_VERSION_OF, RELATION_DERIVED_FROM})
+
 # Audit event types.
 EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
 EVENT_CLAIM_CREATED = "claim.created"
 EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
 EVENT_ATTESTATION_CREATED = "attestation.created"
+EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -245,6 +251,62 @@ class Attestation(Base):
     )
 
     signer_actor: Mapped[Actor] = relationship()
+
+
+class ContentRelation(Base):
+    """An immutable lineage edge between two existing content identities.
+
+    ``content_id`` is the newer version or derived content;
+    ``parent_content_id`` is its direct source. Edges are append-only; there
+    is deliberately no update or delete path.
+    """
+
+    __tablename__ = "content_relations"
+    __table_args__ = (
+        UniqueConstraint(
+            "content_id",
+            "parent_content_id",
+            "relation_type",
+            name="uq_content_relations_identity",
+        ),
+        Index(
+            "ix_content_relations_content_order",
+            "content_id",
+            "created_at",
+            "seq",
+        ),
+        Index(
+            "ix_content_relations_parent_order",
+            "parent_content_id",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("rel_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The newer version or derived content (out-edge endpoint).
+    content_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("contents.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The direct source content (in-edge endpoint).
+    parent_content_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("contents.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: "version_of" or "derived_from".
+    relation_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    content: Mapped[Content] = relationship(foreign_keys=[content_id])
+    parent_content: Mapped[Content] = relationship(
+        foreign_keys=[parent_content_id]
+    )
 
 
 class AuditEvent(Base):

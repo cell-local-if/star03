@@ -72,7 +72,17 @@ Attestations cryptographically bind an existing signing actor to an existing cla
 
 The first attestation write and its `attestation.created` audit event commit in a single transaction. An unknown target is `404 claim_not_found` / `evidence_bundle_not_found` (matched by the declared `target_type`), and an unknown signing actor is `404 unknown_actor` even when the signature itself is valid. Bad Base64, wrong decoded lengths (32/64 bytes), blank identifiers, unknown `target_type`, undeclared fields, and malformed JSON are `422 validation_error`; a well-formed request whose signature fails verification is `422 attestation_verification_failed`, with no resource or audit write. Signature verification uses an RFC 8032 Ed25519 implementation in the Python standard library (no external crypto dependency).
 
-Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422). Every successful actor, content, claim, evidence bundle, and attestation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
+## Content lineage relations
+
+Relations record how content identities descend from one another: `content_id` is the newer version or derived content, `parent_content_id` is its direct source, and `relation_type` is `version_of` or `derived_from`. Relations are immutable and append-only: there is no update or delete path.
+
+- `POST /v1/content-relations` — create a relation between two existing contents. The first creation returns `201` with the stable `rel_` id, both content ids, the relation type, and a UTC `created_at`; a repeat submission of the same three fields returns `200` with the existing relation and writes no row or audit event. An unknown content on either side is `404 content_not_found`; blank identifiers, an unknown relation type, a self-loop, or an edge that would close a lineage cycle are `422 validation_error` and write nothing.
+- `GET /v1/content-relations/{relation_id}` — full public fields, or `404 content_relation_not_found`.
+- `GET /v1/contents/{content_id}/relations` — the in- and out-edges of one content in stable creation order as `{"items", "count"}`; an unknown content id is `404 content_not_found`.
+
+The first relation creation and its `content_relation.created` audit event commit in a single transaction.
+
+Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `content_relation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422). Every successful actor, content, claim, evidence bundle, attestation, and content relation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
 
 ## Tests
 

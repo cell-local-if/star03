@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -20,6 +20,8 @@ from provenance.errors import (
     AttestationVerificationError,
     ClaimNotFoundError,
     ContentNotFoundError,
+    ContentRelationNotFoundError,
+    ContentRelationValidationError,
     EvidenceBundleNotFoundError,
     UnknownActorError,
 )
@@ -28,12 +30,14 @@ from provenance.models import (
     EVENT_ATTESTATION_CREATED,
     EVENT_CLAIM_CREATED,
     EVENT_CONTENT_CREATED,
+    EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     Actor,
     Attestation,
     AuditEvent,
     Claim,
     Content,
+    ContentRelation,
     EvidenceBundle,
 )
 from provenance.schemas import (
@@ -41,6 +45,7 @@ from provenance.schemas import (
     AttestationCreate,
     ClaimCreate,
     ContentCreate,
+    ContentRelationCreate,
     EvidenceBundleCreate,
 )
 
@@ -53,6 +58,10 @@ _EVIDENCE_BUNDLE_ORDER = (
     EvidenceBundle.seq.asc(),
 )
 _ATTESTATION_ORDER = (Attestation.created_at.asc(), Attestation.seq.asc())
+_CONTENT_RELATION_ORDER = (
+    ContentRelation.created_at.asc(),
+    ContentRelation.seq.asc(),
+)
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -479,4 +488,140 @@ def list_attestations(
     if target_id is not None:
         stmt = stmt.where(Attestation.target_id == target_id)
     stmt = stmt.order_by(*_ATTESTATION_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
+def _require_content(session: Session, content_id: str) -> Content:
+    """Return content by id or raise :class:`ContentNotFoundError`."""
+    content = session.execute(
+        select(Content).where(Content.id == content_id)
+    ).scalar_one_or_none()
+    if content is None:
+        raise ContentNotFoundError(content_id)
+    return content
+
+
+def _content_relation_identity_select(payload: ContentRelationCreate):
+    return select(ContentRelation).where(
+        ContentRelation.content_id == payload.content_id,
+        ContentRelation.parent_content_id == payload.parent_content_id,
+        ContentRelation.relation_type == payload.relation_type,
+    )
+
+
+def _would_create_cycle(
+    session: Session, content_id: str, parent_content_id: str
+) -> bool:
+    """True if an edge ``content_id -> parent_content_id`` would close a cycle.
+
+    Edges point from a content to its direct source, so a cycle forms exactly
+    when ``content_id`` is already reachable from ``parent_content_id`` by
+    following existing edges.
+    """
+    visited: set[str] = set()
+    frontier = [parent_content_id]
+    while frontier:
+        current = frontier.pop()
+        if current == content_id:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        parents = session.execute(
+            select(ContentRelation.parent_content_id).where(
+                ContentRelation.content_id == current
+            )
+        ).scalars().all()
+        frontier.extend(parents)
+    return False
+
+
+def create_content_relation(
+    session: Session, payload: ContentRelationCreate
+) -> tuple[ContentRelation, bool]:
+    """Create an immutable lineage edge, returning ``(relation, created)``.
+
+    Both endpoints must be existing contents. A self-loop or an edge that
+    would close a cycle is a validation error and writes nothing. A repeat
+    submission of the same two endpoints and relation type returns the
+    existing relation with ``created=False`` and writes no row or audit
+    event. On first creation, the relation row and its
+    ``content_relation.created`` audit event commit in a single transaction.
+    """
+    # A self-loop is invalid input, checked before any existence lookup.
+    if payload.content_id == payload.parent_content_id:
+        raise ContentRelationValidationError("self_relation")
+
+    _require_content(session, payload.content_id)
+    _require_content(session, payload.parent_content_id)
+
+    # An existing edge with this exact identity is returned unchanged; a
+    # repeat submission is idempotent and needs no row or audit event.
+    existing = session.execute(
+        _content_relation_identity_select(payload)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    if _would_create_cycle(session, payload.content_id, payload.parent_content_id):
+        raise ContentRelationValidationError("relation_cycle")
+
+    relation = ContentRelation(
+        id=ids.content_relation_id(
+            payload.content_id, payload.parent_content_id, payload.relation_type
+        ),
+        content_id=payload.content_id,
+        parent_content_id=payload.parent_content_id,
+        relation_type=payload.relation_type,
+    )
+    session.add(relation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_CONTENT_RELATION_CREATED, resource_id=relation.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical relation won the race: return its resource.
+        session.rollback()
+        raced = session.execute(
+            _content_relation_identity_select(payload)
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(relation)
+    return relation, True
+
+
+def get_content_relation(session: Session, relation_id: str) -> ContentRelation:
+    """Return a relation by id or raise :class:`ContentRelationNotFoundError`."""
+    relation = session.execute(
+        select(ContentRelation).where(ContentRelation.id == relation_id)
+    ).scalar_one_or_none()
+    if relation is None:
+        raise ContentRelationNotFoundError(relation_id)
+    return relation
+
+
+def list_content_relations(
+    session: Session, content_id: str
+) -> list[ContentRelation]:
+    """Return the in- and out-edges of one content in stable creation order.
+
+    The content must exist; an unknown content id is a missing resource, not
+    an empty collection.
+    """
+    _require_content(session, content_id)
+    stmt = (
+        select(ContentRelation)
+        .where(
+            or_(
+                ContentRelation.content_id == content_id,
+                ContentRelation.parent_content_id == content_id,
+            )
+        )
+        .order_by(*_CONTENT_RELATION_ORDER)
+    )
     return list(session.execute(stmt).scalars().all())

@@ -92,6 +92,31 @@ class AttestationNotFoundError(DomainError):
         super().__init__(details={"attestation_id": attestation_id})
 
 
+class ContentRelationNotFoundError(DomainError):
+    status_code = 404
+    code = "content_relation_not_found"
+    message = "The requested content relation does not exist."
+
+    def __init__(self, relation_id: str):
+        super().__init__(details={"relation_id": relation_id})
+
+
+class ContentRelationValidationError(DomainError):
+    """A structurally valid relation request that the graph rejects.
+
+    Self-loops and edges that would close a cycle render as the same
+    ``validation_error`` code as malformed payloads: both are client input
+    the service refuses to persist.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str):
+        super().__init__(details={"reason": reason})
+
+
 class AttestationVerificationError(DomainError):
     status_code = 422
     code = "attestation_verification_failed"
