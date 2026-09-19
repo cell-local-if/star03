@@ -107,3 +107,23 @@ def attestation_id(
         ensure_ascii=False,
     ).encode("utf-8")
     return "att_" + hashlib.sha256(material).hexdigest()
+
+
+def attestation_revocation_id(
+    attestation_id: str,
+    revoker_actor_id: str,
+    reason: str,
+) -> str:
+    """Return a stable ``rev_``-prefixed identifier for a revocation.
+
+    The identity is exactly the idempotency key: the revoked attestation,
+    the revoking actor, and the (trimmed) reason text. The material is a
+    canonical JSON array so fields containing separators cannot collide
+    with different field splits.
+    """
+    material = json.dumps(
+        ["attestation_revocation", attestation_id, revoker_actor_id, reason],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "rev_" + hashlib.sha256(material).hexdigest()

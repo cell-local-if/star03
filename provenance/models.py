@@ -39,6 +39,7 @@ EVENT_CONTENT_CREATED = "content.created"
 EVENT_CLAIM_CREATED = "claim.created"
 EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
 EVENT_ATTESTATION_CREATED = "attestation.created"
+EVENT_ATTESTATION_REVOKED = "attestation.revoked"
 EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
@@ -251,6 +252,57 @@ class Attestation(Base):
     )
 
     signer_actor: Mapped[Actor] = relationship()
+
+
+class AttestationRevocation(Base):
+    """An immutable revocation record for an existing attestation.
+
+    A revocation is an append-only statement that an attestation is no
+    longer relied upon. It neither mutates nor deletes the attestation:
+    the original proof and its ``attestation.created`` audit relationship
+    are preserved. Revocations are append-only; there is deliberately no
+    update or delete path.
+    """
+
+    __tablename__ = "attestation_revocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "attestation_id",
+            "revoker_actor_id",
+            "reason",
+            name="uq_attestation_revocations_identity",
+        ),
+        Index(
+            "ix_attestation_revocations_attestation_order",
+            "attestation_id",
+            "created_at",
+            "seq",
+        ),
+        Index("ix_attestation_revocations_created_order", "created_at", "seq"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("rev_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    attestation_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("attestations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    #: The actor recording the revocation; need not be the signer.
+    revoker_actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: Non-empty, human/audit rationale; stored verbatim (trimmed) text.
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    attestation: Mapped[Attestation] = relationship()
+    revoker_actor: Mapped[Actor] = relationship()
 
 
 class ContentRelation(Base):
