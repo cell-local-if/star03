@@ -35,3 +35,23 @@ def content_payload(
         "title": title,
         "actor_id": actor_id,
     }
+
+
+def create_content(client, **overrides):
+    resp = client.post("/v1/contents", json=content_payload(**overrides))
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def claim_payload(
+    content_id=None,
+    actor_id="org-1",
+    claim_type="attribution",
+    payload=None,
+):
+    return {
+        "content_id": content_id,
+        "actor_id": actor_id,
+        "claim_type": claim_type,
+        "payload": payload if payload is not None else {"statement": "created by actor"},
+    }

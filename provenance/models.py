@@ -29,6 +29,7 @@ SUPPORTED_DIGEST_ALGORITHMS = frozenset({"sha256"})
 # Audit event types.
 EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
+EVENT_CLAIM_CREATED = "claim.created"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -48,6 +49,10 @@ class Actor(Base):
     )
 
     contents: Mapped[list["Content"]] = relationship(
+        back_populates="actor", passive_deletes=True
+    )
+
+    claims: Mapped[list["Claim"]] = relationship(
         back_populates="actor", passive_deletes=True
     )
 
@@ -84,6 +89,56 @@ class Content(Base):
     )
 
     actor: Mapped[Actor] = relationship(back_populates="contents")
+
+    claims: Mapped[list["Claim"]] = relationship(
+        back_populates="content", passive_deletes=True
+    )
+
+
+class Claim(Base):
+    """An immutable provenance claim about content, made by an actor.
+
+    Only the SHA-256 digest of the canonical payload is stored: the raw
+    payload is never persisted, so it cannot be read back or logged from the
+    database. Claims are append-only: there is no update or delete path.
+    """
+
+    __tablename__ = "claims"
+    __table_args__ = (
+        UniqueConstraint(
+            "content_id",
+            "actor_id",
+            "claim_type",
+            "payload_digest",
+            name="uq_claims_identity",
+        ),
+        Index("ix_claims_content_order", "content_id", "created_at", "seq"),
+    )
+
+    #: Monotonic insertion surrogate; the tiebreaker for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Deterministic server-generated identifier ("clm_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    content_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("contents.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The claiming actor; need not equal the content's registering actor.
+    actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    claim_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_digest_algorithm: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    payload_digest: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    content: Mapped[Content] = relationship(back_populates="claims")
+    actor: Mapped[Actor] = relationship(back_populates="claims")
 
 
 class AuditEvent(Base):

@@ -36,7 +36,13 @@ Versioned JSON routes under `/v1`:
 - `GET /v1/contents/{content_id}` — full public fields, or `404 content_not_found`.
 - `GET /v1/contents?actor_id=...` — contents in stable creation order, optionally filtered by source actor.
 
-Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), and `validation_error` (422). Every successful actor creation and first content creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
+### Immutable content claims
+
+- `POST /v1/claims` — attach an immutable claim (`content_id`, `actor_id`, non-empty `claim_type`, and a JSON-object `payload`) to existing content from an existing actor. The claiming actor need not be the content's registering actor. The server canonicalizes the payload deterministically (JCS/RFC 8785: UTF-8, compact, object members sorted by UTF-16 code units) and stores only the `sha256` digest of the canonical bytes — the raw payload is never echoed or persisted. Returns `201` with the stable claim id, the association fields, `payload_digest_algorithm`, `payload_digest`, and a UTC `created_at`. A repeat submission with the same content, actor, claim type, and canonical payload (whitespace, key order, and `1` vs `1.0` do not matter) returns `200` with the existing claim and no new audit event; any different tuple forms a new, independent claim. Claims cannot be updated or deleted.
+- `GET /v1/claims/{claim_id}` — full public fields, or `404 claim_not_found`.
+- `GET /v1/contents/{content_id}/claims` — that content's claims in stable creation order as `items` plus `count`; unknown content gives `404 content_not_found`.
+
+Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), and `validation_error` (422). Non-object payloads, blank claim types, and non-finite JSON numbers (`NaN`/`Infinity`) are validation errors; unknown content or actor references keep their distinct missing-resource status. Every successful actor creation, first content creation, and first claim creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write; the `claim.created` event references the stable claim id. Idempotent resubmissions and failed requests write no audit events. All returned timestamps are timezone-aware UTC.
 
 ## Tests
 

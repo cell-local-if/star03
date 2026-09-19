@@ -11,6 +11,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from provenance import canonical
 from provenance.models import SUPPORTED_DIGEST_ALGORITHMS
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -112,4 +113,62 @@ class ContentResponse(BaseModel):
 
 class ContentListResponse(BaseModel):
     items: list[ContentResponse]
+    count: int
+
+
+class ClaimCreate(BaseModel):
+    content_id: str = Field(..., min_length=1, max_length=80)
+    actor_id: str = Field(..., min_length=1, max_length=255)
+    claim_type: str = Field(..., min_length=1, max_length=128)
+    #: Must be a JSON object. Its raw value is never persisted or echoed; only
+    #: the digest of its canonical form is stored.
+    payload: dict[str, object]
+
+    @field_validator("content_id")
+    @classmethod
+    def _content_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "content_id")
+
+    @field_validator("actor_id")
+    @classmethod
+    def _actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "actor_id")
+
+    @field_validator("claim_type")
+    @classmethod
+    def _claim_type_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "claim_type")
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def _payload_must_be_object(cls, v: object) -> object:
+        # A bare JSON null must not be coerced into an empty object; the
+        # declared dict type already rejects arrays, scalars, and booleans.
+        if v is None:
+            raise ValueError("payload must be a JSON object")
+        return v
+
+    @field_validator("payload")
+    @classmethod
+    def _payload_is_canonicalizable_object(cls, v: dict[str, object]) -> dict[str, object]:
+        # Reject at the validation boundary anything canonical JSON cannot
+        # represent (e.g. NaN/Infinity inside the object).
+        canonical.canonical_json(v)
+        return v
+
+
+class ClaimResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    content_id: str
+    actor_id: str
+    claim_type: str
+    payload_digest_algorithm: str
+    payload_digest: str
+    created_at: datetime
+
+
+class ClaimListResponse(BaseModel):
+    items: list[ClaimResponse]
     count: int
