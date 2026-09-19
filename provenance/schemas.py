@@ -147,6 +147,21 @@ class ContentListResponse(BaseModel):
     count: int
 
 
+class ContentLineageItem(ContentResponse):
+    """A content reached by lineage traversal: the full public view plus depth.
+
+    ``depth`` is the shortest number of lineage edges from the traversal
+    origin; the origin itself is never included.
+    """
+
+    depth: int
+
+
+class ContentLineageResponse(BaseModel):
+    items: list[ContentLineageItem]
+    count: int
+
+
 class ClaimCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     actor_id: str = Field(..., min_length=1, max_length=255)

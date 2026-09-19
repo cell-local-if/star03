@@ -625,3 +625,85 @@ def list_content_relations(
         .order_by(*_CONTENT_RELATION_ORDER)
     )
     return list(session.execute(stmt).scalars().all())
+
+
+# Lineage traversal directions.
+LINEAGE_ANCESTORS = "ancestors"
+LINEAGE_DESCENDANTS = "descendants"
+LINEAGE_DIRECTIONS = frozenset({LINEAGE_ANCESTORS, LINEAGE_DESCENDANTS})
+
+DEFAULT_LINEAGE_MAX_DEPTH = 8
+MIN_LINEAGE_MAX_DEPTH = 1
+MAX_LINEAGE_MAX_DEPTH = 32
+
+
+def get_content_lineage(
+    session: Session,
+    content_id: str,
+    direction: str,
+    max_depth: int = DEFAULT_LINEAGE_MAX_DEPTH,
+) -> list[tuple[Content, int]]:
+    """Return reachable contents as ``(content, depth)`` pairs.
+
+    Ancestor traversal follows edges from a content to its direct source
+    (``content_id -> parent_content_id``); descendant traversal follows them
+    in reverse. The origin is never included. Only contents reachable within
+    ``max_depth`` edges are returned; each content appears once at its
+    shortest depth. Pairs are ordered by depth ascending; within one depth,
+    contents are ordered by the stable creation order of the edge through
+    which they were first reached.
+
+    The traversal is read-only and tracks a visited set, so even anomalous
+    history containing a cycle terminates and the walk is bounded by
+    ``max_depth``. The origin must exist or :class:`ContentNotFoundError` is
+    raised.
+    """
+    # A missing origin is a missing resource, checked before any traversal.
+    _require_content(session, content_id)
+
+    if direction == LINEAGE_ANCESTORS:
+        source_col = ContentRelation.content_id
+        neighbor_col = ContentRelation.parent_content_id
+    else:
+        source_col = ContentRelation.parent_content_id
+        neighbor_col = ContentRelation.content_id
+
+    visited: set[str] = {content_id}
+    frontier: list[str] = [content_id]
+    reached: list[tuple[str, int]] = []
+    for depth in range(1, max_depth + 1):
+        if not frontier:
+            break
+        # Ordering every edge leaving the current frontier by its stable
+        # creation order fixes each level's first-discovery order, including
+        # converging paths whose discovering edges differ.
+        neighbor_ids = session.execute(
+            select(neighbor_col)
+            .where(source_col.in_(frontier))
+            .order_by(*_CONTENT_RELATION_ORDER)
+        ).scalars().all()
+        next_frontier: list[str] = []
+        for neighbor_id in neighbor_ids:
+            if neighbor_id in visited:
+                # Already reached at an equal or shorter depth; also what
+                # makes an anomalous cycle terminate.
+                continue
+            visited.add(neighbor_id)
+            next_frontier.append(neighbor_id)
+            reached.append((neighbor_id, depth))
+        frontier = next_frontier
+
+    if not reached:
+        return []
+
+    contents = (
+        session.execute(
+            select(Content).where(
+                Content.id.in_([reached_id for reached_id, _ in reached])
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {content.id: content for content in contents}
+    return [(by_id[reached_id], depth) for reached_id, depth in reached]

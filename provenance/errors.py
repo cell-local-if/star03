@@ -126,6 +126,21 @@ class AttestationVerificationError(DomainError):
         super().__init__(details=details)
 
 
+class LineageValidationError(DomainError):
+    """A malformed lineage query (``direction`` / ``max_depth``).
+
+    Renders with the same ``validation_error`` code and issue-shaped details
+    as request-body validation failures.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, issues: list[dict]):
+        super().__init__(details={"issues": issues})
+
+
 def _validation_body(exc: RequestValidationError) -> dict:
     # Keep the payload small, stable, and JSON-safe: loc/msg/type per error.
     issues = [

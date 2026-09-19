@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import re
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from provenance import service
+from provenance.errors import LineageValidationError
 from provenance.schemas import (
     ActorCreate,
     ActorResponse,
@@ -19,6 +21,8 @@ from provenance.schemas import (
     ClaimListResponse,
     ClaimResponse,
     ContentCreate,
+    ContentLineageItem,
+    ContentLineageResponse,
     ContentListResponse,
     ContentRelationCreate,
     ContentRelationListResponse,
@@ -115,6 +119,86 @@ def list_content_relations(
     items = service.list_content_relations(session, content_id)
     return ContentRelationListResponse(
         items=[ContentRelationResponse.model_validate(item) for item in items],
+        count=len(items),
+    )
+
+
+def _lineage_item(content, depth: int):
+    # The full public content view, with the traversal depth added.
+    fields = ContentResponse.model_validate(content).model_dump()
+    return ContentLineageItem(**fields, depth=depth)
+
+
+_INTEGER_RE = re.compile(r"-?[0-9]+")
+
+
+def _lineage_query_error(field: str, msg: str, error_type: str):
+    return LineageValidationError(
+        [{"loc": ["query", field], "msg": msg, "type": error_type}]
+    )
+
+
+@router.get(
+    "/contents/{content_id}/lineage",
+    response_model=ContentLineageResponse,
+)
+def get_content_lineage(
+    content_id: str,
+    request: Request,
+    session: DbSession,
+    direction: str | None = Query(default=None),
+    max_depth: str | None = Query(default=None),
+) -> ContentLineageResponse:
+    # Raw multi-values are inspected deliberately: FastAPI otherwise keeps
+    # only the last value of a repeated scalar parameter and Pydantic coerces
+    # "8.0" to 8, both of which must be rejected rather than silently
+    # defaulted or normalized.
+    raw = request.query_params
+    for field in ("direction", "max_depth"):
+        if len(raw.getlist(field)) > 1:
+            raise _lineage_query_error(
+                field,
+                f"query parameter {field} must be provided exactly once",
+                "value_error.repeated",
+            )
+
+    if direction is None:
+        raise _lineage_query_error(
+            "direction", "Field required", "value_error.missing"
+        )
+    if direction not in service.LINEAGE_DIRECTIONS:
+        # Covers missing values, whitespace/blank strings, and any value
+        # other than the two literal traversal directions.
+        raise _lineage_query_error(
+            "direction",
+            "direction must be 'ancestors' or 'descendants'",
+            "value_error",
+        )
+
+    if max_depth is None:
+        depth = service.DEFAULT_LINEAGE_MAX_DEPTH
+    else:
+        if not _INTEGER_RE.fullmatch(max_depth):
+            raise _lineage_query_error(
+                "max_depth",
+                "max_depth must be an integer",
+                "value_error.integer",
+            )
+        depth = int(max_depth)
+        if not (
+            service.MIN_LINEAGE_MAX_DEPTH
+            <= depth
+            <= service.MAX_LINEAGE_MAX_DEPTH
+        ):
+            raise _lineage_query_error(
+                "max_depth",
+                "max_depth must be between 1 and 32",
+                "value_error.range",
+            )
+
+    items = service.get_content_lineage(session, content_id, direction, depth)
+    return ContentLineageResponse(
+        items=[_lineage_item(content, d) for content, d in items],
         count=len(items),
     )
 
