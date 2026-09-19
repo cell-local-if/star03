@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from provenance import canonical, ed25519, ids, signing
 from provenance.errors import (
+    AccessGrantValidationError,
     ActorAlreadyExistsError,
     AttestationNotFoundError,
     AttestationRevocationNotFoundError,
@@ -28,6 +29,7 @@ from provenance.errors import (
 )
 from provenance.models import (
     EVENT_ACTOR_CREATED,
+    EVENT_ATTESTATION_ACCESS_GRANTED,
     EVENT_ATTESTATION_CREATED,
     EVENT_ATTESTATION_REVOKED,
     EVENT_CLAIM_CREATED,
@@ -36,6 +38,7 @@ from provenance.models import (
     EVENT_EVIDENCE_BUNDLE_CREATED,
     Actor,
     Attestation,
+    AttestationAccessGrant,
     AttestationRevocation,
     AuditEvent,
     Claim,
@@ -45,6 +48,7 @@ from provenance.models import (
 )
 from provenance.schemas import (
     ActorCreate,
+    AttestationAccessGrantCreate,
     AttestationCreate,
     AttestationRevocationCreate,
     ClaimCreate,
@@ -641,6 +645,103 @@ def list_revocations_for_attestation(
         .order_by(*_ATTESTATION_REVOCATION_ORDER)
     )
     return list(session.execute(stmt).scalars().all())
+
+
+def _grant_identity_select(payload: AttestationAccessGrantCreate):
+    return select(AttestationAccessGrant).where(
+        AttestationAccessGrant.attestation_id == payload.attestation_id,
+        AttestationAccessGrant.grantee_actor_id == payload.grantee_actor_id,
+    )
+
+
+def create_attestation_access_grant(
+    session: Session, payload: AttestationAccessGrantCreate, caller_actor_id: str
+) -> tuple[AttestationAccessGrant, bool]:
+    """Create an immutable read-access grant, returning ``(grant, created)``.
+
+    The caller must be the attestation's ``signer_actor_id``; only that
+    actor can share read access to its proof. Both the attestation and the
+    grantee actor must already exist. A repeat submission for the same
+    attestation and grantee returns the existing grant with
+    ``created=False`` and writes no row or audit event; any different pair
+    forms an independent, immutable grant. On first creation the grant row
+    and its ``attestation.access_granted`` audit event commit in a single
+    transaction.
+
+    A missing attestation, a missing grantee actor, or a non-signer caller
+    raises :class:`AccessGrantValidationError` and writes nothing.
+    """
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == payload.attestation_id)
+    ).scalar_one_or_none()
+    if attestation is None:
+        raise AccessGrantValidationError("unknown_attestation")
+
+    grantee = session.get(Actor, payload.grantee_actor_id)
+    if grantee is None:
+        raise AccessGrantValidationError("unknown_grantee_actor")
+
+    if attestation.signer_actor_id != caller_actor_id:
+        raise AccessGrantValidationError("not_signer")
+
+    existing = session.execute(
+        _grant_identity_select(payload)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    grant = AttestationAccessGrant(
+        id=ids.attestation_access_grant_id(
+            payload.attestation_id, payload.grantee_actor_id
+        ),
+        attestation_id=payload.attestation_id,
+        grantee_actor_id=payload.grantee_actor_id,
+    )
+    session.add(grant)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_ATTESTATION_ACCESS_GRANTED, resource_id=grant.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical grant won the race: return its record.
+        session.rollback()
+        raced = session.execute(
+            _grant_identity_select(payload)
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(grant)
+    return grant, True
+
+
+def get_protected_attestation(
+    session: Session, attestation_id: str, actor_id: str
+) -> Attestation | None:
+    """Return an attestation readable by ``actor_id``, else ``None``.
+
+    Only the attestation's signer or an actor holding an access grant may
+    read its protected view. A missing attestation or a lack of permission
+    are indistinguishable to the caller: both return ``None`` and the
+    route renders a single 404. The function is strictly read-only.
+    """
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == attestation_id)
+    ).scalar_one_or_none()
+    if attestation is None:
+        return None
+    if attestation.signer_actor_id == actor_id:
+        return attestation
+    grant = session.execute(
+        select(AttestationAccessGrant.id).where(
+            AttestationAccessGrant.attestation_id == attestation_id,
+            AttestationAccessGrant.grantee_actor_id == actor_id,
+        )
+    ).scalar_one_or_none()
+    return attestation if grant is not None else None
 
 
 # Trust evaluation threshold bounds.

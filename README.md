@@ -89,6 +89,29 @@ A revocation is an immutable, append-only record that an existing attestation is
 
 The first revocation write and its `attestation.revoked` audit event commit in a single transaction. An unknown attestation is `404 attestation_not_found` and an unknown revoking actor is `404 unknown_actor`. Blank or whitespace-only `attestation_id`, `revoker_actor_id`, or `reason`, malformed JSON, and any undeclared request field are `422 validation_error` and write neither a record nor an audit event. Because records are append-only, any attempt to update or delete a revocation is met with `405 method_not_allowed`; no such mutation path is provided.
 
+## Read-only attestation access grants
+
+A read-only access grant lets the signer of an existing attestation share that proof's protected view with one other existing actor. Grants are immutable and append-only: there is no update or delete path, and a grant never carries or echoes key or signature material. Both creating a grant and reading the protected view are authenticated by a signed-access header set rather than a bearer token.
+
+Every such request must carry exactly one each of:
+
+- `X-PA` — the acting actor id.
+- `X-PT` — the request timestamp as an RFC 3339 UTC string (`Z` or `+00:00`), whose absolute distance from the current time is at most **300 seconds**.
+- `X-PS` — a standard-Base64 Ed25519 signature decoding to exactly **64 bytes**.
+
+The signature is verified against the exact UTF-8 canonical JSON array (compact separators, non-ASCII emitted unescaped):
+
+```
+["provenance-access-v1",method,path,timestamp,body_sha256]
+```
+
+`method` and `path` are the HTTP method and the request path as served; `timestamp` is the exact `X-PT` value; `body_sha256` is the lowercase hex SHA-256 of the actual request body bytes (the SHA-256 of zero bytes for an empty body). The signature must verify under the public key stored on **any attestation by that actor that carries no revocation**; an attestation with a recorded revocation no longer authenticates, and an actor with no non-revoked attestation key cannot call either route.
+
+- `POST /v1/attestation-access-grants` — JSON body contains `attestation_id` and `grantee_actor_id` (both non-empty; any undeclared field is rejected). The authenticated caller must be that attestation's `signer_actor_id`; only the signer can grant access. The first creation returns `201` with exactly `{id, attestation_id, grantee_actor_id, created_at}` (a stable `aag_` id and a UTC timestamp). A repeat submission for the same attestation–grantee pair returns `200` with the original record, writes no row, and appends no audit event; any different pair forms an independent, immutable grant. The first grant row and its `attestation.access_granted` audit event commit in a single transaction. Missing, repeated, or blank access headers; a malformed or out-of-window timestamp; malformed or wrong-length Base64; a signature over any other message or a body whose bytes do not hash to `body_sha256`; and a signature no non-revoked key of the actor verifies are all `422 validation_error`. A missing attestation, a missing grantee actor, or a caller who is not the attestation's signer is likewise `422 validation_error` and writes nothing.
+- `GET /v1/protected/attestations/{attestation_id}` — authenticated with the same headers; the empty body is signed as the SHA-256 of zero bytes. Only the attestation's `signer_actor_id` or a `grantee_actor_id` holding an access grant for it may read it; a successful response is the existing attestation public view. This endpoint never distinguishes the failure cases: a missing attestation, an unauthenticated request (missing/malformed headers, bad or stale timestamp, unverifiable or revoked key), and an authenticated but unauthorized actor are all `404 attestation_not_found`, with no resource or audit write.
+
+Neither route mutates on a failure, and the protected read never writes a resource row or an audit event.
+
 ## Content lineage relations
 
 Relations record how content identities descend from one another: `content_id` is the newer version or derived content, `parent_content_id` is its direct source, and `relation_type` is `version_of` or `derived_from`. Relations are immutable and append-only: there is no update or delete path.
@@ -100,7 +123,7 @@ Relations record how content identities descend from one another: `content_id` i
 
 The first relation creation and its `content_relation.created` audit event commit in a single transaction.
 
-Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `attestation_revocation_not_found` (404), `content_relation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422). Every successful actor, content, claim, evidence bundle, attestation, attestation revocation, and content relation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write; a revocation records the `attestation.revoked` event. All returned timestamps are timezone-aware UTC.
+Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `attestation_revocation_not_found` (404), `content_relation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422). Every successful actor, content, claim, evidence bundle, attestation, attestation revocation, attestation access grant, and content relation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write; a revocation records the `attestation.revoked` event and an access grant records the `attestation.access_granted` event. Protected attestation reads append no audit rows. All returned timestamps are timezone-aware UTC.
 
 ## Tests
 

@@ -150,6 +150,40 @@ class LineageValidationError(DomainError):
         super().__init__(details={"issues": issues})
 
 
+class AccessValidationError(DomainError):
+    """A malformed signed-access request (headers, timestamp, or signature).
+
+    Used by access-protected writes, where every malformed element is a
+    client validation failure rendering as ``validation_error``. Protected
+    reads never raise this: the same failures collapse to a missing
+    resource (404) so the endpoint neither authenticates nor reveals it.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str):
+        super().__init__(details={"reason": reason})
+
+
+class AccessGrantValidationError(DomainError):
+    """A structurally valid grant request that the domain refuses.
+
+    A missing attestation, a missing grantee actor, or a caller who is not
+    the attestation's signer are all client validation failures for the
+    grant endpoint, rendering with the same ``validation_error`` code as
+    malformed payloads.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str):
+        super().__init__(details={"reason": reason})
+
+
 def _validation_body(exc: RequestValidationError) -> dict:
     # Keep the payload small, stable, and JSON-safe: loc/msg/type per error.
     issues = [

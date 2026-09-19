@@ -40,6 +40,7 @@ EVENT_CLAIM_CREATED = "claim.created"
 EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
 EVENT_ATTESTATION_CREATED = "attestation.created"
 EVENT_ATTESTATION_REVOKED = "attestation.revoked"
+EVENT_ATTESTATION_ACCESS_GRANTED = "attestation.access_granted"
 EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
@@ -303,6 +304,57 @@ class AttestationRevocation(Base):
 
     attestation: Mapped[Attestation] = relationship()
     revoker_actor: Mapped[Actor] = relationship()
+
+
+class AttestationAccessGrant(Base):
+    """An immutable, read-only access grant for one attestation.
+
+    The attestation's ``signer_actor_id`` grants another existing actor
+    (the grantee) read access to the attestation's protected view. A grant
+    is append-only; there is deliberately no update or delete path. The
+    same ``(attestation_id, grantee_actor_id)`` pair is a single immutable
+    record: a repeat submission returns it unchanged with no new audit
+    event.
+    """
+
+    __tablename__ = "attestation_access_grants"
+    __table_args__ = (
+        UniqueConstraint(
+            "attestation_id",
+            "grantee_actor_id",
+            name="uq_attestation_access_grants_identity",
+        ),
+        Index(
+            "ix_attestation_access_grants_attestation_order",
+            "attestation_id",
+            "created_at",
+            "seq",
+        ),
+        Index(
+            "ix_attestation_access_grants_created_order", "created_at", "seq"
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("aag_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    attestation_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("attestations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    #: The actor granted read access; must already exist.
+    grantee_actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    attestation: Mapped[Attestation] = relationship()
+    grantee_actor: Mapped[Actor] = relationship()
 
 
 class ContentRelation(Base):

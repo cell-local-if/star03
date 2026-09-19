@@ -127,3 +127,21 @@ def attestation_revocation_id(
         ensure_ascii=False,
     ).encode("utf-8")
     return "rev_" + hashlib.sha256(material).hexdigest()
+
+
+def attestation_access_grant_id(
+    attestation_id: str,
+    grantee_actor_id: str,
+) -> str:
+    """Return a stable ``aag_``-prefixed identifier for an access grant.
+
+    The identity is exactly the idempotency key: the attestation and the
+    grantee actor. The material is a canonical JSON array so fields
+    containing separators cannot collide with different field splits.
+    """
+    material = json.dumps(
+        ["attestation_access_grant", attestation_id, grantee_actor_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "aag_" + hashlib.sha256(material).hexdigest()

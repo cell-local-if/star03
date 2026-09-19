@@ -9,14 +9,16 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
-from provenance import pagination, service
-from provenance.errors import LineageValidationError
+from provenance import access, pagination, service
+from provenance.errors import AttestationNotFoundError, LineageValidationError
 from provenance.models import RELATION_DERIVED_FROM, RELATION_VERSION_OF
 from provenance.pagination import InvalidCursorError
 from provenance.signing import ATTESTATION_TARGET_TYPES
 from provenance.schemas import (
     ActorCreate,
     ActorResponse,
+    AttestationAccessGrantCreate,
+    AttestationAccessGrantResponse,
     AttestationCreate,
     AttestationListResponse,
     AttestationResponse,
@@ -609,6 +611,53 @@ def list_attestation_revocations(
         items=[AttestationRevocationResponse.model_validate(item) for item in items],
         count=len(items),
     )
+
+
+@router.post(
+    "/attestation-access-grants",
+    response_model=AttestationAccessGrantResponse,
+)
+async def create_attestation_access_grant(
+    request: Request,
+    payload: AttestationAccessGrantCreate,
+    session: DbSession,
+    response: Response,
+) -> AttestationAccessGrantResponse:
+    # Every malformed access element (missing/repeated headers, timestamp
+    # outside the window, malformed or unverifiable signature) is a 422 and
+    # reaches the service only after authentication succeeds. Reading the
+    # raw body here is safe: Starlette caches it for the Pydantic parse.
+    caller_actor_id = await access.authenticate(request, session)
+    grant, created = service.create_attestation_access_grant(
+        session, payload, caller_actor_id
+    )
+    # First creation -> 201; an idempotent repeat submission -> 200, and the
+    # existing immutable grant is returned unchanged with no audit event.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return AttestationAccessGrantResponse.model_validate(grant)
+
+
+@router.get(
+    "/protected/attestations/{attestation_id}",
+    response_model=AttestationResponse,
+)
+async def get_protected_attestation(
+    attestation_id: str, request: Request, session: DbSession
+) -> AttestationResponse:
+    # A protected read never reveals which condition failed: an absent
+    # attestation, an unauthenticated request, and an unauthorized actor
+    # all render as the same 404.
+    actor_id = await access.authenticate_or_none(request, session)
+    attestation = (
+        service.get_protected_attestation(session, attestation_id, actor_id)
+        if actor_id is not None
+        else None
+    )
+    if attestation is None:
+        raise AttestationNotFoundError(attestation_id)
+    return _attestation_response(attestation)
 
 
 _TRUST_EVALUATION_PARAMS = frozenset(
