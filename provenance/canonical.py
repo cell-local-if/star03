@@ -33,3 +33,24 @@ def canonical_json_bytes(value: Any) -> bytes:
 def payload_digest_hex(payload: Any) -> str:
     """Return the SHA-256 hex digest of the canonical claim payload bytes."""
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+#: Domain separator for attestation signature messages.
+ATTESTATION_DOMAIN = "provenance-attestation-v1"
+
+
+def attestation_message_bytes(
+    target_type: str, target_id: str, signer_actor_id: str
+) -> bytes:
+    """Return the canonical UTF-8 message an attestation signature commits to.
+
+    The message is the compact JSON array
+    ``["provenance-attestation-v1", target_type, target_id, signer_actor_id]``
+    with no ASCII escaping, encoded as UTF-8, so signer and verifier derive
+    byte-identical messages regardless of platform or escaping choices.
+    """
+    return json.dumps(
+        [ATTESTATION_DOMAIN, target_type, target_id, signer_actor_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")

@@ -54,9 +54,19 @@ Evidence bundles attach externally verifiable evidence to an existing claim by d
 - `GET /v1/evidence-bundles/{evidence_bundle_id}` — full public fields, or `404 evidence_bundle_not_found`.
 - `GET /v1/claims/{claim_id}/evidence-bundles` — that claim's bundles only, in stable creation order as `{"items", "count"}`; an unknown claim id is `404 claim_not_found` (a missing claim is never an empty collection).
 
-The first bundle creation and its `evidence_bundle.created` audit event commit in a single transaction. Blank text fields, non-object metadata, unsupported algorithms or malformed digests, and malformed JSON are `422 validation_error`; an unknown claim on creation or listing remains `404 claim_not_found`.
+The first bundle creation and its `evidence_bundle.created` audit event commit in a single transaction. Blank text fields, non-object metadata, unsupported algorithms or malformed digests, undeclared request fields (including any field that could carry raw evidence bytes), and malformed JSON are `422 validation_error` with no resource or audit write; an unknown claim on creation or listing remains `404 claim_not_found`.
 
-Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), and `validation_error` (422). Every successful actor, content, claim, and evidence bundle creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
+## Verifiable attestations
+
+Attestations let an existing actor sign an existing claim or evidence bundle with Ed25519. The server verifies the signature over a canonical message before anything is persisted, so every stored attestation is verified. The raw signature is never stored or echoed — only its SHA-256 digest is kept, which is enough to recognize a repeat submission.
+
+- `POST /v1/attestations` — create an attestation with `target_type` (`claim` or `evidence_bundle`), `target_id`, `signer_actor_id`, a Base64 Ed25519 `public_key` (decodes to exactly 32 bytes), and a Base64 `signature` (decodes to exactly 64 bytes). The target and the signer actor must already exist. The signature must verify over the UTF-8 bytes of the compact JSON array `["provenance-attestation-v1", target_type, target_id, signer_actor_id]` (no ASCII escaping). The first creation returns `201` with the stable `att_` id, target, signer, public key, `signature_digest_algorithm=sha256`, the signature digest, `verified=true`, and UTC `created_at`; a repeat submission with the same target, signer, public key, and signature digest returns `200` with the existing attestation and adds no audit event.
+- `GET /v1/attestations/{attestation_id}` — full public fields, or `404 attestation_not_found`.
+- `GET /v1/attestations?target_type=...&target_id=...` — attestations in stable creation order as `{"items", "count"}`, optionally filtered by target type and/or target id.
+
+The first attestation creation and its `attestation.created` audit event commit in a single transaction. Invalid Base64, wrong decoded lengths, an unknown target type, undeclared fields, and malformed JSON are `422 validation_error`; a signature that does not verify is `422 attestation_verification_failed`; an unknown target or signer remains `404 claim_not_found` / `evidence_bundle_not_found` / `unknown_actor`. Ed25519 verification is a self-contained pure-Python RFC 8032 implementation — no new dependencies.
+
+Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422). Every successful actor, content, claim, evidence bundle, and attestation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
 
 ## Tests
 

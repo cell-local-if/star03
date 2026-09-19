@@ -7,13 +7,18 @@ adds no audit event.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from provenance import canonical, ids
+from provenance import canonical, ed25519, ids
 from provenance.errors import (
     ActorAlreadyExistsError,
+    AttestationNotFoundError,
+    AttestationVerificationError,
     ClaimNotFoundError,
     ContentNotFoundError,
     EvidenceBundleNotFoundError,
@@ -21,10 +26,12 @@ from provenance.errors import (
 )
 from provenance.models import (
     EVENT_ACTOR_CREATED,
+    EVENT_ATTESTATION_CREATED,
     EVENT_CLAIM_CREATED,
     EVENT_CONTENT_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     Actor,
+    Attestation,
     AuditEvent,
     Claim,
     Content,
@@ -32,6 +39,7 @@ from provenance.models import (
 )
 from provenance.schemas import (
     ActorCreate,
+    AttestationCreate,
     ClaimCreate,
     ContentCreate,
     EvidenceBundleCreate,
@@ -45,6 +53,7 @@ _EVIDENCE_BUNDLE_ORDER = (
     EvidenceBundle.created_at.asc(),
     EvidenceBundle.seq.asc(),
 )
+_ATTESTATION_ORDER = (Attestation.created_at.asc(), Attestation.seq.asc())
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -334,4 +343,124 @@ def list_evidence_bundles_for_claim(
         .where(EvidenceBundle.claim_id == claim_id)
         .order_by(*_EVIDENCE_BUNDLE_ORDER)
     )
+    return list(session.execute(stmt).scalars().all())
+
+
+def _attestation_identity_select(
+    payload: AttestationCreate, signature_digest_hex: str
+):
+    return select(Attestation).where(
+        Attestation.target_type == payload.target_type,
+        Attestation.target_id == payload.target_id,
+        Attestation.signer_actor_id == payload.signer_actor_id,
+        Attestation.public_key_b64 == payload.public_key,
+        Attestation.signature_digest_hex == signature_digest_hex,
+    )
+
+
+def create_attestation(
+    session: Session, payload: AttestationCreate
+) -> tuple[Attestation, bool]:
+    """Create a verified attestation, returning ``(attestation, created)``.
+
+    The target (an existing claim or evidence bundle) and the signer actor
+    must already exist. The Ed25519 signature is verified against the
+    canonical message for the target and signer; only verified attestations
+    are persisted, and only the signature's SHA-256 digest is stored -- the
+    raw signature is never written. A repeat submission of the same target,
+    signer, public key, and signature digest returns the existing
+    attestation with ``created=False`` and writes no row or audit event.
+    The attestation row and its ``attestation.created`` audit event commit
+    in a single transaction.
+    """
+    if payload.target_type == "claim":
+        target = session.execute(
+            select(Claim).where(Claim.id == payload.target_id)
+        ).scalar_one_or_none()
+        if target is None:
+            raise ClaimNotFoundError(payload.target_id)
+    else:
+        target = session.execute(
+            select(EvidenceBundle).where(EvidenceBundle.id == payload.target_id)
+        ).scalar_one_or_none()
+        if target is None:
+            raise EvidenceBundleNotFoundError(payload.target_id)
+
+    signer = session.get(Actor, payload.signer_actor_id)
+    if signer is None:
+        raise UnknownActorError(payload.signer_actor_id)
+
+    public_key = base64.b64decode(payload.public_key)
+    signature = base64.b64decode(payload.signature)
+    message = canonical.attestation_message_bytes(
+        payload.target_type, payload.target_id, payload.signer_actor_id
+    )
+    if not ed25519.verify(public_key, signature, message):
+        raise AttestationVerificationError()
+
+    signature_digest_hex = hashlib.sha256(signature).hexdigest()
+    existing = session.execute(
+        _attestation_identity_select(payload, signature_digest_hex)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    attestation = Attestation(
+        id=ids.attestation_id(
+            payload.target_type,
+            payload.target_id,
+            payload.signer_actor_id,
+            payload.public_key,
+            signature_digest_hex,
+        ),
+        target_type=payload.target_type,
+        target_id=payload.target_id,
+        signer_actor_id=payload.signer_actor_id,
+        public_key_b64=payload.public_key,
+        signature_digest_algorithm=canonical.CANONICAL_DIGEST_ALGORITHM,
+        signature_digest_hex=signature_digest_hex,
+    )
+    session.add(attestation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_ATTESTATION_CREATED, resource_id=attestation.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical attestation won the race: return its resource.
+        session.rollback()
+        raced = session.execute(
+            _attestation_identity_select(payload, signature_digest_hex)
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(attestation)
+    return attestation, True
+
+
+def get_attestation(session: Session, attestation_id: str) -> Attestation:
+    """Return an attestation by id or raise :class:`AttestationNotFoundError`."""
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == attestation_id)
+    ).scalar_one_or_none()
+    if attestation is None:
+        raise AttestationNotFoundError(attestation_id)
+    return attestation
+
+
+def list_attestations(
+    session: Session,
+    target_type: str | None = None,
+    target_id: str | None = None,
+) -> list[Attestation]:
+    """Return attestations in stable creation order, optionally filtered."""
+    stmt = select(Attestation)
+    if target_type is not None:
+        stmt = stmt.where(Attestation.target_type == target_type)
+    if target_id is not None:
+        stmt = stmt.where(Attestation.target_id == target_id)
+    stmt = stmt.order_by(*_ATTESTATION_ORDER)
     return list(session.execute(stmt).scalars().all())

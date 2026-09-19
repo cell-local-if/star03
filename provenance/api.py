@@ -11,6 +11,9 @@ from provenance import service
 from provenance.schemas import (
     ActorCreate,
     ActorResponse,
+    AttestationCreate,
+    AttestationListResponse,
+    AttestationResponse,
     ClaimCreate,
     ClaimListResponse,
     ClaimResponse,
@@ -151,5 +154,56 @@ def list_claim_evidence_bundles(
     items = service.list_evidence_bundles_for_claim(session, claim_id)
     return EvidenceBundleListResponse(
         items=[_bundle_response(item) for item in items],
+        count=len(items),
+    )
+
+
+def _attestation_response(attestation) -> AttestationResponse:
+    # Map the ORM's ``public_key_b64`` to the wire-level ``public_key`` and
+    # expose the always-true verification state; the raw signature is never
+    # stored, so it can never be echoed.
+    return AttestationResponse(
+        id=attestation.id,
+        target_type=attestation.target_type,
+        target_id=attestation.target_id,
+        signer_actor_id=attestation.signer_actor_id,
+        public_key=attestation.public_key_b64,
+        signature_digest_algorithm=attestation.signature_digest_algorithm,
+        signature_digest_hex=attestation.signature_digest_hex,
+        verified=True,
+        created_at=attestation.created_at,
+    )
+
+
+@router.post("/attestations", response_model=AttestationResponse)
+def create_attestation(
+    payload: AttestationCreate, session: DbSession, response: Response
+) -> AttestationResponse:
+    attestation, created = service.create_attestation(session, payload)
+    # First creation -> 201; an idempotent repeat submission -> 200, and the
+    # existing attestation is returned unchanged.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _attestation_response(attestation)
+
+
+@router.get(
+    "/attestations/{attestation_id}", response_model=AttestationResponse
+)
+def get_attestation(attestation_id: str, session: DbSession) -> AttestationResponse:
+    attestation = service.get_attestation(session, attestation_id)
+    return _attestation_response(attestation)
+
+
+@router.get("/attestations", response_model=AttestationListResponse)
+def list_attestations(
+    session: DbSession,
+    target_type: str | None = None,
+    target_id: str | None = None,
+) -> AttestationListResponse:
+    items = service.list_attestations(session, target_type, target_id)
+    return AttestationListResponse(
+        items=[_attestation_response(item) for item in items],
         count=len(items),
     )

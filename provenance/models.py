@@ -32,6 +32,7 @@ EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
 EVENT_CLAIM_CREATED = "claim.created"
 EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
+EVENT_ATTESTATION_CREATED = "attestation.created"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -183,6 +184,66 @@ class EvidenceBundle(Base):
     )
 
     claim: Mapped[Claim] = relationship()
+
+
+class Attestation(Base):
+    """A verified Ed25519 attestation over an existing claim or bundle.
+
+    Only attestations whose signature verified at creation time are
+    persisted, so every stored row carries ``verified=True`` semantics. The
+    raw signature is never stored: only its SHA-256 digest is kept, which is
+    enough to recognize a repeat submission without retaining the signature
+    itself. Attestations are append-only; there is deliberately no update or
+    delete path.
+    """
+
+    __tablename__ = "attestations"
+    __table_args__ = (
+        UniqueConstraint(
+            "target_type",
+            "target_id",
+            "signer_actor_id",
+            "public_key_b64",
+            "signature_digest_hex",
+            name="uq_attestations_identity",
+        ),
+        Index(
+            "ix_attestations_target_order",
+            "target_type",
+            "target_id",
+            "created_at",
+            "seq",
+        ),
+        Index("ix_attestations_signer_actor_id", "signer_actor_id"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("att_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: "claim" or "evidence_bundle".
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: Id of the attested claim or evidence bundle. Not a database-level
+    #: foreign key: the referenced table depends on ``target_type`` and is
+    #: enforced at the service layer.
+    target_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    signer_actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: Canonical Base64 of the 32-byte Ed25519 public key.
+    public_key_b64: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: Digest algorithm of the stored signature digest ("sha256").
+    signature_digest_algorithm: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    signature_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    signer: Mapped[Actor] = relationship()
 
 
 class AuditEvent(Base):

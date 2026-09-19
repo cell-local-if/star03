@@ -499,33 +499,40 @@ def test_each_first_bundle_creation_writes_one_audit_event(client, db_session):
 # --- Raw evidence bytes never enter the service ------------------------------
 
 
-def test_raw_evidence_bytes_are_never_persisted(client, db_session):
+def test_undeclared_fields_are_rejected_without_writes(client, db_session):
     claim = _setup_claim(client)
     secret_marker = "raw-evidence-byte-marker-9c2e"
     payload = _bundle_payload(claim_id=claim["id"], metadata={"k": "v"})
-    # Extra, non-schema fields that might smuggle bytes must be ignored.
+    # Extra, non-schema fields that might smuggle bytes are refused outright.
     payload["data"] = secret_marker
     payload["evidence"] = secret_marker.encode().hex()
-    resp = client.post("/v1/evidence-bundles", json=payload)
-    assert resp.status_code == 201, resp.text
-    assert secret_marker not in resp.text
+    events_before = len(
+        db_session.execute(select(AuditEvent)).scalars().all()
+    )
 
-    row = db_session.execute(select(EvidenceBundle)).scalars().one()
+    resp = client.post("/v1/evidence-bundles", json=payload)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+    assert secret_marker not in resp.text
+    # No resource row and no audit event are written on rejection.
+    assert db_session.execute(select(EvidenceBundle)).scalars().all() == []
+    assert (
+        len(db_session.execute(select(AuditEvent)).scalars().all())
+        == events_before
+    )
+
+    # The schema has no column capable of carrying the evidence itself.
     columns = [c.name for c in EvidenceBundle.__table__.columns]
-    # There is no column capable of carrying the evidence itself.
     assert "data" not in columns and "evidence" not in columns
-    persisted = " ".join(
-        str(getattr(row, attr))
-        for attr in (
-            "id",
-            "claim_id",
-            "evidence_type",
-            "digest_algorithm",
-            "digest_hex",
-            "media_type",
-        )
-    ) + " " + repr(row.metadata_)
-    assert secret_marker not in persisted
+
+
+def test_any_unknown_field_is_rejected(client):
+    claim = _setup_claim(client)
+    payload = _bundle_payload(claim_id=claim["id"])
+    payload["unexpected"] = "x"
+    resp = client.post("/v1/evidence-bundles", json=payload)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
 
 
 # --- Concurrent race boundary ------------------------------------------------

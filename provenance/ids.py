@@ -60,3 +60,31 @@ def evidence_bundle_id(
         ensure_ascii=False,
     ).encode("utf-8")
     return "evb_" + hashlib.sha256(material).hexdigest()
+
+
+def attestation_id(
+    target_type: str,
+    target_id: str,
+    signer_actor_id: str,
+    public_key_b64: str,
+    signature_digest_hex: str,
+) -> str:
+    """Return a stable ``att_``-prefixed identifier for an attestation.
+
+    The material is a canonical JSON array over the attestation identity
+    (target, signer, public key, and signature digest), so the same
+    attestation always maps to the same stable id.
+    """
+    material = json.dumps(
+        [
+            "attestation",
+            target_type,
+            target_id,
+            signer_actor_id,
+            public_key_b64,
+            signature_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "att_" + hashlib.sha256(material).hexdigest()
