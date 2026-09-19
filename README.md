@@ -16,3 +16,34 @@ The production roadmap must stay within backend engineering. It should grow thro
 - Every change must preserve documented APIs and stored data unless it includes an explicit compatibility and migration path.
 
 The baseline intentionally contains only this public contract. The first production task must create a complete runnable backend capability that does not already exist here; later tasks must build on reviewed, selected commits without repeating earlier work.
+
+## Running the service
+
+```bash
+python -m provenance                      # uses sqlite:///./provenance.db
+python -m provenance --database-url sqlite:////var/lib/provenance.db --port 8080
+PROVENANCE_DATABASE_URL=sqlite:///./x.db python -m provenance
+```
+
+The database location is taken from `--database-url`, then the `PROVENANCE_DATABASE_URL` environment variable, then the default. Tables are created automatically on first startup (parent directories included).
+
+## Initial capability: content identity and source actors
+
+Versioned JSON routes under `/v1`:
+
+- `POST /v1/actors` — register a source actor (`id`, `name`, `type`); returns `201`.
+- `POST /v1/contents` — register content identity by digest. Requires an existing actor; validates `digest_algorithm=sha256`, exactly 64 hexadecimal characters for `digest_hex`, and non-empty `media_type`/`actor_id`. The first registration returns `201`; a repeat submission for the same algorithm+digest returns `200` with the existing resource and no new id or audit event. Content bytes are never accepted, stored, or logged — only the digest and metadata.
+- `GET /v1/contents/{content_id}` — full public fields, or `404 content_not_found`.
+- `GET /v1/contents?actor_id=...` — contents in stable creation order, optionally filtered by source actor.
+
+Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), and `validation_error` (422). Every successful actor creation and first content creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
+
+## Tests
+
+```bash
+pip install -e ".[test]"   # or: pip install -r requirements.lock
+pytest
+```
+
+Tests are deterministic and fully offline (in-memory and temporary-file SQLite, no network).
+

@@ -1,0 +1,56 @@
+"""FastAPI application factory.
+
+The database location comes from explicit :class:`~provenance.config.Settings`
+(constructor, ``PROVENANCE_DATABASE_URL``, or the CLI flag). Tables are created
+automatically on first startup.
+"""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from provenance import __version__
+from provenance.api import router as v1_router
+from provenance.config import Settings
+from provenance.database import (
+    init_db,
+    make_engine,
+    make_session_factory,
+)
+from provenance.errors import register_exception_handlers
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+
+    engine = make_engine(settings.database_url)
+    # Create tables eagerly so the database is ready as soon as the app exists.
+    init_db(engine)
+    session_factory = make_session_factory(engine)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        try:
+            yield
+        finally:
+            engine.dispose()
+
+    app = FastAPI(
+        title="Digital Content Provenance API",
+        version=__version__,
+        lifespan=lifespan,
+    )
+    app.state.settings = settings
+    app.state.engine = engine
+    app.state.session_factory = session_factory
+
+    register_exception_handlers(app)
+    app.include_router(v1_router)
+
+    @app.get("/healthz", tags=["meta"])
+    def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return app
