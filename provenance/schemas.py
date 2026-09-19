@@ -300,6 +300,16 @@ class EvidenceBundleListResponse(BaseModel):
     count: int
 
 
+class EvidenceBundlePageResponse(BaseModel):
+    """A cursor-paginated page of evidence bundle public views."""
+
+    items: list[EvidenceBundleResponse]
+    #: Total number of items after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)

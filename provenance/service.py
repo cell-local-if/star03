@@ -354,6 +354,43 @@ def list_evidence_bundles_for_claim(
     return list(session.execute(stmt).scalars().all())
 
 
+DEFAULT_CONTENT_EVIDENCE_LIMIT = 50
+MIN_CONTENT_EVIDENCE_LIMIT = 1
+MAX_CONTENT_EVIDENCE_LIMIT = 100
+
+
+def list_evidence_bundles_for_content(
+    session: Session,
+    content_id: str,
+    evidence_type: str | None = None,
+    media_type: str | None = None,
+) -> list[EvidenceBundle]:
+    """Return evidence bundles attached to a content's claims.
+
+    Only bundles linked through claims that directly assert this exact
+    content are returned: evidence attached to a different content
+    reachable through lineage relations is not -- the listing performs no
+    graph traversal. Optional ``evidence_type``/``media_type`` are exact,
+    combinable string matches. Results follow the bundles' stable creation
+    order (``created_at`` with the monotonic ``seq`` tiebreaker).
+
+    The content must exist; an unknown content id is a missing resource,
+    not an empty collection.
+    """
+    _require_content(session, content_id)
+    stmt = (
+        select(EvidenceBundle)
+        .join(Claim, EvidenceBundle.claim_id == Claim.id)
+        .where(Claim.content_id == content_id)
+    )
+    if evidence_type is not None:
+        stmt = stmt.where(EvidenceBundle.evidence_type == evidence_type)
+    if media_type is not None:
+        stmt = stmt.where(EvidenceBundle.media_type == media_type)
+    stmt = stmt.order_by(*_EVIDENCE_BUNDLE_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 def _attestation_identity_select(
     payload: AttestationCreate, signature_digest_hex: str
 ):

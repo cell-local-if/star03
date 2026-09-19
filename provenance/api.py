@@ -32,6 +32,7 @@ from provenance.schemas import (
     ContentResponse,
     EvidenceBundleCreate,
     EvidenceBundleListResponse,
+    EvidenceBundlePageResponse,
     EvidenceBundleResponse,
 )
 
@@ -134,7 +135,7 @@ def _lineage_item(content, depth: int):
 _INTEGER_RE = re.compile(r"-?[0-9]+")
 
 
-def _lineage_query_error(field: str, msg: str, error_type: str):
+def _query_validation_error(field: str, msg: str, error_type: str):
     return LineageValidationError(
         [{"loc": ["query", field], "msg": msg, "type": error_type}]
     )
@@ -144,7 +145,7 @@ def _parse_once(raw, field: str) -> str | None:
     """Return a query parameter provided at most once, else raise 422."""
     values = raw.getlist(field)
     if len(values) > 1:
-        raise _lineage_query_error(
+        raise _query_validation_error(
             field,
             f"query parameter {field} must be provided exactly once",
             "value_error.repeated",
@@ -158,14 +159,14 @@ def _parse_int_param(raw, field: str, default: int, minimum: int, maximum: int):
     if value is None:
         return default
     if not _INTEGER_RE.fullmatch(value):
-        raise _lineage_query_error(
+        raise _query_validation_error(
             field,
             f"{field} must be an integer",
             "value_error.integer",
         )
     parsed = int(value)
     if not (minimum <= parsed <= maximum):
-        raise _lineage_query_error(
+        raise _query_validation_error(
             field,
             f"{field} must be between {minimum} and {maximum}",
             "value_error.range",
@@ -196,13 +197,13 @@ def get_content_lineage(
 
     direction = _parse_once(raw, "direction")
     if direction is None:
-        raise _lineage_query_error(
+        raise _query_validation_error(
             "direction", "Field required", "value_error.missing"
         )
     if direction not in service.LINEAGE_DIRECTIONS:
         # Covers missing values, whitespace/blank strings, and any value
         # other than the two literal traversal directions.
-        raise _lineage_query_error(
+        raise _query_validation_error(
             "direction",
             "direction must be 'ancestors' or 'descendants'",
             "value_error",
@@ -223,7 +224,7 @@ def get_content_lineage(
         service.MAX_LINEAGE_MIN_DEPTH,
     )
     if min_level > depth:
-        raise _lineage_query_error(
+        raise _query_validation_error(
             "min_depth",
             "min_depth must not be greater than max_depth",
             "value_error.range",
@@ -236,7 +237,7 @@ def get_content_lineage(
     ):
         # Only the two literal edge types are accepted; blanks and casing
         # variants are rejected rather than normalized.
-        raise _lineage_query_error(
+        raise _query_validation_error(
             "relation_type",
             "relation_type must be 'version_of' or 'derived_from'",
             "value_error",
@@ -258,7 +259,7 @@ def get_content_lineage(
                 request.app.state.lineage_cursor_secret, cursor
             )
         except InvalidCursorError as exc:
-            raise _lineage_query_error(
+            raise _query_validation_error(
                 "cursor",
                 "cursor is malformed, expired, or invalid",
                 "value_error.cursor",
@@ -275,7 +276,7 @@ def get_content_lineage(
             "limit": page_limit,
         }
         if any(claims[key] != value for key, value in expected.items()):
-            raise _lineage_query_error(
+            raise _query_validation_error(
                 "cursor",
                 "cursor does not match the query parameters",
                 "value_error.cursor",
@@ -400,6 +401,115 @@ def list_claim_evidence_bundles(
     return EvidenceBundleListResponse(
         items=[_bundle_response(item) for item in items],
         count=len(items),
+    )
+
+
+def _parse_nonempty_filter(raw, field: str) -> str | None:
+    """Parse a non-empty, exact-match string filter provided at most once."""
+    value = _parse_once(raw, field)
+    if value is None:
+        return None
+    if not value.strip():
+        # Blank/whitespace filters are invalid rather than matched against
+        # nothing or silently dropped.
+        raise _query_validation_error(
+            field, f"{field} must not be empty", "value_error"
+        )
+    return value
+
+
+@router.get(
+    "/contents/{content_id}/evidence-bundles",
+    response_model=EvidenceBundlePageResponse,
+)
+def list_content_evidence_bundles(
+    content_id: str,
+    request: Request,
+    session: DbSession,
+    evidence_type: str | None = Query(default=None),
+    media_type: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> EvidenceBundlePageResponse:
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, and a blank
+    # filter/limit is never coerced to a default.
+    raw = request.query_params
+
+    evidence_type = _parse_nonempty_filter(raw, "evidence_type")
+    media_type = _parse_nonempty_filter(raw, "media_type")
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CONTENT_EVIDENCE_LIMIT,
+        service.MIN_CONTENT_EVIDENCE_LIMIT,
+        service.MAX_CONTENT_EVIDENCE_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.content_evidence_cursor_secret,
+                pagination.CONTENT_EVIDENCE_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the origin, every
+        # effective filter, and the effective limit must match exactly.
+        expected = {
+            "content_id": content_id,
+            "evidence_type": evidence_type,
+            "media_type": media_type,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Parameters and cursor are validated first; a malformed request is a
+    # 422 regardless of the origin. A structurally valid request for an
+    # unknown content is a missing resource (404), not an empty collection.
+    items = service.list_evidence_bundles_for_content(
+        session, content_id, evidence_type, media_type
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.content_evidence_cursor_secret,
+                pagination.CONTENT_EVIDENCE_CURSOR,
+                {
+                    "content_id": content_id,
+                    "evidence_type": evidence_type,
+                    "media_type": media_type,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    return EvidenceBundlePageResponse(
+        items=[_bundle_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
     )
 
 
