@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     ForeignKey,
     Index,
@@ -30,6 +31,7 @@ SUPPORTED_DIGEST_ALGORITHMS = frozenset({"sha256"})
 EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
 EVENT_CLAIM_CREATED = "claim.created"
+EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -131,6 +133,49 @@ class Claim(Base):
 
     content: Mapped[Content] = relationship()
     actor: Mapped[Actor] = relationship()
+
+
+class EvidenceBundle(Base):
+    """Verifiable evidence attached to an immutable claim.
+
+    Like content, raw evidence bytes are intentionally not modeled: only the
+    digest, media type, and JSON metadata are persisted, so evidence bytes can
+    never reach the database or logs through this service. Bundles are
+    append-only; there is deliberately no update or delete path.
+    """
+
+    __tablename__ = "evidence_bundles"
+    __table_args__ = (
+        UniqueConstraint(
+            "claim_id",
+            "evidence_type",
+            "digest_hex",
+            name="uq_evidence_bundles_identity",
+        ),
+        Index("ix_evidence_bundles_claim_order", "claim_id", "created_at", "seq"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("evb_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    claim_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("claims.id", ondelete="RESTRICT"), nullable=False
+    )
+    evidence_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    digest_algorithm: Mapped[str] = mapped_column(String(32), nullable=False)
+    digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: Free-form JSON object metadata. Named ``metadata_json`` because
+    #: ``metadata`` is reserved by SQLAlchemy's declarative base.
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    claim: Mapped[Claim] = relationship()
 
 
 class AuditEvent(Base):

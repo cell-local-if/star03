@@ -25,6 +25,23 @@ def _required_nonempty(value: str, field: str) -> str:
     return cleaned
 
 
+def _digest_algorithm_supported(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in SUPPORTED_DIGEST_ALGORITHMS:
+        supported = ", ".join(sorted(SUPPORTED_DIGEST_ALGORITHMS))
+        raise ValueError(f"unsupported digest algorithm; supported: {supported}")
+    return normalized
+
+
+def _digest_hex_sha256(value: str) -> str:
+    # Normalize case so the same digest cannot be registered twice via
+    # different casing; then enforce exactly 64 lowercase hex chars.
+    normalized = value.strip().lower()
+    if not _HEX64.fullmatch(normalized):
+        raise ValueError("digest_hex must be exactly 64 hexadecimal characters")
+    return normalized
+
+
 class ActorCreate(BaseModel):
     id: str = Field(..., min_length=1, max_length=255)
     name: str = Field(..., min_length=1, max_length=4096)
@@ -65,21 +82,12 @@ class ContentCreate(BaseModel):
     @field_validator("digest_algorithm")
     @classmethod
     def _algorithm_supported(cls, v: str) -> str:
-        normalized = v.strip().lower()
-        if normalized not in SUPPORTED_DIGEST_ALGORITHMS:
-            supported = ", ".join(sorted(SUPPORTED_DIGEST_ALGORITHMS))
-            raise ValueError(f"unsupported digest algorithm; supported: {supported}")
-        return normalized
+        return _digest_algorithm_supported(v)
 
     @field_validator("digest_hex")
     @classmethod
     def _digest_is_sha256_hex(cls, v: str) -> str:
-        # Normalize case so the same digest cannot be registered twice via
-        # different casing; then enforce exactly 64 lowercase hex chars.
-        normalized = v.strip().lower()
-        if not _HEX64.fullmatch(normalized):
-            raise ValueError("digest_hex must be exactly 64 hexadecimal characters")
-        return normalized
+        return _digest_hex_sha256(v)
 
     @field_validator("media_type")
     @classmethod
@@ -168,4 +176,75 @@ class ClaimResponse(BaseModel):
 
 class ClaimListResponse(BaseModel):
     items: list[ClaimResponse]
+    count: int
+
+
+class EvidenceBundleCreate(BaseModel):
+    """Evidence bundle registration: digest and metadata only, never bytes."""
+
+    claim_id: str = Field(..., min_length=1, max_length=80)
+    evidence_type: str = Field(..., min_length=1, max_length=128)
+    digest_algorithm: str = Field(..., min_length=1, max_length=32)
+    digest_hex: str = Field(..., min_length=1, max_length=128)
+    media_type: str = Field(..., min_length=1, max_length=255)
+    #: Must be a JSON object; arrays, scalars, and null are rejected.
+    metadata: dict[str, Any]
+
+    @field_validator("claim_id")
+    @classmethod
+    def _claim_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "claim_id")
+
+    @field_validator("evidence_type")
+    @classmethod
+    def _evidence_type_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "evidence_type")
+
+    @field_validator("digest_algorithm")
+    @classmethod
+    def _algorithm_supported(cls, v: str) -> str:
+        return _digest_algorithm_supported(v)
+
+    @field_validator("digest_hex")
+    @classmethod
+    def _digest_is_sha256_hex(cls, v: str) -> str:
+        return _digest_hex_sha256(v)
+
+    @field_validator("media_type")
+    @classmethod
+    def _media_type_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "media_type")
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_json_safe(cls, v: dict[str, Any]) -> dict[str, Any]:
+        try:
+            canonical_json_bytes(v)
+        except (TypeError, ValueError):
+            # Non-finite numbers (NaN/Infinity) have no canonical JSON form.
+            raise ValueError(
+                "metadata must be a JSON object with finite numbers"
+            ) from None
+        return v
+
+
+class EvidenceBundleResponse(BaseModel):
+    """Public evidence bundle view: claim link, digest, metadata, timestamps."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    claim_id: str
+    evidence_type: str
+    digest_algorithm: str
+    digest_hex: str
+    media_type: str
+    #: The ORM attribute is ``metadata_json`` (``metadata`` is reserved by
+    #: SQLAlchemy); the public field stays ``metadata``.
+    metadata: dict[str, Any] = Field(validation_alias="metadata_json")
+    created_at: datetime
+
+
+class EvidenceBundleListResponse(BaseModel):
+    items: list[EvidenceBundleResponse]
     count: int

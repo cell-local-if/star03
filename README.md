@@ -46,7 +46,17 @@ Claims attach a typed, digest-committed statement by an actor to a registered co
 
 The first claim creation and its `claim.created` audit event commit in a single transaction. Non-object payloads, blank claim types, and malformed JSON are `422 validation_error`; unknown contents and actors remain `404 content_not_found` / `unknown_actor`.
 
-Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), and `validation_error` (422). Every successful actor creation and first content creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
+## Verifiable evidence bundles
+
+Evidence bundles attach verifiable, digest-committed evidence to an existing immutable claim. Raw evidence bytes are never accepted, persisted, or logged — only the digest, media type, and JSON metadata.
+
+- `POST /v1/evidence-bundles` — create a bundle with an existing `claim_id`, non-empty `evidence_type`, `digest_algorithm=sha256`, exactly 64 hexadecimal characters for `digest_hex`, non-empty `media_type`, and a JSON-object `metadata`. The first creation returns `201` with the stable bundle id, claim association, evidence type, digest algorithm and value, media type, metadata, and UTC `created_at`; a repeat submission with the same claim, evidence type, and digest returns `200` with the existing bundle (first metadata preserved) and adds no audit event. Any other field combination forms an independent bundle.
+- `GET /v1/evidence-bundles/{evidence_bundle_id}` — full public fields, or `404 evidence_bundle_not_found`.
+- `GET /v1/claims/{claim_id}/evidence-bundles` — that claim's bundles only, in stable creation order as `{"items", "count"}`; an unknown claim id is `404 claim_not_found`.
+
+The first bundle creation and its `evidence_bundle.created` audit event commit in a single transaction. Blank text fields, non-object metadata, unsupported digest algorithms, malformed digests, and malformed JSON are `422 validation_error`; unknown claims and bundles remain `404 claim_not_found` / `evidence_bundle_not_found`.
+
+Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), and `validation_error` (422). Every successful actor creation and first content creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
 
 ## Tests
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -28,7 +29,7 @@ def test_first_startup_creates_database_file_and_tables(tmp_path):
         )
     }
     con.close()
-    assert {"actors", "contents", "audit_events"}.issubset(tables)
+    assert {"actors", "contents", "claims", "evidence_bundles", "audit_events"}.issubset(tables)
 
 
 def test_data_persists_across_app_restarts(tmp_db_url, file_client):
@@ -44,6 +45,17 @@ def test_data_persists_across_app_restarts(tmp_db_url, file_client):
             "actor_id": "org-1",
             "claim_type": "authorship",
             "payload": {"statement": "created by org-1"},
+        },
+    ).json()
+    bundle = file_client.post(
+        "/v1/evidence-bundles",
+        json={
+            "claim_id": claim["id"],
+            "evidence_type": "signature",
+            "digest_algorithm": "sha256",
+            "digest_hex": hashlib.sha256(b"evidence-a").hexdigest(),
+            "media_type": "application/json",
+            "metadata": {"source": "scanner-1"},
         },
     ).json()
 
@@ -68,6 +80,14 @@ def test_data_persists_across_app_restarts(tmp_db_url, file_client):
         assert claims["count"] == 1
         assert claims["items"][0]["id"] == claim["id"]
 
+        # The evidence bundle and its per-claim listing survived the restart.
+        fetched_bundle = client.get(f"/v1/evidence-bundles/{bundle['id']}")
+        assert fetched_bundle.status_code == 200
+        assert fetched_bundle.json() == bundle
+        bundles = client.get(f"/v1/claims/{claim['id']}/evidence-bundles").json()
+        assert bundles["count"] == 1
+        assert bundles["items"][0]["id"] == bundle["id"]
+
         # Audit history survived the restart.
         import sqlite3
 
@@ -75,7 +95,7 @@ def test_data_persists_across_app_restarts(tmp_db_url, file_client):
         con = sqlite3.connect(path)
         audit_count = con.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
         con.close()
-        assert audit_count == 3
+        assert audit_count == 4
 
 
 def test_environment_variable_selects_database(monkeypatch, tmp_path):

@@ -17,6 +17,9 @@ from provenance.schemas import (
     ContentCreate,
     ContentListResponse,
     ContentResponse,
+    EvidenceBundleCreate,
+    EvidenceBundleListResponse,
+    EvidenceBundleResponse,
 )
 
 router = APIRouter(prefix="/v1")
@@ -95,5 +98,42 @@ def list_content_claims(content_id: str, session: DbSession) -> ClaimListRespons
     items = service.list_claims_for_content(session, content_id)
     return ClaimListResponse(
         items=[ClaimResponse.model_validate(item) for item in items],
+        count=len(items),
+    )
+
+
+@router.post("/evidence-bundles", response_model=EvidenceBundleResponse)
+def create_evidence_bundle(
+    payload: EvidenceBundleCreate, session: DbSession, response: Response
+) -> EvidenceBundleResponse:
+    bundle, created = service.create_evidence_bundle(session, payload)
+    # First creation -> 201; an idempotent repeat submission -> 200, and the
+    # existing bundle (with its first metadata) is returned unchanged.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return EvidenceBundleResponse.model_validate(bundle)
+
+
+@router.get(
+    "/evidence-bundles/{evidence_bundle_id}", response_model=EvidenceBundleResponse
+)
+def get_evidence_bundle(
+    evidence_bundle_id: str, session: DbSession
+) -> EvidenceBundleResponse:
+    bundle = service.get_evidence_bundle(session, evidence_bundle_id)
+    return EvidenceBundleResponse.model_validate(bundle)
+
+
+@router.get(
+    "/claims/{claim_id}/evidence-bundles",
+    response_model=EvidenceBundleListResponse,
+)
+def list_claim_evidence_bundles(
+    claim_id: str, session: DbSession
+) -> EvidenceBundleListResponse:
+    items = service.list_evidence_bundles_for_claim(session, claim_id)
+    return EvidenceBundleListResponse(
+        items=[EvidenceBundleResponse.model_validate(item) for item in items],
         count=len(items),
     )

@@ -35,3 +35,17 @@ def claim_id(
         ensure_ascii=False,
     ).encode("utf-8")
     return "clm_" + hashlib.sha256(material).hexdigest()
+
+
+def evidence_bundle_id(claim_id: str, evidence_type: str, digest_hex: str) -> str:
+    """Return a stable ``evb_``-prefixed identifier for an evidence bundle.
+
+    The material is a canonical JSON array so fields containing separators
+    cannot collide with different field splits.
+    """
+    material = json.dumps(
+        ["evidence_bundle", claim_id, evidence_type, digest_hex],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "evb_" + hashlib.sha256(material).hexdigest()
