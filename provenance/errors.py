@@ -92,6 +92,15 @@ class AttestationNotFoundError(DomainError):
         super().__init__(details={"attestation_id": attestation_id})
 
 
+class AttestationRevocationNotFoundError(DomainError):
+    status_code = 404
+    code = "attestation_revocation_not_found"
+    message = "The requested attestation revocation does not exist."
+
+    def __init__(self, revocation_id: str):
+        super().__init__(details={"revocation_id": revocation_id})
+
+
 class ContentRelationNotFoundError(DomainError):
     status_code = 404
     code = "content_relation_not_found"

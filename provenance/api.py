@@ -20,6 +20,9 @@ from provenance.schemas import (
     AttestationCreate,
     AttestationListResponse,
     AttestationResponse,
+    AttestationRevocationCreate,
+    AttestationRevocationListResponse,
+    AttestationRevocationResponse,
     ClaimCreate,
     ClaimListResponse,
     ClaimResponse,
@@ -564,6 +567,54 @@ def list_attestations(
     items = service.list_attestations(session, target_type, target_id)
     return AttestationListResponse(
         items=[_attestation_response(item) for item in items],
+        count=len(items),
+    )
+
+
+def _revocation_response(revocation) -> AttestationRevocationResponse:
+    return AttestationRevocationResponse(
+        id=revocation.id,
+        attestation_id=revocation.attestation_id,
+        revoker_actor_id=revocation.revoker_actor_id,
+        reason=revocation.reason,
+        created_at=revocation.created_at,
+    )
+
+
+@router.post("/attestation-revocations", response_model=AttestationRevocationResponse)
+def create_attestation_revocation(
+    payload: AttestationRevocationCreate, session: DbSession, response: Response
+) -> AttestationRevocationResponse:
+    revocation, created = service.create_attestation_revocation(session, payload)
+    # First creation -> 201; an idempotent repeat submission -> 200, and the
+    # existing immutable revocation record is returned unchanged.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _revocation_response(revocation)
+
+
+@router.get(
+    "/attestation-revocations/{revocation_id}",
+    response_model=AttestationRevocationResponse,
+)
+def get_attestation_revocation(
+    revocation_id: str, session: DbSession
+) -> AttestationRevocationResponse:
+    revocation = service.get_attestation_revocation(session, revocation_id)
+    return _revocation_response(revocation)
+
+
+@router.get(
+    "/attestations/{attestation_id}/revocations",
+    response_model=AttestationRevocationListResponse,
+)
+def list_attestation_revocations(
+    attestation_id: str, session: DbSession
+) -> AttestationRevocationListResponse:
+    items = service.list_attestation_revocations(session, attestation_id)
+    return AttestationRevocationListResponse(
+        items=[_revocation_response(item) for item in items],
         count=len(items),
     )
 

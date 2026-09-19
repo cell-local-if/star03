@@ -17,6 +17,7 @@ from provenance import canonical, ed25519, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
     AttestationNotFoundError,
+    AttestationRevocationNotFoundError,
     AttestationVerificationError,
     ClaimNotFoundError,
     ContentNotFoundError,
@@ -28,12 +29,14 @@ from provenance.errors import (
 from provenance.models import (
     EVENT_ACTOR_CREATED,
     EVENT_ATTESTATION_CREATED,
+    EVENT_ATTESTATION_REVOKED,
     EVENT_CLAIM_CREATED,
     EVENT_CONTENT_CREATED,
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     Actor,
     Attestation,
+    AttestationRevocation,
     AuditEvent,
     Claim,
     Content,
@@ -43,6 +46,7 @@ from provenance.models import (
 from provenance.schemas import (
     ActorCreate,
     AttestationCreate,
+    AttestationRevocationCreate,
     ClaimCreate,
     ContentCreate,
     ContentRelationCreate,
@@ -58,6 +62,10 @@ _EVIDENCE_BUNDLE_ORDER = (
     EvidenceBundle.seq.asc(),
 )
 _ATTESTATION_ORDER = (Attestation.created_at.asc(), Attestation.seq.asc())
+_ATTESTATION_REVOCATION_ORDER = (
+    AttestationRevocation.created_at.asc(),
+    AttestationRevocation.seq.asc(),
+)
 _CONTENT_RELATION_ORDER = (
     ContentRelation.created_at.asc(),
     ContentRelation.seq.asc(),
@@ -528,6 +536,106 @@ def list_attestations(
     return list(session.execute(stmt).scalars().all())
 
 
+def _attestation_revocation_identity_select(payload: AttestationRevocationCreate):
+    return select(AttestationRevocation).where(
+        AttestationRevocation.attestation_id == payload.attestation_id,
+        AttestationRevocation.revoker_actor_id == payload.revoker_actor_id,
+        AttestationRevocation.reason == payload.reason,
+    )
+
+
+def create_attestation_revocation(
+    session: Session, payload: AttestationRevocationCreate
+) -> tuple[AttestationRevocation, bool]:
+    """Create an immutable revocation record, returning ``(revocation, created)``.
+
+    The revoked attestation and the revoking actor must already exist. A
+    repeat submission of the same attestation, revoker, and reason returns
+    the existing record with ``created=False`` and writes no row or audit
+    event; any other combination forms an independent record. On first
+    creation, the revocation row and its ``attestation.revoked`` audit event
+    commit in a single transaction. The attestation itself is never modified
+    or deleted.
+    """
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == payload.attestation_id)
+    ).scalar_one_or_none()
+    if attestation is None:
+        raise AttestationNotFoundError(payload.attestation_id)
+    revoker = session.get(Actor, payload.revoker_actor_id)
+    if revoker is None:
+        raise UnknownActorError(payload.revoker_actor_id)
+
+    existing = session.execute(
+        _attestation_revocation_identity_select(payload)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    revocation = AttestationRevocation(
+        id=ids.attestation_revocation_id(
+            payload.attestation_id, payload.revoker_actor_id, payload.reason
+        ),
+        attestation_id=payload.attestation_id,
+        revoker_actor_id=payload.revoker_actor_id,
+        reason=payload.reason,
+    )
+    session.add(revocation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_ATTESTATION_REVOKED, resource_id=revocation.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical revocation won the race: return its resource.
+        session.rollback()
+        raced = session.execute(
+            _attestation_revocation_identity_select(payload)
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(revocation)
+    return revocation, True
+
+
+def get_attestation_revocation(
+    session: Session, revocation_id: str
+) -> AttestationRevocation:
+    """Return a revocation by id or raise :class:`AttestationRevocationNotFoundError`."""
+    revocation = session.execute(
+        select(AttestationRevocation).where(
+            AttestationRevocation.id == revocation_id
+        )
+    ).scalar_one_or_none()
+    if revocation is None:
+        raise AttestationRevocationNotFoundError(revocation_id)
+    return revocation
+
+
+def list_attestation_revocations(
+    session: Session, attestation_id: str
+) -> list[AttestationRevocation]:
+    """Return revocations of one attestation in stable creation order.
+
+    The attestation must exist; an unknown attestation id is a missing
+    resource, not an empty collection.
+    """
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == attestation_id)
+    ).scalar_one_or_none()
+    if attestation is None:
+        raise AttestationNotFoundError(attestation_id)
+    stmt = (
+        select(AttestationRevocation)
+        .where(AttestationRevocation.attestation_id == attestation_id)
+        .order_by(*_ATTESTATION_REVOCATION_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
+
+
 # Trust evaluation threshold bounds.
 DEFAULT_TRUST_MIN_SIGNERS = 1
 MIN_TRUST_MIN_SIGNERS = 1
@@ -549,9 +657,10 @@ def evaluate_trust(
     actors count: multiple attestations by the same ``signer_actor_id`` --
     e.g. under different keys -- qualify once. Every stored attestation is a
     verified attestation (unverifiable signatures are rejected before any
-    row is written), so all matching rows qualify. The result is computed
-    live and the function is strictly read-only: it writes no resource and
-    no audit event.
+    row is written), so all matching rows qualify -- except revoked ones: an
+    attestation with at least one revocation record no longer counts toward
+    the qualified signer set. The result is computed live and the function
+    is strictly read-only: it writes no resource and no audit event.
 
     The target must exist: a missing claim raises
     :class:`ClaimNotFoundError` and a missing evidence bundle raises
@@ -573,11 +682,15 @@ def evaluate_trust(
         if target is None:
             raise EvidenceBundleNotFoundError(target_id)
 
+    # Revoked attestations (those with at least one revocation record) are
+    # excluded; all other semantics are unchanged.
+    revoked_ids = select(AttestationRevocation.attestation_id)
     signer_ids = session.execute(
         select(Attestation.signer_actor_id)
         .where(
             Attestation.target_type == target_type,
             Attestation.target_id == target_id,
+            Attestation.id.not_in(revoked_ids),
         )
         .distinct()
     ).scalars().all()

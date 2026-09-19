@@ -405,6 +405,51 @@ class AttestationListResponse(BaseModel):
     count: int
 
 
+class AttestationRevocationCreate(BaseModel):
+    # Revocation requests carry exactly the declared fields; undeclared
+    # fields are rejected rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The existing attestation being revoked.
+    attestation_id: str = Field(..., min_length=1, max_length=80)
+    #: An already-registered actor recording the revocation.
+    revoker_actor_id: str = Field(..., min_length=1, max_length=255)
+    #: Non-empty human-readable reason for the revocation.
+    reason: str = Field(..., min_length=1, max_length=4096)
+
+    @field_validator("attestation_id")
+    @classmethod
+    def _attestation_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "attestation_id")
+
+    @field_validator("revoker_actor_id")
+    @classmethod
+    def _revoker_actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "revoker_actor_id")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "reason")
+
+
+class AttestationRevocationResponse(BaseModel):
+    """Public revocation view: associations, reason, and timestamp."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    attestation_id: str
+    revoker_actor_id: str
+    reason: str
+    created_at: datetime
+
+
+class AttestationRevocationListResponse(BaseModel):
+    items: list[AttestationRevocationResponse]
+    count: int
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 
