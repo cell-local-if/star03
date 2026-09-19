@@ -127,7 +127,7 @@ def test_empty_traversal_returns_empty_set_not_404(client):
     for origin, direction in ((ids["a"], "ancestors"), (ids["b"], "descendants")):
         resp = _lineage(client, origin, direction)
         assert resp.status_code == 200
-        assert resp.json() == {"items": [], "count": 0}
+        assert resp.json() == {"items": [], "count": 0, "next_cursor": None}
 
 
 def test_unknown_origin_is_content_not_found(client):

@@ -15,6 +15,14 @@ from pathlib import Path
 DATABASE_URL_ENV = "PROVENANCE_DATABASE_URL"
 DEFAULT_DATABASE_URL = "sqlite:///./provenance.db"
 
+#: HMAC key material for stateless lineage pagination cursors. Deployments
+#: should override it (constructor or ``PROVENANCE_LINEAGE_CURSOR_SECRET``);
+#: the built-in fallback keeps single-process/offline deployments working
+#: without configuration while still yielding verifiable, tamper-evident
+#: cursors. Cursors minted under one secret are invalid under another.
+LINEAGE_CURSOR_SECRET_ENV = "PROVENANCE_LINEAGE_CURSOR_SECRET"
+DEFAULT_LINEAGE_CURSOR_SECRET = "provenance-lineage-cursor-secret-v1"
+
 
 def _normalize_sqlite_url(url: str) -> str:
     """Return an absolute path-based SQLite URL for a relative ``sqlite:///`` one.
@@ -38,8 +46,16 @@ class Settings:
     """Runtime settings resolved in constructor > env > default order."""
 
     database_url: str = DEFAULT_DATABASE_URL
+    lineage_cursor_secret: str = DEFAULT_LINEAGE_CURSOR_SECRET
 
     @classmethod
     def from_env(cls, database_url: str | None = None) -> "Settings":
         resolved = database_url or os.environ.get(DATABASE_URL_ENV) or DEFAULT_DATABASE_URL
-        return cls(database_url=_normalize_sqlite_url(resolved))
+        secret = (
+            os.environ.get(LINEAGE_CURSOR_SECRET_ENV)
+            or DEFAULT_LINEAGE_CURSOR_SECRET
+        )
+        return cls(
+            database_url=_normalize_sqlite_url(resolved),
+            lineage_cursor_secret=secret,
+        )

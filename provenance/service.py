@@ -32,6 +32,7 @@ from provenance.models import (
     EVENT_CONTENT_CREATED,
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
+    SUPPORTED_RELATION_TYPES,
     Actor,
     Attestation,
     AuditEvent,
@@ -632,9 +633,22 @@ LINEAGE_ANCESTORS = "ancestors"
 LINEAGE_DESCENDANTS = "descendants"
 LINEAGE_DIRECTIONS = frozenset({LINEAGE_ANCESTORS, LINEAGE_DESCENDANTS})
 
+# Relation types accepted as a lineage filter (omission disables filtering).
+LINEAGE_RELATION_TYPES = SUPPORTED_RELATION_TYPES
+
 DEFAULT_LINEAGE_MAX_DEPTH = 8
 MIN_LINEAGE_MAX_DEPTH = 1
 MAX_LINEAGE_MAX_DEPTH = 32
+
+# Depth floor for returned items; traversal reachability is never affected.
+DEFAULT_LINEAGE_MIN_DEPTH = 1
+MIN_LINEAGE_MIN_DEPTH = 1
+MAX_LINEAGE_MIN_DEPTH = 32
+
+# Pagination bounds for the filtered lineage item list.
+DEFAULT_LINEAGE_LIMIT = 50
+MIN_LINEAGE_LIMIT = 1
+MAX_LINEAGE_LIMIT = 100
 
 
 def get_content_lineage(
@@ -642,6 +656,8 @@ def get_content_lineage(
     content_id: str,
     direction: str,
     max_depth: int = DEFAULT_LINEAGE_MAX_DEPTH,
+    relation_type: str | None = None,
+    min_depth: int = DEFAULT_LINEAGE_MIN_DEPTH,
 ) -> list[tuple[Content, int]]:
     """Return reachable contents as ``(content, depth)`` pairs.
 
@@ -652,6 +668,13 @@ def get_content_lineage(
     shortest depth. Pairs are ordered by depth ascending; within one depth,
     contents are ordered by the stable creation order of the edge through
     which they were first reached.
+
+    Filtering never restricts traversal: edges of every relation type are
+    walked and the shortest depth is computed over the full reachable graph.
+    ``relation_type`` keeps only contents whose first-discovery edge has that
+    type; ``min_depth`` drops contents reached at a shallower depth. Both
+    affect solely which already-reached contents are returned, in their
+    original depth/edge order.
 
     The traversal is read-only and tracks a visited set, so even anomalous
     history containing a cycle terminates and the walk is bounded by
@@ -670,40 +693,48 @@ def get_content_lineage(
 
     visited: set[str] = {content_id}
     frontier: list[str] = [content_id]
-    reached: list[tuple[str, int]] = []
+    reached: list[tuple[str, int, str]] = []
     for depth in range(1, max_depth + 1):
         if not frontier:
             break
         # Ordering every edge leaving the current frontier by its stable
         # creation order fixes each level's first-discovery order, including
-        # converging paths whose discovering edges differ.
-        neighbor_ids = session.execute(
-            select(neighbor_col)
+        # converging paths whose discovering edges differ. The edge's type
+        # travels with the neighbor so relation filtering can act on the
+        # first-discovery edge without changing what the walk can reach.
+        rows = session.execute(
+            select(neighbor_col, ContentRelation.relation_type)
             .where(source_col.in_(frontier))
             .order_by(*_CONTENT_RELATION_ORDER)
-        ).scalars().all()
+        ).all()
         next_frontier: list[str] = []
-        for neighbor_id in neighbor_ids:
+        for neighbor_id, edge_type in rows:
             if neighbor_id in visited:
                 # Already reached at an equal or shorter depth; also what
                 # makes an anomalous cycle terminate.
                 continue
             visited.add(neighbor_id)
             next_frontier.append(neighbor_id)
-            reached.append((neighbor_id, depth))
+            reached.append((neighbor_id, depth, edge_type))
         frontier = next_frontier
 
-    if not reached:
+    filtered = [
+        (reached_id, depth)
+        for reached_id, depth, edge_type in reached
+        if depth >= min_depth
+        and (relation_type is None or edge_type == relation_type)
+    ]
+    if not filtered:
         return []
 
     contents = (
         session.execute(
             select(Content).where(
-                Content.id.in_([reached_id for reached_id, _ in reached])
+                Content.id.in_([reached_id for reached_id, _ in filtered])
             )
         )
         .scalars()
         .all()
     )
     by_id = {content.id: content for content in contents}
-    return [(by_id[reached_id], depth) for reached_id, depth in reached]
+    return [(by_id[reached_id], depth) for reached_id, depth in filtered]

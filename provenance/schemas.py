@@ -159,7 +159,10 @@ class ContentLineageItem(ContentResponse):
 
 class ContentLineageResponse(BaseModel):
     items: list[ContentLineageItem]
+    #: Total number of items after filtering, independent of pagination.
     count: int
+    #: Opaque cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
 
 
 class ClaimCreate(BaseModel):
