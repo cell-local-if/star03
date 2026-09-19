@@ -403,3 +403,20 @@ class AttestationResponse(BaseModel):
 class AttestationListResponse(BaseModel):
     items: list[AttestationResponse]
     count: int
+
+
+class TrustEvaluationResponse(BaseModel):
+    """Read-only trust assessment of a claim or evidence bundle.
+
+    Computed on demand from the attestations already stored for the target:
+    no resource or audit event is created.
+    """
+
+    target_type: Literal["claim", "evidence_bundle"]
+    target_id: str
+    min_signers: int
+    #: Number of distinct signing actors with a verified attestation of the
+    #: target; multiple attestations by the same actor count once.
+    qualified_signer_count: int
+    #: ``"trusted"`` when ``qualified_signer_count >= min_signers``.
+    decision: Literal["trusted", "untrusted"]

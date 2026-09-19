@@ -13,6 +13,7 @@ from provenance import pagination, service
 from provenance.errors import LineageValidationError
 from provenance.models import RELATION_DERIVED_FROM, RELATION_VERSION_OF
 from provenance.pagination import InvalidCursorError
+from provenance.signing import ATTESTATION_TARGET_TYPES
 from provenance.schemas import (
     ActorCreate,
     ActorResponse,
@@ -34,6 +35,7 @@ from provenance.schemas import (
     EvidenceBundleListResponse,
     EvidenceBundlePageResponse,
     EvidenceBundleResponse,
+    TrustEvaluationResponse,
 )
 
 router = APIRouter(prefix="/v1")
@@ -564,3 +566,75 @@ def list_attestations(
         items=[_attestation_response(item) for item in items],
         count=len(items),
     )
+
+
+_TRUST_EVALUATION_PARAMS = frozenset(
+    {"target_type", "target_id", "min_signers"}
+)
+
+
+@router.get(
+    "/trust-evaluations",
+    response_model=TrustEvaluationResponse,
+)
+def evaluate_trust(
+    request: Request,
+    session: DbSession,
+    target_type: str | None = Query(default=None),
+    target_id: str | None = Query(default=None),
+    min_signers: str | None = Query(default=None),
+) -> TrustEvaluationResponse:
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, and blank or
+    # non-numeric values are never coerced to defaults.
+    raw = request.query_params
+
+    unknown = set(raw) - _TRUST_EVALUATION_PARAMS
+    if unknown:
+        # Undeclared parameters are rejected rather than ignored, so a typo
+        # (e.g. ``min_signer``) never silently changes the evaluation.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    target_type = _parse_once(raw, "target_type")
+    if target_type is None:
+        raise _query_validation_error(
+            "target_type", "Field required", "value_error.missing"
+        )
+    if target_type not in ATTESTATION_TARGET_TYPES:
+        # Covers missing values, whitespace/blank strings, casing variants,
+        # and anything other than the two literal target types.
+        raise _query_validation_error(
+            "target_type",
+            "target_type must be 'claim' or 'evidence_bundle'",
+            "value_error",
+        )
+
+    target_id = _parse_once(raw, "target_id")
+    if target_id is None:
+        raise _query_validation_error(
+            "target_id", "Field required", "value_error.missing"
+        )
+    if not target_id.strip():
+        # A blank identifier is invalid rather than a lookup of the empty
+        # string (which would merely 404).
+        raise _query_validation_error(
+            "target_id", "target_id must not be empty", "value_error"
+        )
+
+    threshold = _parse_int_param(
+        raw,
+        "min_signers",
+        service.DEFAULT_TRUST_MIN_SIGNERS,
+        service.MIN_TRUST_MIN_SIGNERS,
+        service.MAX_TRUST_MIN_SIGNERS,
+    )
+
+    # All parameters are validated before any existence lookup: a malformed
+    # request is a 422 even when the target also happens to be missing.
+    result = service.evaluate_trust(
+        session, target_type, target_id, threshold
+    )
+    return TrustEvaluationResponse(**result)

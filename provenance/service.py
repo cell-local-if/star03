@@ -528,6 +528,73 @@ def list_attestations(
     return list(session.execute(stmt).scalars().all())
 
 
+# Trust evaluation threshold bounds.
+DEFAULT_TRUST_MIN_SIGNERS = 1
+MIN_TRUST_MIN_SIGNERS = 1
+MAX_TRUST_MIN_SIGNERS = 100
+
+TRUST_DECISION_TRUSTED = "trusted"
+TRUST_DECISION_UNTRUSTED = "untrusted"
+
+
+def evaluate_trust(
+    session: Session,
+    target_type: str,
+    target_id: str,
+    min_signers: int = DEFAULT_TRUST_MIN_SIGNERS,
+) -> dict:
+    """Evaluate trust in one claim or evidence bundle from existing proofs.
+
+    Only attestations of the exact target count, and only distinct signing
+    actors count: multiple attestations by the same ``signer_actor_id`` --
+    e.g. under different keys -- qualify once. Every stored attestation is a
+    verified attestation (unverifiable signatures are rejected before any
+    row is written), so all matching rows qualify. The result is computed
+    live and the function is strictly read-only: it writes no resource and
+    no audit event.
+
+    The target must exist: a missing claim raises
+    :class:`ClaimNotFoundError` and a missing evidence bundle raises
+    :class:`EvidenceBundleNotFoundError`, matched by the declared
+    ``target_type``. Returns the response-shaped evaluation dict; the
+    decision is ``"trusted"`` when the qualified signer count reaches
+    ``min_signers`` and ``"untrusted"`` otherwise (including zero).
+    """
+    if target_type == signing.TARGET_CLAIM:
+        target = session.execute(
+            select(Claim).where(Claim.id == target_id)
+        ).scalar_one_or_none()
+        if target is None:
+            raise ClaimNotFoundError(target_id)
+    else:
+        target = session.execute(
+            select(EvidenceBundle).where(EvidenceBundle.id == target_id)
+        ).scalar_one_or_none()
+        if target is None:
+            raise EvidenceBundleNotFoundError(target_id)
+
+    signer_ids = session.execute(
+        select(Attestation.signer_actor_id)
+        .where(
+            Attestation.target_type == target_type,
+            Attestation.target_id == target_id,
+        )
+        .distinct()
+    ).scalars().all()
+    qualified = len(set(signer_ids))
+    return {
+        "target_type": target_type,
+        "target_id": target_id,
+        "min_signers": min_signers,
+        "qualified_signer_count": qualified,
+        "decision": (
+            TRUST_DECISION_TRUSTED
+            if qualified >= min_signers
+            else TRUST_DECISION_UNTRUSTED
+        ),
+    }
+
+
 def _require_content(session: Session, content_id: str) -> Content:
     """Return content by id or raise :class:`ContentNotFoundError`."""
     content = session.execute(
