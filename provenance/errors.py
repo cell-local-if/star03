@@ -74,6 +74,15 @@ class ClaimNotFoundError(DomainError):
         super().__init__(details={"claim_id": claim_id})
 
 
+class EvidenceBundleNotFoundError(DomainError):
+    status_code = 404
+    code = "evidence_bundle_not_found"
+    message = "The requested evidence bundle does not exist."
+
+    def __init__(self, evidence_bundle_id: str):
+        super().__init__(details={"evidence_bundle_id": evidence_bundle_id})
+
+
 def _validation_body(exc: RequestValidationError) -> dict:
     # Keep the payload small, stable, and JSON-safe: loc/msg/type per error.
     issues = [

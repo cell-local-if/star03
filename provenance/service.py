@@ -16,23 +16,35 @@ from provenance.errors import (
     ActorAlreadyExistsError,
     ClaimNotFoundError,
     ContentNotFoundError,
+    EvidenceBundleNotFoundError,
     UnknownActorError,
 )
 from provenance.models import (
     EVENT_ACTOR_CREATED,
     EVENT_CLAIM_CREATED,
     EVENT_CONTENT_CREATED,
+    EVENT_EVIDENCE_BUNDLE_CREATED,
     Actor,
     AuditEvent,
     Claim,
     Content,
+    EvidenceBundle,
 )
-from provenance.schemas import ActorCreate, ClaimCreate, ContentCreate
+from provenance.schemas import (
+    ActorCreate,
+    ClaimCreate,
+    ContentCreate,
+    EvidenceBundleCreate,
+)
 
 # Stable creation order: timestamp first, with the monotonic sequence as a
 # deterministic tiebreaker.
 _CONTENT_ORDER = (Content.created_at.asc(), Content.seq.asc())
 _CLAIM_ORDER = (Claim.created_at.asc(), Claim.seq.asc())
+_EVIDENCE_BUNDLE_ORDER = (
+    EvidenceBundle.created_at.asc(),
+    EvidenceBundle.seq.asc(),
+)
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -218,5 +230,108 @@ def list_claims_for_content(session: Session, content_id: str) -> list[Claim]:
         select(Claim)
         .where(Claim.content_id == content_id)
         .order_by(*_CLAIM_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
+
+
+def _evidence_bundle_identity_select(payload: EvidenceBundleCreate):
+    return select(EvidenceBundle).where(
+        EvidenceBundle.claim_id == payload.claim_id,
+        EvidenceBundle.evidence_type == payload.evidence_type,
+        EvidenceBundle.digest_algorithm == payload.digest_algorithm,
+        EvidenceBundle.digest_hex == payload.digest_hex,
+    )
+
+
+def create_evidence_bundle(
+    session: Session, payload: EvidenceBundleCreate
+) -> tuple[EvidenceBundle, bool]:
+    """Create an evidence bundle, returning ``(bundle, created)``.
+
+    The referenced claim must already exist. Evidence bytes are never seen
+    by this service: only the digest, media type, and metadata are stored.
+    A repeat submission of the same claim, evidence type, digest algorithm,
+    and digest value returns the existing bundle with ``created=False`` --
+    its first-submission metadata is retained -- and writes no row or audit
+    event. Any other field combination forms an independent bundle. The
+    bundle row and its ``evidence_bundle.created`` audit event commit in a
+    single transaction.
+    """
+    claim = session.execute(
+        select(Claim).where(Claim.id == payload.claim_id)
+    ).scalar_one_or_none()
+    if claim is None:
+        raise ClaimNotFoundError(payload.claim_id)
+
+    existing = session.execute(
+        _evidence_bundle_identity_select(payload)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    bundle = EvidenceBundle(
+        id=ids.evidence_bundle_id(
+            payload.claim_id,
+            payload.evidence_type,
+            payload.digest_algorithm,
+            payload.digest_hex,
+        ),
+        claim_id=payload.claim_id,
+        evidence_type=payload.evidence_type,
+        digest_algorithm=payload.digest_algorithm,
+        digest_hex=payload.digest_hex,
+        media_type=payload.media_type,
+        metadata_=payload.metadata,
+    )
+    session.add(bundle)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_EVIDENCE_BUNDLE_CREATED, resource_id=bundle.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical bundle won the race: return its resource.
+        session.rollback()
+        raced = session.execute(
+            _evidence_bundle_identity_select(payload)
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(bundle)
+    return bundle, True
+
+
+def get_evidence_bundle(
+    session: Session, evidence_bundle_id: str
+) -> EvidenceBundle:
+    """Return an evidence bundle by id or raise :class:`EvidenceBundleNotFoundError`."""
+    bundle = session.execute(
+        select(EvidenceBundle).where(EvidenceBundle.id == evidence_bundle_id)
+    ).scalar_one_or_none()
+    if bundle is None:
+        raise EvidenceBundleNotFoundError(evidence_bundle_id)
+    return bundle
+
+
+def list_evidence_bundles_for_claim(
+    session: Session, claim_id: str
+) -> list[EvidenceBundle]:
+    """Return evidence bundles for one claim in stable creation order.
+
+    The claim must exist; an unknown claim id is a missing resource, not an
+    empty collection.
+    """
+    claim = session.execute(
+        select(Claim).where(Claim.id == claim_id)
+    ).scalar_one_or_none()
+    if claim is None:
+        raise ClaimNotFoundError(claim_id)
+    stmt = (
+        select(EvidenceBundle)
+        .where(EvidenceBundle.claim_id == claim_id)
+        .order_by(*_EVIDENCE_BUNDLE_ORDER)
     )
     return list(session.execute(stmt).scalars().all())

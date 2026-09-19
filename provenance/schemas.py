@@ -169,3 +169,77 @@ class ClaimResponse(BaseModel):
 class ClaimListResponse(BaseModel):
     items: list[ClaimResponse]
     count: int
+
+
+class EvidenceBundleCreate(BaseModel):
+    claim_id: str = Field(..., min_length=1, max_length=80)
+    evidence_type: str = Field(..., min_length=1, max_length=128)
+    digest_algorithm: str = Field(..., min_length=1, max_length=32)
+    digest_hex: str = Field(..., min_length=1, max_length=128)
+    media_type: str = Field(..., min_length=1, max_length=255)
+    #: Must be a JSON object; arrays, scalars, and null are rejected.
+    metadata: dict[str, Any]
+
+    @field_validator("claim_id")
+    @classmethod
+    def _claim_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "claim_id")
+
+    @field_validator("evidence_type")
+    @classmethod
+    def _evidence_type_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "evidence_type")
+
+    @field_validator("digest_algorithm")
+    @classmethod
+    def _algorithm_supported(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in SUPPORTED_DIGEST_ALGORITHMS:
+            supported = ", ".join(sorted(SUPPORTED_DIGEST_ALGORITHMS))
+            raise ValueError(f"unsupported digest algorithm; supported: {supported}")
+        return normalized
+
+    @field_validator("digest_hex")
+    @classmethod
+    def _digest_is_sha256_hex(cls, v: str) -> str:
+        # Normalize case so the same digest cannot create two bundles via
+        # different casing; then enforce exactly 64 lowercase hex chars.
+        normalized = v.strip().lower()
+        if not _HEX64.fullmatch(normalized):
+            raise ValueError("digest_hex must be exactly 64 hexadecimal characters")
+        return normalized
+
+    @field_validator("media_type")
+    @classmethod
+    def _media_type_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "media_type")
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_json_object(cls, v: dict[str, Any]) -> dict[str, Any]:
+        try:
+            canonical_json_bytes(v)
+        except (TypeError, ValueError):
+            # Non-finite numbers (NaN/Infinity) have no valid JSON form.
+            raise ValueError(
+                "metadata must be a JSON object with finite values"
+            ) from None
+        return v
+
+
+class EvidenceBundleResponse(BaseModel):
+    """Public evidence bundle view: associations, digest, metadata, time."""
+
+    id: str
+    claim_id: str
+    evidence_type: str
+    digest_algorithm: str
+    digest_hex: str
+    media_type: str
+    metadata: dict[str, Any]
+    created_at: datetime
+
+
+class EvidenceBundleListResponse(BaseModel):
+    items: list[EvidenceBundleResponse]
+    count: int
