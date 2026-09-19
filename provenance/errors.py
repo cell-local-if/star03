@@ -83,6 +83,24 @@ class EvidenceBundleNotFoundError(DomainError):
         super().__init__(details={"evidence_bundle_id": evidence_bundle_id})
 
 
+class AttestationNotFoundError(DomainError):
+    status_code = 404
+    code = "attestation_not_found"
+    message = "The requested attestation does not exist."
+
+    def __init__(self, attestation_id: str):
+        super().__init__(details={"attestation_id": attestation_id})
+
+
+class AttestationVerificationError(DomainError):
+    status_code = 422
+    code = "attestation_verification_failed"
+    message = "The attestation signature could not be verified."
+
+    def __init__(self, details: dict | None = None):
+        super().__init__(details=details)
+
+
 def _validation_body(exc: RequestValidationError) -> dict:
     # Keep the payload small, stable, and JSON-safe: loc/msg/type per error.
     issues = [

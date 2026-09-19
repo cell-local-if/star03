@@ -15,6 +15,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -32,6 +33,7 @@ EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
 EVENT_CLAIM_CREATED = "claim.created"
 EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
+EVENT_ATTESTATION_CREATED = "attestation.created"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -183,6 +185,66 @@ class EvidenceBundle(Base):
     )
 
     claim: Mapped[Claim] = relationship()
+
+
+class Attestation(Base):
+    """A verified Ed25519 attestation of a claim or evidence bundle.
+
+    Only records that passed signature verification are ever written. The
+    raw signature is never persisted: only its SHA-256 digest is stored,
+    alongside the 32-byte Ed25519 public key and the association to the
+    attested target and the existing signing actor. Attestations are
+    append-only; there is deliberately no update or delete path.
+    """
+
+    __tablename__ = "attestations"
+    __table_args__ = (
+        UniqueConstraint(
+            "target_type",
+            "target_id",
+            "signer_actor_id",
+            "public_key",
+            "signature_digest_hex",
+            name="uq_attestations_identity",
+        ),
+        Index(
+            "ix_attestations_target",
+            "target_type",
+            "target_id",
+            "created_at",
+            "seq",
+        ),
+        Index("ix_attestations_created_order", "created_at", "seq"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("att_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: "claim" or "evidence_bundle"; target_id is polymorphic and has no FK.
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    signer_actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The 32 raw Ed25519 public-key bytes (Base64 on the wire).
+    public_key: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    #: Digest algorithm of the signature digest ("sha256").
+    signature_digest_algorithm: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    #: SHA-256 hex digest of the submitted signature; the signature itself
+    #: is never stored or echoed back.
+    signature_digest_hex: Mapped[str] = mapped_column(
+        String(128), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    signer_actor: Mapped[Actor] = relationship()
 
 
 class AuditEvent(Base):

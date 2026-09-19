@@ -54,9 +54,25 @@ Evidence bundles attach externally verifiable evidence to an existing claim by d
 - `GET /v1/evidence-bundles/{evidence_bundle_id}` — full public fields, or `404 evidence_bundle_not_found`.
 - `GET /v1/claims/{claim_id}/evidence-bundles` — that claim's bundles only, in stable creation order as `{"items", "count"}`; an unknown claim id is `404 claim_not_found` (a missing claim is never an empty collection).
 
-The first bundle creation and its `evidence_bundle.created` audit event commit in a single transaction. Blank text fields, non-object metadata, unsupported algorithms or malformed digests, and malformed JSON are `422 validation_error`; an unknown claim on creation or listing remains `404 claim_not_found`.
+The first bundle creation and its `evidence_bundle.created` audit event commit in a single transaction. Blank text fields, non-object metadata, unsupported algorithms or malformed digests, malformed JSON, and **any undeclared request field** are `422 validation_error`; an unknown claim on creation or listing remains `404 claim_not_found`. In particular, fields that could carry raw evidence (for example `data` or `evidence`) are not silently ignored: they are rejected with `422` and write neither a resource nor an audit event.
 
-Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), and `validation_error` (422). Every successful actor, content, claim, and evidence bundle creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
+## Verifiable attestations
+
+Attestations cryptographically bind an existing signing actor to an existing claim or evidence bundle. They only associate targets that already exist; they never create claims, bundles, or actors. The service verifies Ed25519 signatures but never holds a private key, and only verified attestations are ever written.
+
+- `POST /v1/attestations` — body contains `target_type` (`"claim"` or `"evidence_bundle"`), the existing `target_id`, an existing `signer_actor_id`, a Base64 Ed25519 `public_key` that decodes to exactly **32 bytes**, and a Base64 `signature` that decodes to exactly **64 bytes**. The signature is verified against the exact UTF-8 canonical JSON array (compact separators, non-ASCII emitted unescaped):
+
+  ```
+  ["provenance-attestation-v1",target_type,target_id,signer_actor_id]
+  ```
+
+  A signature over any other serialization (reordered elements, whitespace, ASCII `\u` escapes, a different prefix/actor) fails verification. The first creation returns `201` with the stable `att_` id, `target_type`/`target_id`, `signer_actor_id`, the Base64 public key, the `sha256` hex digest of the signature, `verified: true`, and a UTC `created_at`. The raw signature is never persisted or echoed — only its SHA-256 digest is stored. A repeat submission with the same target, signing actor, public key, and signature digest returns `200` with the existing attestation and writes no row or audit event.
+- `GET /v1/attestations/{attestation_id}` — full public fields, or `404 attestation_not_found`.
+- `GET /v1/attestations?target_type=...&target_id=...` — all attestations in stable creation order as `{"items", "count"}`, optionally filtered by `target_type` (`claim` / `evidence_bundle`; any other value is `422 validation_error`) and/or `target_id`. Filtering is an empty collection (`{"items": [], "count": 0}`), never a 404.
+
+The first attestation write and its `attestation.created` audit event commit in a single transaction. An unknown target is `404 claim_not_found` / `evidence_bundle_not_found` (matched by the declared `target_type`), and an unknown signing actor is `404 unknown_actor` even when the signature itself is valid. Bad Base64, wrong decoded lengths (32/64 bytes), blank identifiers, unknown `target_type`, undeclared fields, and malformed JSON are `422 validation_error`; a well-formed request whose signature fails verification is `422 attestation_verification_failed`, with no resource or audit write. Signature verification uses an RFC 8032 Ed25519 implementation in the Python standard library (no external crypto dependency).
+
+Errors are distinct JSON bodies under `{"error": {"code", ...}}`: `actor_already_exists` (409), `unknown_actor` (404), `content_not_found` (404), `claim_not_found` (404), `evidence_bundle_not_found` (404), `attestation_not_found` (404), `attestation_verification_failed` (422), and `validation_error` (422). Every successful actor, content, claim, evidence bundle, and attestation creation appends one audit row (`event_type`, `resource_id`, UTC `created_at`) in the same transaction as the resource write. All returned timestamps are timezone-aware UTC.
 
 ## Tests
 
