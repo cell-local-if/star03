@@ -356,6 +356,25 @@ class ContentExportResponse(BaseModel):
     claims: list[ClaimExportItem]
 
 
+class EvidenceBundleExchangeResponse(BaseModel):
+    """An interoperability snapshot of one evidence bundle for external verifiers.
+
+    Exactly four members: ``content`` (the content the bundle's directly
+    associated claim asserts), ``claim`` (the claim the bundle is directly
+    attached to), ``evidence_bundle`` (the bundle's existing full public
+    view), and ``attestations`` (the existing attestations whose target is
+    this exact evidence bundle, in stable creation order, each rendered with
+    exactly the existing attestation detail fields). No lineage traversal is
+    performed and no other content, claim, or bundle is included; revoked
+    attestations are retained for historical auditability.
+    """
+
+    content: ContentResponse
+    claim: ClaimResponse
+    evidence_bundle: EvidenceBundleResponse
+    attestations: list[AttestationResponse]
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)

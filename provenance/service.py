@@ -1041,6 +1041,59 @@ def get_content_export(
     return content, claims, bundles_by_claim
 
 
+def get_evidence_bundle_exchange(
+    session: Session, evidence_bundle_id: str
+) -> tuple[EvidenceBundle, Claim, Content, list[Attestation]]:
+    """Return an evidence bundle's interoperability snapshot.
+
+    The result is ``(bundle, claim, content, attestations)``: the bundle
+    itself, the single claim the bundle is directly attached to, the single
+    content that claim directly asserts, and the attestations whose target is
+    exactly this evidence bundle in stable creation order. No content lineage
+    is traversed and no other content, claim, bundle, or attestation is
+    returned. Attestations targeting claims (including this bundle's claim)
+    or other bundles are excluded; revoked attestations of this bundle are
+    retained so the snapshot stays historically auditable. The function is
+    strictly read-only: it writes no resource and no audit event.
+
+    The bundle must exist; an unknown evidence bundle id is a missing
+    resource, not an empty snapshot.
+    """
+    bundle = session.execute(
+        select(EvidenceBundle).where(EvidenceBundle.id == evidence_bundle_id)
+    ).scalar_one_or_none()
+    if bundle is None:
+        raise EvidenceBundleNotFoundError(evidence_bundle_id)
+
+    claim = session.execute(
+        select(Claim).where(Claim.id == bundle.claim_id)
+    ).scalar_one_or_none()
+    # A stored bundle always references a stored claim; the guard preserves
+    # the 404 contract even against anomalous history.
+    if claim is None:  # pragma: no cover - defensive
+        raise EvidenceBundleNotFoundError(evidence_bundle_id)
+
+    content = session.execute(
+        select(Content).where(Content.id == claim.content_id)
+    ).scalar_one_or_none()
+    if content is None:  # pragma: no cover - defensive
+        raise EvidenceBundleNotFoundError(evidence_bundle_id)
+
+    attestations = list(
+        session.execute(
+            select(Attestation)
+            .where(
+                Attestation.target_type == signing.TARGET_EVIDENCE_BUNDLE,
+                Attestation.target_id == evidence_bundle_id,
+            )
+            .order_by(*_ATTESTATION_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    return bundle, claim, content, attestations
+
+
 # Trust evaluation threshold bounds.
 DEFAULT_TRUST_MIN_SIGNERS = 1
 MIN_TRUST_MIN_SIGNERS = 1

@@ -49,6 +49,7 @@ from provenance.schemas import (
     ContentRelationResponse,
     ContentResponse,
     EvidenceBundleCreate,
+    EvidenceBundleExchangeResponse,
     EvidenceBundleImportCreate,
     EvidenceBundleImportResponse,
     EvidenceBundleListResponse,
@@ -428,6 +429,33 @@ def get_evidence_bundle(
 ) -> EvidenceBundleResponse:
     bundle = service.get_evidence_bundle(session, evidence_bundle_id)
     return _bundle_response(bundle)
+
+
+@router.get(
+    "/evidence-bundles/{evidence_bundle_id}/exchange",
+    response_model=EvidenceBundleExchangeResponse,
+)
+def get_evidence_bundle_exchange(
+    evidence_bundle_id: str, request: Request, session: DbSession
+) -> EvidenceBundleExchangeResponse:
+    # The exchange takes no query parameters: any parameter at all (known or
+    # unknown, blank or repeated) is a 422 rather than silently ignored.
+    raw = request.query_params
+    if raw:
+        field = sorted(set(raw))[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+    # Strictly read-only: the snapshot writes no resource and no audit event.
+    bundle, claim, content, attestations = service.get_evidence_bundle_exchange(
+        session, evidence_bundle_id
+    )
+    return EvidenceBundleExchangeResponse(
+        content=ContentResponse.model_validate(content),
+        claim=ClaimResponse.model_validate(claim),
+        evidence_bundle=_bundle_response(bundle),
+        attestations=[_attestation_response(item) for item in attestations],
+    )
 
 
 @router.get(
