@@ -1190,6 +1190,49 @@ def get_evidence_bundle_exchange_import(
     return record
 
 
+# Exchange-import receipt search paging bounds.
+DEFAULT_EXCHANGE_IMPORTS_LIMIT = 50
+MIN_EXCHANGE_IMPORTS_LIMIT = 1
+MAX_EXCHANGE_IMPORTS_LIMIT = 100
+
+_EXCHANGE_IMPORT_ORDER = (
+    ExchangeImportRecord.created_at.asc(),
+    ExchangeImportRecord.seq.asc(),
+)
+
+
+def list_evidence_bundle_exchange_imports(
+    session: Session,
+    manifest_version: str | None = None,
+    evidence_bundle_id: str | None = None,
+    manifest_digest_hex: str | None = None,
+) -> list[ExchangeImportRecord]:
+    """Return exchange-import receipts in stable creation order, optionally filtered.
+
+    The three receiving-identity fields are exact, case- and
+    whitespace-sensitive string matches that combine as logical AND; an
+    absent filter imposes no restriction. Results follow the receipts'
+    stable creation order (``created_at`` with the monotonic ``seq``
+    tiebreaker). The function is strictly read-only: it writes no resource
+    and no audit event.
+    """
+    stmt = select(ExchangeImportRecord)
+    if manifest_version is not None:
+        stmt = stmt.where(
+            ExchangeImportRecord.manifest_version == manifest_version
+        )
+    if evidence_bundle_id is not None:
+        stmt = stmt.where(
+            ExchangeImportRecord.evidence_bundle_id == evidence_bundle_id
+        )
+    if manifest_digest_hex is not None:
+        stmt = stmt.where(
+            ExchangeImportRecord.manifest_digest_hex == manifest_digest_hex
+        )
+    stmt = stmt.order_by(*_EXCHANGE_IMPORT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 # Trust evaluation threshold bounds.
 DEFAULT_TRUST_MIN_SIGNERS = 1
 MIN_TRUST_MIN_SIGNERS = 1

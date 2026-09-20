@@ -37,6 +37,9 @@ CONTENT_EVIDENCE_CURSOR_VERSION = "ce1"
 #: Marker for cursors that page through the audit-event search.
 AUDIT_EVENTS_CURSOR_VERSION = "ae1"
 
+#: Marker for cursors that page through exchange-import receipts.
+EXCHANGE_IMPORTS_CURSOR_VERSION = "ei1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -188,6 +191,35 @@ AUDIT_EVENTS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_audit_events_claims,
+)
+
+
+def _validate_exchange_imports_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null) or non-empty strings;
+    # matching is case- and whitespace-sensitive, so the raw value is bound.
+    _optional_nonempty_str(claims, "manifest_version")
+    _optional_nonempty_str(claims, "evidence_bundle_id")
+    _optional_nonempty_str(claims, "manifest_digest_hex")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/evidence-bundle-exchange-imports``.
+EXCHANGE_IMPORTS_CURSOR = CursorKind(
+    version=EXCHANGE_IMPORTS_CURSOR_VERSION,
+    claim_fields=(
+        "manifest_version",
+        "evidence_bundle_id",
+        "manifest_digest_hex",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_exchange_imports_claims,
 )
 
 
