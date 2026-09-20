@@ -8,6 +8,7 @@ adds no audit event.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 
 from sqlalchemy import exists, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
@@ -83,6 +84,7 @@ _CONTENT_RELATION_ORDER = (
     ContentRelation.created_at.asc(),
     ContentRelation.seq.asc(),
 )
+_AUDIT_EVENT_ORDER = (AuditEvent.created_at.asc(), AuditEvent.seq.asc())
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -883,6 +885,39 @@ def retire_authentication_key_rotation(
     # onto the identity-map object before returning it.
     session.refresh(rotation)
     return rotation
+
+
+# Audit-event listing page-size bounds.
+DEFAULT_AUDIT_EVENTS_LIMIT = 50
+MIN_AUDIT_EVENTS_LIMIT = 1
+MAX_AUDIT_EVENTS_LIMIT = 100
+
+
+def list_audit_events(
+    session: Session,
+    event_type: str | None = None,
+    resource_id: str | None = None,
+    from_at: datetime | None = None,
+    to_at: datetime | None = None,
+) -> list[AuditEvent]:
+    """Return audit events in stable creation order.
+
+    Optional ``event_type``/``resource_id`` are exact, combinable string
+    matches; ``from_at``/``to_at`` are inclusive UTC bounds on ``created_at``.
+    The function is strictly read-only: it writes no resource and no audit
+    event.
+    """
+    stmt = select(AuditEvent)
+    if event_type is not None:
+        stmt = stmt.where(AuditEvent.event_type == event_type)
+    if resource_id is not None:
+        stmt = stmt.where(AuditEvent.resource_id == resource_id)
+    if from_at is not None:
+        stmt = stmt.where(AuditEvent.created_at >= from_at)
+    if to_at is not None:
+        stmt = stmt.where(AuditEvent.created_at <= to_at)
+    stmt = stmt.order_by(*_AUDIT_EVENT_ORDER)
+    return list(session.execute(stmt).scalars().all())
 
 
 # Trust evaluation threshold bounds.

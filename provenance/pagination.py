@@ -32,6 +32,9 @@ LINEAGE_CURSOR_VERSION = "v1"
 #: Marker for cursors that page through one content's evidence bundles.
 CONTENT_EVIDENCE_CURSOR_VERSION = "ce1"
 
+#: Marker for cursors that page through the audit-event listing.
+AUDIT_EVENTS_CURSOR_VERSION = "ae1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -148,6 +151,37 @@ CONTENT_EVIDENCE_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_content_evidence_claims,
+)
+
+
+def _validate_audit_events_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters and the RFC3339 UTC bounds are carried as the
+    # raw request strings: either absent (null) or non-empty strings.
+    _optional_nonempty_str(claims, "event_type")
+    _optional_nonempty_str(claims, "resource_id")
+    _optional_nonempty_str(claims, "from")
+    _optional_nonempty_str(claims, "to")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/audit-events``.
+AUDIT_EVENTS_CURSOR = CursorKind(
+    version=AUDIT_EVENTS_CURSOR_VERSION,
+    claim_fields=(
+        "event_type",
+        "resource_id",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_audit_events_claims,
 )
 
 

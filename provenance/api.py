@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import re
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
@@ -30,6 +31,8 @@ from provenance.schemas import (
     AttestationRevocationCreate,
     AttestationRevocationListResponse,
     AttestationRevocationResponse,
+    AuditEventItem,
+    AuditEventListResponse,
     AuthenticationKeyRotationCreate,
     AuthenticationKeyRotationResponse,
     ClaimCreate,
@@ -825,3 +828,158 @@ def evaluate_trust(
         session, target_type, target_id, threshold
     )
     return TrustEvaluationResponse(**result)
+
+
+_AUDIT_EVENTS_PARAMS = frozenset(
+    {"event_type", "resource_id", "from", "to", "limit", "cursor"}
+)
+
+# Strict RFC 3339 date-time with an explicit UTC designator only: ``Z`` (or
+# the RFC-permitted lowercase variants) or a zero numeric offset. Naive
+# timestamps, non-UTC offsets, missing seconds, and any other shape are
+# rejected rather than normalized.
+_RFC3339_UTC_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(\.[0-9]+)?([Zz]|\+00:00)"
+)
+
+
+def _parse_rfc3339_utc_value(value: str | None, field: str) -> datetime | None:
+    """Parse an optional RFC 3339 UTC timestamp query parameter value."""
+    if value is None:
+        return None
+    if not value.strip():
+        raise _query_validation_error(
+            field, f"{field} must not be empty", "value_error"
+        )
+    if not _RFC3339_UTC_RE.fullmatch(value):
+        raise _query_validation_error(
+            field,
+            f"{field} must be an RFC 3339 UTC timestamp",
+            "value_error.datetime",
+        )
+    try:
+        parsed = datetime.fromisoformat(
+            value.replace("Z", "+00:00").replace("z", "+00:00")
+        )
+    except ValueError as exc:
+        # Structurally RFC-shaped but not a real moment (e.g. month 13).
+        raise _query_validation_error(
+            field,
+            f"{field} must be an RFC 3339 UTC timestamp",
+            "value_error.datetime",
+        ) from exc
+    return parsed.astimezone(timezone.utc)
+
+
+@router.get("/audit-events", response_model=AuditEventListResponse)
+def list_audit_events(
+    request: Request,
+    session: DbSession,
+    event_type: str | None = Query(default=None),
+    resource_id: str | None = Query(default=None),
+    from_: str | None = Query(default=None, alias="from"),
+    to: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> AuditEventListResponse:
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, and a blank
+    # filter/timestamp/limit is never coerced to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _AUDIT_EVENTS_PARAMS
+    if unknown:
+        # Undeclared parameters are rejected rather than ignored, so a typo
+        # never silently changes the audited selection.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    event_type = _parse_nonempty_filter(raw, "event_type")
+    resource_id = _parse_nonempty_filter(raw, "resource_id")
+    from_raw = _parse_once(raw, "from")
+    to_raw = _parse_once(raw, "to")
+    from_at = _parse_rfc3339_utc_value(from_raw, "from")
+    to_at = _parse_rfc3339_utc_value(to_raw, "to")
+    if from_at is not None and to_at is not None and from_at > to_at:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_AUDIT_EVENTS_LIMIT,
+        service.MIN_AUDIT_EVENTS_LIMIT,
+        service.MAX_AUDIT_EVENTS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.audit_events_cursor_secret,
+                pagination.AUDIT_EVENTS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (carried as its raw, un-normalized value) and the effective
+        # limit must match exactly.
+        expected = {
+            "event_type": event_type,
+            "resource_id": resource_id,
+            "from": from_raw,
+            "to": to_raw,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    items = service.list_audit_events(
+        session, event_type, resource_id, from_at, to_at
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.audit_events_cursor_secret,
+                pagination.AUDIT_EVENTS_CURSOR,
+                {
+                    "event_type": event_type,
+                    "resource_id": resource_id,
+                    "from": from_raw,
+                    "to": to_raw,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    return AuditEventListResponse(
+        items=[AuditEventItem.model_validate(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
