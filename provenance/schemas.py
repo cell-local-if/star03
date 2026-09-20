@@ -632,6 +632,107 @@ class ExchangeManifestVerificationResponse(BaseModel):
     computed_digest_hex: str | None = None
 
 
+class EvidenceBundleExchangeImportManifest(BaseModel):
+    """The four-field manifest of a received exchange package.
+
+    Exactly the existing manifest's public fields: the fixed
+    ``manifest_version`` and ``digest_algorithm``, the referenced bundle id,
+    and the claimed ``manifest_digest_hex``. Undeclared members are rejected
+    rather than ignored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest_version: Literal[EXCHANGE_MANIFEST_VERSION]
+    evidence_bundle_id: str = Field(..., min_length=1, max_length=80)
+    digest_algorithm: Literal[EXCHANGE_MANIFEST_DIGEST_ALGORITHM]
+    manifest_digest_hex: str
+
+    @field_validator("evidence_bundle_id")
+    @classmethod
+    def _evidence_bundle_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "evidence_bundle_id")
+
+    @field_validator("manifest_digest_hex")
+    @classmethod
+    def _manifest_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "manifest_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class EvidenceBundleExchangeImportCreate(BaseModel):
+    """A received exchange package offered for controlled import.
+
+    Exactly two members: ``manifest`` is the existing four-field exchange
+    manifest and ``snapshot`` is the existing four-member exchange snapshot
+    public structure. Both reuse the offline verification shapes, so the same
+    structural, field, association, and raw-material rules apply: the bundle
+    id must match across both halves, the claim/content associations must be
+    consistent, and every attestation must target this evidence bundle. The
+    manifest digest is recomputed over the snapshot exactly as received under
+    the existing canonical rules and must match. Nothing here is resolved
+    against local resources: verification is decided by the request body
+    alone, and no field can carry a raw signature, claim payload, content
+    bytes, or evidence bytes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest: EvidenceBundleExchangeImportManifest
+    snapshot: ExchangeManifestVerificationSnapshot
+
+    @model_validator(mode="after")
+    def _snapshot_associations_consistent(self):
+        manifest = self.manifest
+        snapshot = self.snapshot
+        if snapshot.evidence_bundle.id != manifest.evidence_bundle_id:
+            raise ValueError(
+                "snapshot.evidence_bundle.id must equal manifest.evidence_bundle_id"
+            )
+        if snapshot.claim.id != snapshot.evidence_bundle.claim_id:
+            raise ValueError(
+                "snapshot.claim.id must equal snapshot.evidence_bundle.claim_id"
+            )
+        if snapshot.content.id != snapshot.claim.content_id:
+            raise ValueError(
+                "snapshot.content.id must equal snapshot.claim.content_id"
+            )
+        for attestation in snapshot.attestations:
+            if (
+                attestation.target_type != "evidence_bundle"
+                or attestation.target_id != manifest.evidence_bundle_id
+            ):
+                raise ValueError(
+                    "every snapshot attestation must target this evidence bundle"
+                )
+        return self
+
+
+class EvidenceBundleExchangeImportResponse(BaseModel):
+    """Public view of an immutable received-package record.
+
+    Carries only the stable ``eir_`` receipt id, the receipt identity
+    (manifest version, bundle id, digest algorithm and claimed digest), and
+    the UTC ``received_at``. The verified snapshot itself is not copied into
+    or read back from the record.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    manifest_version: str
+    evidence_bundle_id: str
+    digest_algorithm: str
+    manifest_digest_hex: str
+    received_at: datetime
+
+
 class AttestationListResponse(BaseModel):
     items: list[AttestationResponse]
     count: int

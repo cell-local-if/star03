@@ -83,6 +83,15 @@ class EvidenceBundleNotFoundError(DomainError):
         super().__init__(details={"evidence_bundle_id": evidence_bundle_id})
 
 
+class EvidenceBundleExchangeImportNotFoundError(DomainError):
+    status_code = 404
+    code = "evidence_bundle_exchange_import_not_found"
+    message = "The requested evidence bundle exchange import does not exist."
+
+    def __init__(self, import_id: str):
+        super().__init__(details={"import_id": import_id})
+
+
 class AttestationNotFoundError(DomainError):
     status_code = 404
     code = "attestation_not_found"
@@ -108,6 +117,26 @@ class ContentRelationNotFoundError(DomainError):
 
     def __init__(self, relation_id: str):
         super().__init__(details={"relation_id": relation_id})
+
+
+class ExchangeImportValidationError(DomainError):
+    """A structurally valid exchange-import package that fails verification.
+
+    A manifest digest that does not match the recomputed SHA-256 of the
+    received snapshot renders with the same ``validation_error`` code as a
+    malformed request body: the package is client input the service refuses
+    to register, and nothing is written.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str, details: dict | None = None):
+        merged = {"reason": reason}
+        if details:
+            merged.update(details)
+        super().__init__(details=merged)
 
 
 class ContentRelationValidationError(DomainError):

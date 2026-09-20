@@ -39,6 +39,7 @@ EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
 EVENT_CLAIM_CREATED = "claim.created"
 EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
+EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 EVENT_ATTESTATION_CREATED = "attestation.created"
 EVENT_ATTESTATION_REVOKED = "attestation.revoked"
 EVENT_ATTESTATION_ACCESS_GRANTED = "attestation.access_granted"
@@ -196,6 +197,53 @@ class EvidenceBundle(Base):
     )
 
     claim: Mapped[Claim] = relationship()
+
+
+class EvidenceBundleExchangeImport(Base):
+    """An immutable receipt for an offline-verified received exchange package.
+
+    The record commits only to the package's receipt identity -- the manifest
+    version, the referenced evidence bundle id, and the manifest digest --
+    together with the manifest's fixed digest algorithm and the UTC receipt
+    time. The exchange snapshot itself is deliberately neither copied nor
+    persisted: its bytes were verified offline and are not retained, so raw
+    signatures, claim payloads, content bytes, and evidence bytes can never
+    reach storage through this route. Receipts are append-only; there is no
+    update or delete path. A retried submission of the same receipt identity
+    returns the original record unchanged.
+    """
+
+    __tablename__ = "evidence_bundle_exchange_imports"
+    __table_args__ = (
+        UniqueConstraint(
+            "manifest_version",
+            "evidence_bundle_id",
+            "manifest_digest_hex",
+            name="uq_evidence_bundle_exchange_imports_identity",
+        ),
+        Index(
+            "ix_evidence_bundle_exchange_imports_order", "received_at", "seq"
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable receipt identifier ("eir_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: Fixed manifest format version of the received package.
+    manifest_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: Evidence bundle id named by the received manifest (never resolved).
+    evidence_bundle_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    #: Digest algorithm named by the received manifest ("sha256").
+    digest_algorithm: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: SHA-256 hex digest claimed by the manifest and verified over the
+    #: received snapshot before this row was written.
+    manifest_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
 
 
 class Attestation(Base):

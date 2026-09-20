@@ -54,6 +54,8 @@ from provenance.schemas import (
     EvidenceBundleExchangeManifestResponse,
     EvidenceBundleExchangePackageResponse,
     EvidenceBundleExchangeResponse,
+    EvidenceBundleExchangeImportCreate,
+    EvidenceBundleExchangeImportResponse,
     EvidenceBundleImportCreate,
     EvidenceBundleImportResponse,
     EvidenceBundleListResponse,
@@ -560,6 +562,49 @@ async def verify_exchange_manifest(
     )
 
 
+@router.post(
+    "/evidence-bundle-exchange-imports",
+    response_model=EvidenceBundleExchangeImportResponse,
+)
+async def import_evidence_bundle_exchange(
+    payload: EvidenceBundleExchangeImportCreate,
+    request: Request,
+    session: DbSession,
+    response: Response,
+) -> EvidenceBundleExchangeImportResponse:
+    # The digest commits to the snapshot exactly as received (root member
+    # order, array order, datetime spellings), not a parsed or re-serialized
+    # form, matching the offline verification route. Schema validation has
+    # already guaranteed the structure, fields, associations, and that every
+    # member is canonicalizable. No local resource is consulted: whether the
+    # named bundle, claim, content, or actors exist never changes the verdict.
+    body = await request.json()
+    record, created = service.register_evidence_bundle_exchange_import(
+        session, payload, body["snapshot"]
+    )
+    # First accepted receipt for this identity -> 201; a retry of the same
+    # identity -> 200 with the existing record unchanged and no new audit.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return EvidenceBundleExchangeImportResponse.model_validate(record)
+
+
+@router.get(
+    "/evidence-bundle-exchange-imports/{import_id}",
+    response_model=EvidenceBundleExchangeImportResponse,
+)
+def get_evidence_bundle_exchange_import(
+    import_id: str, request: Request, session: DbSession
+) -> EvidenceBundleExchangeImportResponse:
+    # Same boundary as the exchange-style routes: any (or repeated) query
+    # parameter is a 422 before the receipt lookup. The read is strictly
+    # read-only and returns the public receipt; the snapshot is not stored.
+    _reject_any_query_param(request)
+    record = service.get_evidence_bundle_exchange_import(session, import_id)
+    return EvidenceBundleExchangeImportResponse.model_validate(record)
+
+
 @router.get(
     "/claims/{claim_id}/evidence-bundles",
     response_model=EvidenceBundleListResponse,
@@ -572,7 +617,6 @@ def list_claim_evidence_bundles(
         items=[_bundle_response(item) for item in items],
         count=len(items),
     )
-
 
 @router.get(
     "/contents/{content_id}/export",

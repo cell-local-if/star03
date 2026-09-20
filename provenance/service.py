@@ -23,7 +23,9 @@ from provenance.errors import (
     ContentNotFoundError,
     ContentRelationNotFoundError,
     ContentRelationValidationError,
+    EvidenceBundleExchangeImportNotFoundError,
     EvidenceBundleNotFoundError,
+    ExchangeImportValidationError,
     ProtectedAccessValidationError,
     UnknownActorError,
 )
@@ -38,6 +40,7 @@ from provenance.models import (
     EVENT_CONTENT_CREATED,
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
+    EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
     Actor,
     Attestation,
     AttestationAccessGrant,
@@ -48,6 +51,7 @@ from provenance.models import (
     Content,
     ContentRelation,
     EvidenceBundle,
+    EvidenceBundleExchangeImport,
 )
 from provenance.schemas import (
     ActorCreate,
@@ -59,6 +63,7 @@ from provenance.schemas import (
     ContentCreate,
     ContentRelationCreate,
     EvidenceBundleCreate,
+    EvidenceBundleExchangeImportCreate,
     EvidenceBundleImportCreate,
 )
 from provenance.time_utils import utc_now
@@ -1092,6 +1097,111 @@ def get_evidence_bundle_exchange(
         .all()
     )
     return bundle, claim, content, attestations
+
+
+def _exchange_import_identity_select(
+    manifest_version: str, evidence_bundle_id: str, manifest_digest_hex: str
+):
+    return select(EvidenceBundleExchangeImport).where(
+        EvidenceBundleExchangeImport.manifest_version == manifest_version,
+        EvidenceBundleExchangeImport.evidence_bundle_id == evidence_bundle_id,
+        EvidenceBundleExchangeImport.manifest_digest_hex == manifest_digest_hex,
+    )
+
+
+def register_evidence_bundle_exchange_import(
+    session: Session,
+    payload: EvidenceBundleExchangeImportCreate,
+    raw_snapshot: dict,
+) -> tuple[EvidenceBundleExchangeImport, bool]:
+    """Register a received, offline-verified exchange package as a receipt.
+
+    Verification is decided entirely by the request body and never consults
+    local resources: the snapshot is canonicalized under the existing
+    manifest rules exactly as received and hashed with SHA-256, and the
+    result must equal the claimed ``manifest_digest_hex``. Structural,
+    field, association, and raw-material checks have already been enforced
+    by the request schema. A digest mismatch raises
+    :class:`ExchangeImportValidationError` and writes nothing.
+
+    The receipt identity is ``(manifest_version, evidence_bundle_id,
+    manifest_digest_hex)``. The first accepted package for an identity is
+    inserted together with its ``evidence_bundle.exchange_imported`` audit
+    event in a single transaction and returns ``(record, True)``; a retry of
+    the same identity returns the existing record with ``(record, False)``,
+    unchanged, and writes neither a row nor an audit event. The verified
+    snapshot itself is never persisted.
+    """
+    manifest = payload.manifest
+    computed_digest_hex = canonical.exchange_manifest_digest_hex(raw_snapshot)
+    if computed_digest_hex != manifest.manifest_digest_hex:
+        raise ExchangeImportValidationError(
+            "manifest_digest_hex does not match the snapshot",
+            details={"computed_digest_hex": computed_digest_hex},
+        )
+
+    identity_select = _exchange_import_identity_select(
+        manifest.manifest_version,
+        manifest.evidence_bundle_id,
+        manifest.manifest_digest_hex,
+    )
+    existing = session.execute(identity_select).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    # One instant stamps both the receipt and its audit event, so the two
+    # rows committed in this transaction always agree.
+    received_at = utc_now()
+    record = EvidenceBundleExchangeImport(
+        id=ids.evidence_bundle_exchange_import_id(
+            manifest.manifest_version,
+            manifest.evidence_bundle_id,
+            manifest.manifest_digest_hex,
+        ),
+        manifest_version=manifest.manifest_version,
+        evidence_bundle_id=manifest.evidence_bundle_id,
+        digest_algorithm=manifest.digest_algorithm,
+        manifest_digest_hex=manifest.manifest_digest_hex,
+        received_at=received_at,
+    )
+    session.add(record)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
+            resource_id=record.id,
+            created_at=received_at,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent import registered the same identity first: return its
+        # record unchanged, with no additional audit event.
+        session.rollback()
+        raced = session.execute(identity_select).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(record)
+    return record, True
+
+
+def get_evidence_bundle_exchange_import(
+    session: Session, import_id: str
+) -> EvidenceBundleExchangeImport:
+    """Return a received-package record by id or raise 404.
+
+    The lookup is by the receipt's own stable ``eir_`` id; it never resolves
+    the named evidence bundle against local resources.
+    """
+    record = session.execute(
+        select(EvidenceBundleExchangeImport).where(
+            EvidenceBundleExchangeImport.id == import_id
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        raise EvidenceBundleExchangeImportNotFoundError(import_id)
+    return record
 
 
 # Trust evaluation threshold bounds.

@@ -62,6 +62,32 @@ def evidence_bundle_id(
     return "evb_" + hashlib.sha256(material).hexdigest()
 
 
+def evidence_bundle_exchange_import_id(
+    manifest_version: str,
+    evidence_bundle_id: str,
+    manifest_digest_hex: str,
+) -> str:
+    """Return a stable ``eir_``-prefixed identifier for a received package.
+
+    The identity is exactly the receipt identity: the manifest version, the
+    referenced evidence bundle id, and the manifest digest. The raw snapshot,
+    its content and evidence bytes, claim payloads, and signatures never
+    enter the identifier material. The material is a canonical JSON array so
+    fields containing separators cannot collide with different field splits.
+    """
+    material = json.dumps(
+        [
+            "evidence_bundle_exchange_import",
+            manifest_version,
+            evidence_bundle_id,
+            manifest_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "eir_" + hashlib.sha256(material).hexdigest()
+
+
 def content_relation_id(
     content_id: str,
     parent_content_id: str,
