@@ -482,6 +482,26 @@ class AttestationAccessGrantResponse(BaseModel):
     created_at: datetime
 
 
+class AuditEventItem(BaseModel):
+    """Public audit-event view: type, resource, and UTC timestamp only."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    event_type: str
+    resource_id: str
+    created_at: datetime
+
+
+class AuditEventPageResponse(BaseModel):
+    """A cursor-paginated page of audit-event public views."""
+
+    items: list[AuditEventItem]
+    #: Total number of events after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 

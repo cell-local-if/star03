@@ -24,6 +24,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from provenance.time_utils import parse_rfc3339_utc
+
 #: Legacy lineage cursor format generation. Bump only when the lineage claim
 #: set/encoding changes; cursors carrying any other marker are rejected as
 #: expired/unknown.
@@ -31,6 +33,9 @@ LINEAGE_CURSOR_VERSION = "v1"
 
 #: Marker for cursors that page through one content's evidence bundles.
 CONTENT_EVIDENCE_CURSOR_VERSION = "ce1"
+
+#: Marker for cursors that page through the audit-event search.
+AUDIT_EVENTS_CURSOR_VERSION = "ae1"
 
 
 class InvalidCursorError(ValueError):
@@ -148,6 +153,41 @@ CONTENT_EVIDENCE_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_content_evidence_claims,
+)
+
+
+def _validate_audit_events_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null) or non-empty strings.
+    _optional_nonempty_str(claims, "event_type")
+    _optional_nonempty_str(claims, "resource_id")
+    # The time bounds are absent (null) or canonical RFC 3339 UTC strings.
+    for field in ("from", "to"):
+        value = claims[field]
+        if value is not None and (
+            not isinstance(value, str) or parse_rfc3339_utc(value) is None
+        ):
+            raise InvalidCursorError(f"cursor {field} is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/audit-events``.
+AUDIT_EVENTS_CURSOR = CursorKind(
+    version=AUDIT_EVENTS_CURSOR_VERSION,
+    claim_fields=(
+        "event_type",
+        "resource_id",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_audit_events_claims,
 )
 
 

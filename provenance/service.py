@@ -83,6 +83,7 @@ _CONTENT_RELATION_ORDER = (
     ContentRelation.created_at.asc(),
     ContentRelation.seq.asc(),
 )
+_AUDIT_EVENT_ORDER = (AuditEvent.created_at.asc(), AuditEvent.seq.asc())
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -958,6 +959,41 @@ def evaluate_trust(
             else TRUST_DECISION_UNTRUSTED
         ),
     }
+
+
+# Audit-event search paging bounds.
+DEFAULT_AUDIT_EVENTS_LIMIT = 50
+MIN_AUDIT_EVENTS_LIMIT = 1
+MAX_AUDIT_EVENTS_LIMIT = 100
+
+
+def list_audit_events(
+    session: Session,
+    event_type: str | None = None,
+    resource_id: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[AuditEvent]:
+    """Return audit events in stable creation order, optionally filtered.
+
+    ``event_type`` and ``resource_id`` are exact, combinable string matches.
+    ``from_dt``/``to_dt`` are timezone-aware UTC instants applied as
+    inclusive ``created_at`` bounds. Results follow the events' stable
+    creation order (``created_at`` with the monotonic ``seq`` tiebreaker).
+    The function is strictly read-only: it writes no resource and no audit
+    event.
+    """
+    stmt = select(AuditEvent)
+    if event_type is not None:
+        stmt = stmt.where(AuditEvent.event_type == event_type)
+    if resource_id is not None:
+        stmt = stmt.where(AuditEvent.resource_id == resource_id)
+    if from_dt is not None:
+        stmt = stmt.where(AuditEvent.created_at >= from_dt)
+    if to_dt is not None:
+        stmt = stmt.where(AuditEvent.created_at <= to_dt)
+    stmt = stmt.order_by(*_AUDIT_EVENT_ORDER)
+    return list(session.execute(stmt).scalars().all())
 
 
 def _require_content(session: Session, content_id: str) -> Content:

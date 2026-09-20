@@ -19,6 +19,7 @@ from provenance.errors import (
 from provenance.models import RELATION_DERIVED_FROM, RELATION_VERSION_OF
 from provenance.pagination import InvalidCursorError
 from provenance.signing import ATTESTATION_TARGET_TYPES
+from provenance.time_utils import parse_rfc3339_utc
 from provenance.schemas import (
     ActorCreate,
     ActorResponse,
@@ -30,6 +31,8 @@ from provenance.schemas import (
     AttestationRevocationCreate,
     AttestationRevocationListResponse,
     AttestationRevocationResponse,
+    AuditEventItem,
+    AuditEventPageResponse,
     AuthenticationKeyRotationCreate,
     AuthenticationKeyRotationResponse,
     ClaimCreate,
@@ -825,3 +828,136 @@ def evaluate_trust(
         session, target_type, target_id, threshold
     )
     return TrustEvaluationResponse(**result)
+
+
+_AUDIT_EVENTS_PARAMS = frozenset(
+    {"event_type", "resource_id", "from", "to", "limit", "cursor"}
+)
+
+
+def _parse_rfc3339_param(raw, field: str):
+    """Parse an optional strict RFC 3339 UTC timestamp query parameter."""
+    value = _parse_once(raw, field)
+    if value is None:
+        return None
+    if not value.strip():
+        raise _query_validation_error(
+            field, f"{field} must not be empty", "value_error"
+        )
+    parsed = parse_rfc3339_utc(value)
+    if parsed is None:
+        raise _query_validation_error(
+            field,
+            f"{field} must be an RFC 3339 UTC timestamp",
+            "value_error.datetime",
+        )
+    return parsed
+
+
+def _audit_time_claim(dt) -> str | None:
+    # The cursor binds the effective instant, not its spelling: equivalent
+    # notations ("Z" vs "+00:00") canonicalize to the same claim.
+    return dt.isoformat() if dt is not None else None
+
+
+@router.get("/audit-events", response_model=AuditEventPageResponse)
+def list_audit_events(request: Request, session: DbSession) -> AuditEventPageResponse:
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, and blank or
+    # malformed values are never coerced to defaults.
+    raw = request.query_params
+
+    unknown = set(raw) - _AUDIT_EVENTS_PARAMS
+    if unknown:
+        # Undeclared parameters are rejected rather than ignored, so a typo
+        # never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    event_type = _parse_nonempty_filter(raw, "event_type")
+    resource_id = _parse_nonempty_filter(raw, "resource_id")
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_AUDIT_EVENTS_LIMIT,
+        service.MIN_AUDIT_EVENTS_LIMIT,
+        service.MAX_AUDIT_EVENTS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.audit_events_cursor_secret,
+                pagination.AUDIT_EVENTS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter and the effective limit must match exactly.
+        expected = {
+            "event_type": event_type,
+            "resource_id": resource_id,
+            "from": _audit_time_claim(from_dt),
+            "to": _audit_time_claim(to_dt),
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no resource and no audit event.
+    items = service.list_audit_events(
+        session, event_type, resource_id, from_dt, to_dt
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.audit_events_cursor_secret,
+                pagination.AUDIT_EVENTS_CURSOR,
+                {
+                    "event_type": event_type,
+                    "resource_id": resource_id,
+                    "from": _audit_time_claim(from_dt),
+                    "to": _audit_time_claim(to_dt),
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    return AuditEventPageResponse(
+        items=[AuditEventItem.model_validate(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
