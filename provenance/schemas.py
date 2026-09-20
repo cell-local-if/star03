@@ -398,6 +398,21 @@ class EvidenceBundleExchangeManifestResponse(BaseModel):
     manifest_digest_hex: str
 
 
+class EvidenceBundleExchangePackageResponse(BaseModel):
+    """One read returning an exchange snapshot together with its manifest.
+
+    Exactly two members: ``snapshot`` is the bundle's existing exchange
+    snapshot view and ``manifest`` is its existing four-field integrity
+    manifest. The manifest digest is computed over exactly the ``snapshot``
+    member returned in this same response under the existing canonical
+    rules; both derive from a single read-only snapshot read, so the package
+    introduces no resource, record, or audit event.
+    """
+
+    snapshot: EvidenceBundleExchangeResponse
+    manifest: EvidenceBundleExchangeManifestResponse
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)
