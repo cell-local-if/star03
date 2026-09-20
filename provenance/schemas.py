@@ -758,6 +758,40 @@ class EvidenceBundleExchangeImportReconciliationResponse(BaseModel):
     matches: bool
 
 
+class EvidenceBundleExchangeImportReconciliationItem(BaseModel):
+    """One receipt's current local reconciliation in a list page.
+
+    Carries the existing single-receipt public view exactly (``id``,
+    ``manifest_version``, ``evidence_bundle_id``, ``manifest_digest_hex``,
+    ``received_at``) plus the three reconciliation fields computed against
+    current local state: ``local_available`` is false,
+    ``local_manifest_digest_hex`` null, and ``matches`` false when no local
+    bundle carries the receipt's ``evidence_bundle_id``; when one does, the
+    current exchange manifest digest is reported under the existing manifest
+    rules and ``matches`` is true only on character-for-character equality
+    with the receipt digest. The snapshot and every raw material are absent.
+    """
+
+    id: str
+    manifest_version: str
+    evidence_bundle_id: str
+    manifest_digest_hex: str
+    received_at: datetime
+    local_available: bool
+    local_manifest_digest_hex: str | None
+    matches: bool
+
+
+class EvidenceBundleExchangeImportReconciliationPageResponse(BaseModel):
+    """A cursor-paginated page of receipt local reconciliations."""
+
+    items: list[EvidenceBundleExchangeImportReconciliationItem]
+    #: Total number of receipts, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class AttestationListResponse(BaseModel):
     items: list[AttestationResponse]
     count: int

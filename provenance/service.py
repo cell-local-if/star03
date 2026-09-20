@@ -1212,6 +1212,27 @@ _EXCHANGE_IMPORT_ORDER = (
     ExchangeImportRecord.seq.asc(),
 )
 
+# Exchange-import reconciliation listing paging bounds.
+DEFAULT_EXCHANGE_IMPORT_RECONCILIATIONS_LIMIT = 50
+MIN_EXCHANGE_IMPORT_RECONCILIATIONS_LIMIT = 1
+MAX_EXCHANGE_IMPORT_RECONCILIATIONS_LIMIT = 100
+
+
+def list_evidence_bundle_exchange_import_reconciliations(
+    session: Session,
+) -> list[ExchangeImportRecord]:
+    """Return every exchange-import receipt in stable creation order.
+
+    The reconciliation collection is unfiltered; each receipt's local
+    reconciliation is computed by the caller from the receipt's own
+    ``evidence_bundle_id``. Results follow the receipts' stable creation
+    order (``created_at`` with the monotonic ``seq`` tiebreaker). The
+    function is strictly read-only: it writes no resource and no audit
+    event.
+    """
+    stmt = select(ExchangeImportRecord).order_by(*_EXCHANGE_IMPORT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
 
 def list_evidence_bundle_exchange_imports(
     session: Session,
