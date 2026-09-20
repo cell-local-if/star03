@@ -30,6 +30,8 @@ from provenance.schemas import (
     AttestationRevocationCreate,
     AttestationRevocationListResponse,
     AttestationRevocationResponse,
+    AuthenticationKeyRotationCreate,
+    AuthenticationKeyRotationResponse,
     ClaimCreate,
     ClaimListResponse,
     ClaimResponse,
@@ -691,6 +693,71 @@ async def get_protected_attestation(
     if attestation is None:
         raise ProtectedResourceNotFoundError()
     return _attestation_response(attestation)
+
+
+def _rotation_response(rotation) -> AuthenticationKeyRotationResponse:
+    # Only the 32 public-key bytes leave the service, Base64 on the wire;
+    # there is never a private key or raw signature to render.
+    return AuthenticationKeyRotationResponse(
+        id=rotation.id,
+        actor_id=rotation.actor_id,
+        new_public_key=base64.b64encode(rotation.public_key).decode("ascii"),
+        active=rotation.active,
+        created_at=rotation.created_at,
+        retired_at=rotation.retired_at,
+    )
+
+
+@router.post(
+    "/authentication-key-rotations",
+    response_model=AuthenticationKeyRotationResponse,
+)
+async def create_authentication_key_rotation(
+    request: Request,
+    payload: AuthenticationKeyRotationCreate,
+    session: DbSession,
+    response: Response,
+) -> AuthenticationKeyRotationResponse:
+    # The signature covers the exact bytes on the wire; FastAPI's parsed
+    # model is built from the same cached body, so body_sha256 matches what
+    # the client signed. The caller authenticated by the signature is the
+    # rotation's subject.
+    raw_body = await request.body()
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    rotation, created = service.create_authentication_key_rotation(
+        session, payload, caller
+    )
+    # First creation -> 201; a retried submission for the same subject and
+    # public key -> 200 with the original record (retired or not) and no
+    # audit event.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _rotation_response(rotation)
+
+
+@router.post(
+    "/authentication-key-rotations/{rotation_id}/retire",
+    response_model=AuthenticationKeyRotationResponse,
+)
+async def retire_authentication_key_rotation(
+    rotation_id: str, request: Request, session: DbSession
+) -> AuthenticationKeyRotationResponse:
+    raw_body = await request.body()
+    # The request body is empty, so the signed body_sha256 is the digest of
+    # zero bytes, exactly as for a bodyless request. A non-empty body is
+    # malformed input rejected before any state change.
+    if raw_body:
+        raise ProtectedAccessValidationError("body_must_be_empty")
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    rotation = service.retire_authentication_key_rotation(
+        session, rotation_id, caller
+    )
+    return _rotation_response(rotation)
 
 
 @router.get(

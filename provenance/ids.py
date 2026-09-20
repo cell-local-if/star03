@@ -144,3 +144,21 @@ def attestation_revocation_id(
         ensure_ascii=False,
     ).encode("utf-8")
     return "rev_" + hashlib.sha256(material).hexdigest()
+
+
+def authentication_key_rotation_id(
+    actor_id: str, public_key_hex: str
+) -> str:
+    """Return a stable ``akr_``-prefixed identifier for a key rotation.
+
+    The identity is exactly the idempotency key: the subject and the new
+    public key. A private key or a raw signature never enters the material.
+    The material is a canonical JSON array so fields containing separators
+    cannot collide with different field splits.
+    """
+    material = json.dumps(
+        ["authentication_key_rotation", actor_id, public_key_hex],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "akr_" + hashlib.sha256(material).hexdigest()

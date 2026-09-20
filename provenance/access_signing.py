@@ -20,10 +20,11 @@ with three headers:
     value, and ``body_sha256`` is the lowercase-hex SHA-256 of the actual
     request body bytes (zero bytes for an empty body).
 
-The signature is accepted if it verifies under **any** public key of an
-attestation created by the calling actor that carries no revocation record.
-Revoked attestation keys never authenticate, regardless of the target the
-request operates on.
+The signature is accepted if it verifies under **any** public key of a
+non-revoked attestation created by the calling actor, or under an active
+authentication key the actor introduced through a key rotation (a retired
+rotation key never authenticates). Revoked attestation keys never
+authenticate, regardless of the target the request operates on.
 
 Failures split into two categories:
 
@@ -51,7 +52,11 @@ from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
 from provenance import ed25519
-from provenance.models import Attestation, AttestationRevocation
+from provenance.models import (
+    Attestation,
+    AttestationRevocation,
+    AuthenticationKeyRotation,
+)
 
 #: Required headers, in the order documented by the contract.
 HEADER_ACTOR = "X-PA"
@@ -146,22 +151,44 @@ def _decode_signature(raw: str) -> bytes:
 
 
 def _actor_public_keys(session: Session, actor_id: str) -> list[bytes]:
-    """Distinct public keys of the actor's attestations carrying no revocation."""
+    """Distinct current authentication keys of the actor.
+
+    The set is the union of:
+
+    * public keys of the actor's attestations carrying no revocation, and
+    * public keys of the actor's active (non-retired) key rotations.
+
+    A rotated key therefore authenticates without any attestation, an
+    existing non-revoked attestation key keeps working, and a retired
+    rotation key -- like a revoked attestation key -- never authenticates.
+    """
     revoked = exists().where(
         AttestationRevocation.attestation_id == Attestation.id
     )
-    return list(
+    attestation_keys = (
         session.execute(
-            select(Attestation.public_key)
-            .where(
+            select(Attestation.public_key).where(
                 Attestation.signer_actor_id == actor_id,
                 ~revoked,
             )
-            .distinct()
         )
         .scalars()
         .all()
     )
+    rotation_keys = (
+        session.execute(
+            select(AuthenticationKeyRotation.public_key).where(
+                AuthenticationKeyRotation.actor_id == actor_id,
+                AuthenticationKeyRotation.active.is_(True),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # De-duplicate: the same key bytes may be carried by both an attestation
+    # and a rotation; verifying twice adds no security and costs a scalar
+    # multiplication.
+    return list(dict.fromkeys([*attestation_keys, *rotation_keys]))
 
 
 def authenticate(session: Session, request, body: bytes) -> str:

@@ -497,3 +497,42 @@ class TrustEvaluationResponse(BaseModel):
     qualified_signer_count: int
     #: ``"trusted"`` when ``qualified_signer_count >= min_signers``.
     decision: Literal["trusted", "untrusted"]
+
+
+class AuthenticationKeyRotationCreate(BaseModel):
+    # A rotation carries exactly its declared verification material. There
+    # is deliberately no field capable of carrying a private key or a raw
+    # signature: undeclared fields are rejected rather than silently dropped.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The subject introducing the key. The authenticated caller must be
+    #: this same actor.
+    actor_id: str = Field(..., min_length=1, max_length=255)
+    #: Base64 Ed25519 public key; must decode to exactly 32 bytes.
+    new_public_key: bytes
+
+    @field_validator("actor_id")
+    @classmethod
+    def _actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "actor_id")
+
+    @field_validator("new_public_key", mode="before")
+    @classmethod
+    def _new_public_key_is_32_bytes(cls, v: Any) -> bytes:
+        return _decode_base64(v, "new_public_key", PUBLIC_KEY_LENGTH)
+
+
+class AuthenticationKeyRotationResponse(BaseModel):
+    """Public rotation view: subject, public key, lifecycle flags, and times."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    #: The subject who owns the key.
+    actor_id: str
+    #: Base64 of the 32-byte Ed25519 public key.
+    new_public_key: str
+    active: bool
+    created_at: datetime
+    #: UTC retirement time, or null while the key is active.
+    retired_at: datetime | None

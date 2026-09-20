@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -32,6 +32,8 @@ from provenance.models import (
     EVENT_ATTESTATION_ACCESS_GRANTED,
     EVENT_ATTESTATION_CREATED,
     EVENT_ATTESTATION_REVOKED,
+    EVENT_AUTHENTICATION_KEY_RETIRED,
+    EVENT_AUTHENTICATION_KEY_ROTATED,
     EVENT_CLAIM_CREATED,
     EVENT_CONTENT_CREATED,
     EVENT_CONTENT_RELATION_CREATED,
@@ -40,6 +42,7 @@ from provenance.models import (
     Attestation,
     AttestationAccessGrant,
     AttestationRevocation,
+    AuthenticationKeyRotation,
     AuditEvent,
     Claim,
     Content,
@@ -51,11 +54,13 @@ from provenance.schemas import (
     AttestationAccessGrantCreate,
     AttestationCreate,
     AttestationRevocationCreate,
+    AuthenticationKeyRotationCreate,
     ClaimCreate,
     ContentCreate,
     ContentRelationCreate,
     EvidenceBundleCreate,
 )
+from provenance.time_utils import utc_now
 
 # Stable creation order: timestamp first, with the monotonic sequence as a
 # deterministic tiebreaker.
@@ -745,6 +750,139 @@ def get_accessible_attestation(
         )
     ).first()
     return attestation if grant_exists is not None else None
+
+
+def create_authentication_key_rotation(
+    session: Session,
+    payload: AuthenticationKeyRotationCreate,
+    caller_actor_id: str,
+) -> tuple[AuthenticationKeyRotation, bool]:
+    """Rotate in a new authentication public key, returning ``(record, created)``.
+
+    The authenticated caller is the subject: ``payload.actor_id`` must be the
+    caller and the subject must already exist. The new key immediately
+    joins the subject's non-revoked authentication key set for the
+    protected routes without any attestation. A repeat submission for the
+    same subject and public key returns the original record with
+    ``created=False`` and writes no row or audit event -- including a record
+    that has since been retired, which is returned unchanged. A different
+    public key forms an independent rotation. On first creation the row and
+    its ``authentication_key.rotated`` audit event commit in a single
+    transaction. Every rejected request is a ``422`` validation error and
+    writes nothing.
+    """
+    # Validate the subject before the credential-derived identity lookup:
+    # an unknown subject and a caller/body mismatch are 422s, not 404s.
+    actor = session.get(Actor, payload.actor_id)
+    if actor is None:
+        raise ProtectedAccessValidationError("unknown_actor")
+
+    if payload.actor_id != caller_actor_id:
+        raise ProtectedAccessValidationError("actor_mismatch")
+
+    existing = session.execute(
+        select(AuthenticationKeyRotation).where(
+            AuthenticationKeyRotation.actor_id == payload.actor_id,
+            AuthenticationKeyRotation.public_key == payload.new_public_key,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        # Idempotent even after retirement: the original (possibly retired)
+        # record is returned and no audit event is written.
+        return existing, False
+
+    rotation = AuthenticationKeyRotation(
+        id=ids.authentication_key_rotation_id(
+            payload.actor_id, payload.new_public_key.hex()
+        ),
+        actor_id=payload.actor_id,
+        public_key=payload.new_public_key,
+        active=True,
+    )
+    session.add(rotation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_AUTHENTICATION_KEY_ROTATED,
+            resource_id=rotation.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical rotation won the race: return its record.
+        session.rollback()
+        raced = session.execute(
+            select(AuthenticationKeyRotation).where(
+                AuthenticationKeyRotation.actor_id == payload.actor_id,
+                AuthenticationKeyRotation.public_key == payload.new_public_key,
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(rotation)
+    return rotation, True
+
+
+def retire_authentication_key_rotation(
+    session: Session,
+    rotation_id: str,
+    caller_actor_id: str,
+) -> AuthenticationKeyRotation:
+    """Retire an active key rotation owned by the caller.
+
+    Only the owning subject may retire the record, and only while it is
+    active. An unknown record, an owner mismatch, or a repeat retirement of
+    an already-retired record is a ``422`` validation error and writes
+    nothing -- existence is never revealed to a non-owner. On success the
+    record's ``active`` flips to false and a UTC ``retired_at`` is stamped
+    in the same transaction as the ``authentication_key.retired`` audit
+    event; the key then stops authenticating immediately.
+
+    The active check and the state flip are a single conditional UPDATE,
+    so two concurrent retire calls cannot both succeed and write two
+    audit events: exactly one flips the row, the other is rejected.
+    """
+    rotation = session.execute(
+        select(AuthenticationKeyRotation).where(
+            AuthenticationKeyRotation.id == rotation_id
+        )
+    ).scalar_one_or_none()
+    if rotation is None:
+        raise ProtectedAccessValidationError("rotation_not_found")
+
+    if rotation.actor_id != caller_actor_id:
+        # Collapse owner mismatch into the same opaque validation error as
+        # an unknown record, without revealing that the record exists.
+        raise ProtectedAccessValidationError("rotation_not_found")
+
+    retired_at = utc_now()
+    result = session.execute(
+        sa_update(AuthenticationKeyRotation)
+        .where(
+            AuthenticationKeyRotation.id == rotation_id,
+            AuthenticationKeyRotation.active.is_(True),
+        )
+        .values(active=False, retired_at=retired_at)
+    )
+    if result.rowcount != 1:
+        # The row was active at load time but a concurrent transaction
+        # retired it first: this request is a repeat retirement, not a
+        # success, so it writes no state and no audit event.
+        session.rollback()
+        raise ProtectedAccessValidationError("rotation_already_retired")
+
+    session.add(
+        AuditEvent(
+            event_type=EVENT_AUTHENTICATION_KEY_RETIRED,
+            resource_id=rotation.id,
+        )
+    )
+    session.commit()
+    # The core UPDATE bypassed the ORM unit of work; reload the final state
+    # onto the identity-map object before returning it.
+    session.refresh(rotation)
+    return rotation
 
 
 # Trust evaluation threshold bounds.

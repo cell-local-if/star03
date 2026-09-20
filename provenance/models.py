@@ -11,6 +11,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     ForeignKey,
     Index,
     Integer,
@@ -42,6 +43,8 @@ EVENT_ATTESTATION_CREATED = "attestation.created"
 EVENT_ATTESTATION_REVOKED = "attestation.revoked"
 EVENT_ATTESTATION_ACCESS_GRANTED = "attestation.access_granted"
 EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
+EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
+EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -356,6 +359,66 @@ class AttestationAccessGrant(Base):
 
     attestation: Mapped[Attestation] = relationship()
     grantee_actor: Mapped[Actor] = relationship()
+
+
+class AuthenticationKeyRotation(Base):
+    """A subject's rotated authentication public key.
+
+    A rotation introduces a new 32-byte Ed25519 public key that immediately
+    joins the subject's non-revoked authentication key set for the protected
+    routes -- no attestation is required, and the key does not replace the
+    public keys still carried by the subject's existing non-revoked
+    attestations. Only the public key is ever received: there is no field
+    capable of carrying a private key or a raw signature.
+
+    A rotation is retired, never deleted: ``active`` flips to false and a
+    UTC ``retired_at`` is stamped, preserving the original record and its
+    ``authentication_key.rotated`` audit relationship. A retired key stops
+    authenticating immediately. The ``(actor_id, public_key)`` pair is
+    unique, so a retried submission for the same subject and key returns the
+    original record (whether still active or already retired).
+    """
+
+    __tablename__ = "authentication_key_rotations"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id",
+            "public_key",
+            name="uq_authentication_key_rotations_identity",
+        ),
+        Index("ix_authentication_key_rotations_actor_order", "actor_id", "seq"),
+        Index(
+            "ix_authentication_key_rotations_active_actor",
+            "actor_id",
+            "active",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("akr_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The subject who owns the key and whose signature authenticated the
+    #: request; the caller is always this actor.
+    actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The 32 raw Ed25519 public-key bytes (Base64 on the wire).
+    public_key: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    #: True while the key authenticates; flips to false exactly once on retire.
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+    #: Set in the same transaction as the ``authentication_key.retired``
+    #: audit event; null while the key is active.
+    retired_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+
+    actor: Mapped[Actor] = relationship()
 
 
 class ContentRelation(Base):
