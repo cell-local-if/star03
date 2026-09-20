@@ -58,6 +58,8 @@ from provenance.schemas import (
     EvidenceBundleListResponse,
     EvidenceBundlePageResponse,
     EvidenceBundleResponse,
+    ExchangeManifestVerificationCreate,
+    ExchangeManifestVerificationResponse,
     TrustEvaluationResponse,
 )
 
@@ -498,6 +500,31 @@ def get_evidence_bundle_exchange_manifest(
         evidence_bundle_id=evidence_bundle_id,
         digest_algorithm=EXCHANGE_MANIFEST_DIGEST_ALGORITHM,
         manifest_digest_hex=manifest_digest_hex,
+    )
+
+
+@router.post(
+    "/exchange-manifest-verifications",
+    response_model=ExchangeManifestVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_exchange_manifest(
+    payload: ExchangeManifestVerificationCreate, request: Request
+) -> ExchangeManifestVerificationResponse:
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no audit event is written. Verification
+    # uses the request body alone; the bundle id is never resolved against
+    # local state.
+    body = await request.json()
+    # The digest commits to the snapshot exactly as received: the raw JSON
+    # values (root member order, array order, datetime spellings), not any
+    # parsed or re-serialized form. Field validation has already guaranteed
+    # every member is canonicalizable.
+    computed_digest_hex = canonical.exchange_manifest_digest_hex(body["snapshot"])
+    if computed_digest_hex == payload.manifest_digest_hex:
+        return ExchangeManifestVerificationResponse(valid=True)
+    return ExchangeManifestVerificationResponse(
+        valid=False, computed_digest_hex=computed_digest_hex
     )
 
 

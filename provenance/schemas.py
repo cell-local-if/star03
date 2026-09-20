@@ -12,7 +12,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from provenance.canonical import canonical_json_bytes
 from provenance.ed25519 import PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH
@@ -486,6 +486,135 @@ class AttestationResponse(BaseModel):
     #: Always true for stored attestations: only verified rows are written.
     verified: bool
     created_at: datetime
+
+
+class ExchangeManifestVerificationSnapshotContent(ContentResponse):
+    """The ``content`` member of a snapshot under offline verification.
+
+    Exactly the existing public content view's fields: undeclared members
+    (including any raw-material field) are rejected rather than ignored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ExchangeManifestVerificationSnapshotClaim(ClaimResponse):
+    """The ``claim`` member: exactly the existing public claim view's fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ExchangeManifestVerificationSnapshotEvidenceBundle(EvidenceBundleResponse):
+    """The ``evidence_bundle`` member: exactly the existing public bundle view.
+
+    ``metadata`` must be canonicalizable JSON with finite numbers, exactly as
+    at bundle creation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_canonicalizable(cls, v: dict[str, Any]) -> dict[str, Any]:
+        try:
+            canonical_json_bytes(v)
+        except (TypeError, ValueError):
+            # Non-finite numbers (NaN/Infinity) have no canonical JSON form.
+            raise ValueError(
+                "metadata must be a JSON object with finite values"
+            ) from None
+        return v
+
+
+class ExchangeManifestVerificationSnapshotAttestation(AttestationResponse):
+    """An ``attestations`` entry: exactly the existing public attestation view."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ExchangeManifestVerificationSnapshot(BaseModel):
+    """The exchange snapshot under verification: exactly the four members."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: ExchangeManifestVerificationSnapshotContent
+    claim: ExchangeManifestVerificationSnapshotClaim
+    evidence_bundle: ExchangeManifestVerificationSnapshotEvidenceBundle
+    attestations: list[ExchangeManifestVerificationSnapshotAttestation]
+
+
+class ExchangeManifestVerificationCreate(BaseModel):
+    """An offline exchange-manifest verification request.
+
+    Exactly five members: the fixed ``manifest_version`` and
+    ``digest_algorithm``, the referenced bundle id, the claimed
+    ``manifest_digest_hex``, and the exchange ``snapshot`` the manifest
+    commits to. Verification is pure: it reads and writes no server state,
+    so the bundle id is an opaque reference, never a lookup key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest_version: Literal[EXCHANGE_MANIFEST_VERSION]
+    evidence_bundle_id: str = Field(..., min_length=1, max_length=80)
+    digest_algorithm: Literal[EXCHANGE_MANIFEST_DIGEST_ALGORITHM]
+    manifest_digest_hex: str
+    snapshot: ExchangeManifestVerificationSnapshot
+
+    @field_validator("evidence_bundle_id")
+    @classmethod
+    def _evidence_bundle_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "evidence_bundle_id")
+
+    @field_validator("manifest_digest_hex")
+    @classmethod
+    def _manifest_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "manifest_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _snapshot_associations_consistent(self):
+        snapshot = self.snapshot
+        if snapshot.evidence_bundle.id != self.evidence_bundle_id:
+            raise ValueError(
+                "snapshot.evidence_bundle.id must equal evidence_bundle_id"
+            )
+        if snapshot.claim.id != snapshot.evidence_bundle.claim_id:
+            raise ValueError(
+                "snapshot.claim.id must equal snapshot.evidence_bundle.claim_id"
+            )
+        if snapshot.content.id != snapshot.claim.content_id:
+            raise ValueError(
+                "snapshot.content.id must equal snapshot.claim.content_id"
+            )
+        for attestation in snapshot.attestations:
+            if (
+                attestation.target_type != "evidence_bundle"
+                or attestation.target_id != self.evidence_bundle_id
+            ):
+                raise ValueError(
+                    "every snapshot attestation must target this evidence bundle"
+                )
+        return self
+
+
+class ExchangeManifestVerificationResponse(BaseModel):
+    """The offline verification verdict.
+
+    ``computed_digest_hex`` is present only on a mismatch, so a matching
+    manifest renders exactly ``{"valid": true}``.
+    """
+
+    valid: bool
+    #: The digest computed from the submitted snapshot under the manifest
+    #: canonical rules; omitted when it matches the claimed digest.
+    computed_digest_hex: str | None = None
 
 
 class AttestationListResponse(BaseModel):
