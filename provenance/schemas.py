@@ -398,6 +398,23 @@ class EvidenceBundleExchangeManifestResponse(BaseModel):
     manifest_digest_hex: str
 
 
+class EvidenceBundleExchangePackageResponse(BaseModel):
+    """A single read exporting one bundle's exchange snapshot and manifest.
+
+    Exactly two members: ``snapshot`` is the bundle's existing exchange
+    snapshot public view (``content``, ``claim``, ``evidence_bundle``, and
+    ``attestations``) and ``manifest`` is its existing four-field exchange
+    manifest public view. Both are derived from one read of the same
+    persisted state: the manifest digest is computed over the snapshot
+    member included in this same response, so the pair is self-binding.
+    The package introduces no resource, record, or audit event, and it
+    performs no lineage traversal and carries no raw bytes.
+    """
+
+    snapshot: EvidenceBundleExchangeResponse
+    manifest: EvidenceBundleExchangeManifestResponse
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)

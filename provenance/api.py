@@ -52,6 +52,7 @@ from provenance.schemas import (
     ContentResponse,
     EvidenceBundleCreate,
     EvidenceBundleExchangeManifestResponse,
+    EvidenceBundleExchangePackageResponse,
     EvidenceBundleExchangeResponse,
     EvidenceBundleImportCreate,
     EvidenceBundleImportResponse,
@@ -500,6 +501,36 @@ def get_evidence_bundle_exchange_manifest(
         evidence_bundle_id=evidence_bundle_id,
         digest_algorithm=EXCHANGE_MANIFEST_DIGEST_ALGORITHM,
         manifest_digest_hex=manifest_digest_hex,
+    )
+
+
+@router.get(
+    "/evidence-bundles/{evidence_bundle_id}/exchange/package",
+    response_model=EvidenceBundleExchangePackageResponse,
+)
+def get_evidence_bundle_exchange_package(
+    evidence_bundle_id: str, request: Request, session: DbSession
+) -> EvidenceBundleExchangePackageResponse:
+    # Same boundary as the exchange snapshot and manifest routes: any (or
+    # repeated) query parameter is a 422 before the bundle lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only and single-read: the snapshot is assembled once
+    # from one session read state, and the manifest is derived from that
+    # exact same snapshot object (the snapshot member of this response),
+    # so the digest always binds the snapshot served alongside it. No
+    # resource, record, or audit event is written; an unknown bundle is the
+    # existing evidence_bundle_not_found 404.
+    snapshot = _exchange_snapshot_response(evidence_bundle_id, session)
+    snapshot_json = snapshot.model_dump(mode="json")
+    manifest_digest_hex = canonical.exchange_manifest_digest_hex(snapshot_json)
+    manifest = EvidenceBundleExchangeManifestResponse(
+        manifest_version=EXCHANGE_MANIFEST_VERSION,
+        evidence_bundle_id=evidence_bundle_id,
+        digest_algorithm=EXCHANGE_MANIFEST_DIGEST_ALGORITHM,
+        manifest_digest_hex=manifest_digest_hex,
+    )
+    return EvidenceBundleExchangePackageResponse(
+        snapshot=snapshot, manifest=manifest
     )
 
 
