@@ -39,6 +39,8 @@ from provenance.schemas import (
     ClaimListResponse,
     ClaimResponse,
     ContentCreate,
+    ContentExportClaimItem,
+    ContentExportResponse,
     ContentLineageItem,
     ContentLineageResponse,
     ContentListResponse,
@@ -337,6 +339,39 @@ def get_content_lineage(
         items=[_lineage_item(content, d) for content, d in page],
         count=total,
         next_cursor=next_cursor,
+    )
+
+
+def _export_claim_item(claim, bundles) -> ContentExportClaimItem:
+    # The full public claim view, with the claim's evidence bundles (each
+    # the existing public bundle view) added in stable creation order.
+    fields = ClaimResponse.model_validate(claim).model_dump()
+    return ContentExportClaimItem(
+        **fields, evidence_bundles=[_bundle_response(b) for b in bundles]
+    )
+
+
+@router.get(
+    "/contents/{content_id}/export",
+    response_model=ContentExportResponse,
+)
+def export_content(
+    content_id: str, request: Request, session: DbSession
+) -> ContentExportResponse:
+    # The export takes no parameters: any query parameter is rejected
+    # rather than silently ignored, so a typo never changes the snapshot.
+    raw = request.query_params
+    if raw:
+        field = sorted(raw)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+    # Strictly read-only: no resource or audit event is written, whether
+    # the content exists, is claim-less, or is unknown (404).
+    content, rows = service.get_content_export(session, content_id)
+    return ContentExportResponse(
+        content=ContentResponse.model_validate(content),
+        claims=[_export_claim_item(claim, bundles) for claim, bundles in rows],
     )
 
 

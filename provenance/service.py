@@ -413,6 +413,46 @@ def list_evidence_bundles_for_content(
     return list(session.execute(stmt).scalars().all())
 
 
+def get_content_export(
+    session: Session, content_id: str
+) -> tuple[Content, list[tuple[Claim, list[EvidenceBundle]]]]:
+    """Return a content with its claims and their bundles for export.
+
+    The result pairs the content with ``(claim, bundles)`` rows: claims in
+    their stable creation order, each claim's bundles in their own stable
+    creation order. Only claims that directly assert this exact content are
+    included -- no lineage traversal to related contents. A content without
+    claims yields an empty list, as does a claim without bundles.
+
+    The content must exist; an unknown content id is a missing resource,
+    not an empty export. The function is strictly read-only: it writes no
+    resource and no audit event.
+    """
+    content = _require_content(session, content_id)
+    claims = (
+        session.execute(
+            select(Claim)
+            .where(Claim.content_id == content_id)
+            .order_by(*_CLAIM_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    rows = []
+    for claim in claims:
+        bundles = (
+            session.execute(
+                select(EvidenceBundle)
+                .where(EvidenceBundle.claim_id == claim.id)
+                .order_by(*_EVIDENCE_BUNDLE_ORDER)
+            )
+            .scalars()
+            .all()
+        )
+        rows.append((claim, list(bundles)))
+    return content, rows
+
+
 def _attestation_identity_select(
     payload: AttestationCreate, signature_digest_hex: str
 ):

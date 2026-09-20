@@ -310,6 +310,31 @@ class EvidenceBundlePageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ContentExportClaimItem(ClaimResponse):
+    """A claim in a content export: the full public view plus its evidence.
+
+    ``evidence_bundles`` lists the claim's bundles in their stable creation
+    order, each as the existing evidence-bundle public view; it is empty
+    when the claim has no bundles.
+    """
+
+    evidence_bundles: list[EvidenceBundleResponse]
+
+
+class ContentExportResponse(BaseModel):
+    """A transferable provenance-evidence snapshot of one content.
+
+    Exactly ``content`` (the existing full public content view) and
+    ``claims`` (the content's own claims in stable creation order, each
+    with its evidence bundles). No lineage traversal, no raw payloads or
+    evidence bytes, and no internal fields beyond the existing public
+    views.
+    """
+
+    content: ContentResponse
+    claims: list[ContentExportClaimItem]
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)
