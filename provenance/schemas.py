@@ -12,7 +12,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from provenance.canonical import canonical_json_bytes
 from provenance.ed25519 import PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH
@@ -491,6 +491,117 @@ class AttestationResponse(BaseModel):
 class AttestationListResponse(BaseModel):
     items: list[AttestationResponse]
     count: int
+
+
+class ExchangeSnapshotContent(ContentResponse):
+    """Strict inbound form of the public content view: no undeclared members."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ExchangeSnapshotClaim(ClaimResponse):
+    """Strict inbound form of the public claim view: no undeclared members."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ExchangeSnapshotEvidenceBundle(EvidenceBundleResponse):
+    """Strict inbound form of the public bundle view: no undeclared members."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ExchangeSnapshotAttestation(AttestationResponse):
+    """Strict inbound form of the public attestation view: no undeclared members."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ExchangeManifestSnapshot(BaseModel):
+    """An exchange snapshot exactly as exchanged: four members, no more.
+
+    Each member uses the corresponding existing public view's fields; any
+    extra member (e.g. a raw claim payload, evidence bytes, or a raw
+    signature) is rejected rather than silently dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: ExchangeSnapshotContent
+    claim: ExchangeSnapshotClaim
+    evidence_bundle: ExchangeSnapshotEvidenceBundle
+    attestations: list[ExchangeSnapshotAttestation]
+
+
+class ExchangeManifestVerificationCreate(BaseModel):
+    # A stateless offline verification request carries exactly the manifest
+    # fields and the snapshot they commit to; undeclared fields are rejected
+    # rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    manifest_version: Literal[EXCHANGE_MANIFEST_VERSION]
+    evidence_bundle_id: str = Field(..., min_length=1, max_length=80)
+    digest_algorithm: Literal[EXCHANGE_MANIFEST_DIGEST_ALGORITHM]
+    manifest_digest_hex: str
+    snapshot: ExchangeManifestSnapshot
+
+    @field_validator("evidence_bundle_id")
+    @classmethod
+    def _evidence_bundle_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "evidence_bundle_id")
+
+    @field_validator("manifest_digest_hex")
+    @classmethod
+    def _manifest_digest_is_sha256_hex(cls, v: str) -> str:
+        # No case normalization: the manifest digest is exactly 64 lowercase
+        # hexadecimal characters; anything else is malformed input.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "manifest_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _snapshot_self_consistent(self) -> "ExchangeManifestVerificationCreate":
+        # The snapshot must be the exchange snapshot of the manifest's own
+        # bundle: the bundle id matches the manifest, the claim asserts the
+        # bundled content, the bundle is attached to that claim, and every
+        # attestation targets this exact evidence bundle.
+        snapshot = self.snapshot
+        if snapshot.evidence_bundle.id != self.evidence_bundle_id:
+            raise ValueError(
+                "snapshot.evidence_bundle.id must equal evidence_bundle_id"
+            )
+        if snapshot.claim.content_id != snapshot.content.id:
+            raise ValueError(
+                "snapshot.claim.content_id must equal snapshot.content.id"
+            )
+        if snapshot.evidence_bundle.claim_id != snapshot.claim.id:
+            raise ValueError(
+                "snapshot.evidence_bundle.claim_id must equal snapshot.claim.id"
+            )
+        for attestation in snapshot.attestations:
+            if (
+                attestation.target_type != "evidence_bundle"
+                or attestation.target_id != self.evidence_bundle_id
+            ):
+                raise ValueError(
+                    "every attestation must target this evidence bundle"
+                )
+        return self
+
+
+class ExchangeManifestVerificationResponse(BaseModel):
+    """Offline verification verdict plus the independently computed digest.
+
+    ``valid`` is true exactly when the submitted ``manifest_digest_hex``
+    equals ``computed_digest_hex``; the computed digest is always returned
+    so the caller can inspect the mismatch.
+    """
+
+    valid: bool
+    computed_digest_hex: str
 
 
 class AttestationRevocationCreate(BaseModel):

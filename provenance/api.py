@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 from typing import Annotated, Literal
 
@@ -58,6 +59,8 @@ from provenance.schemas import (
     EvidenceBundleListResponse,
     EvidenceBundlePageResponse,
     EvidenceBundleResponse,
+    ExchangeManifestVerificationCreate,
+    ExchangeManifestVerificationResponse,
     TrustEvaluationResponse,
 )
 
@@ -498,6 +501,48 @@ def get_evidence_bundle_exchange_manifest(
         evidence_bundle_id=evidence_bundle_id,
         digest_algorithm=EXCHANGE_MANIFEST_DIGEST_ALGORITHM,
         manifest_digest_hex=manifest_digest_hex,
+    )
+
+
+def _reject_json_constant(value: str) -> None:
+    # NaN/Infinity have no canonical JSON form; reject rather than hash them.
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+@router.post(
+    "/exchange-manifest-verifications",
+    response_model=ExchangeManifestVerificationResponse,
+)
+async def verify_exchange_manifest(
+    request: Request, payload: ExchangeManifestVerificationCreate
+) -> ExchangeManifestVerificationResponse:
+    # Stateless offline check for third-party verifiers: the verdict is
+    # computed entirely from the request body. No session is opened and no
+    # resource, record, or audit event is queried, created, or modified.
+    try:
+        raw = json.loads(
+            await request.body(), parse_constant=_reject_json_constant
+        )
+        snapshot = raw["snapshot"]
+        computed = canonical.exchange_manifest_digest_hex(snapshot)
+    except (KeyError, TypeError, ValueError) as exc:
+        # Unreachable for a body that passed schema validation; defensive so
+        # a non-canonicalizable value can never surface as a 500.
+        raise LineageValidationError(
+            [
+                {
+                    "loc": ["body"],
+                    "msg": "request body must be canonicalizable JSON",
+                    "type": "value_error",
+                }
+            ]
+        ) from exc
+    # The digest commits to the snapshot exactly as submitted: under the
+    # manifest canonical rules the root members and arrays keep the
+    # submitted order, so a reordered root yields a different digest.
+    return ExchangeManifestVerificationResponse(
+        valid=computed == payload.manifest_digest_hex,
+        computed_digest_hex=computed,
     )
 
 
