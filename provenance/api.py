@@ -36,9 +36,11 @@ from provenance.schemas import (
     AuthenticationKeyRotationCreate,
     AuthenticationKeyRotationResponse,
     ClaimCreate,
+    ClaimExportItem,
     ClaimListResponse,
     ClaimResponse,
     ContentCreate,
+    ContentExportResponse,
     ContentLineageItem,
     ContentLineageResponse,
     ContentListResponse,
@@ -418,6 +420,40 @@ def list_claim_evidence_bundles(
     return EvidenceBundleListResponse(
         items=[_bundle_response(item) for item in items],
         count=len(items),
+    )
+
+
+@router.get(
+    "/contents/{content_id}/export",
+    response_model=ContentExportResponse,
+)
+def get_content_export(
+    content_id: str, request: Request, session: DbSession
+) -> ContentExportResponse:
+    # The export takes no query parameters: any parameter at all (known or
+    # unknown, blank or repeated) is a 422 rather than silently ignored.
+    raw = request.query_params
+    if raw:
+        field = sorted(set(raw))[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+    # Strictly read-only: the export writes no resource and no audit event.
+    content, claims, bundles_by_claim = service.get_content_export(
+        session, content_id
+    )
+    return ContentExportResponse(
+        content=ContentResponse.model_validate(content),
+        claims=[
+            ClaimExportItem(
+                **ClaimResponse.model_validate(claim).model_dump(),
+                evidence_bundles=[
+                    _bundle_response(bundle)
+                    for bundle in bundles_by_claim[claim.id]
+                ],
+            )
+            for claim in claims
+        ],
     )
 
 

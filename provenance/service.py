@@ -886,6 +886,47 @@ def retire_authentication_key_rotation(
     return rotation
 
 
+def get_content_export(
+    session: Session, content_id: str
+) -> tuple[Content, list[Claim], dict[str, list[EvidenceBundle]]]:
+    """Return a content's transferable provenance-evidence snapshot.
+
+    The result is ``(content, claims, bundles_by_claim_id)``: the content
+    itself, the claims that directly assert this exact content in stable
+    creation order, and each claim's evidence bundles in their own stable
+    creation order keyed by claim id (a claim without bundles maps to an
+    empty list). No lineage traversal is performed: claims or bundles of
+    related contents are never included. The function is strictly read-only:
+    it writes no resource and no audit event.
+
+    The content must exist; an unknown content id is a missing resource, not
+    an empty export.
+    """
+    content = _require_content(session, content_id)
+    claims = list(
+        session.execute(
+            select(Claim)
+            .where(Claim.content_id == content_id)
+            .order_by(*_CLAIM_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    bundles_by_claim: dict[str, list[EvidenceBundle]] = {
+        claim.id: [] for claim in claims
+    }
+    if claims:
+        bundles = session.execute(
+            select(EvidenceBundle)
+            .join(Claim, EvidenceBundle.claim_id == Claim.id)
+            .where(Claim.content_id == content_id)
+            .order_by(*_EVIDENCE_BUNDLE_ORDER)
+        ).scalars().all()
+        for bundle in bundles:
+            bundles_by_claim[bundle.claim_id].append(bundle)
+    return content, claims, bundles_by_claim
+
+
 # Trust evaluation threshold bounds.
 DEFAULT_TRUST_MIN_SIGNERS = 1
 MIN_TRUST_MIN_SIGNERS = 1
