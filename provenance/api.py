@@ -49,6 +49,8 @@ from provenance.schemas import (
     ContentRelationResponse,
     ContentResponse,
     EvidenceBundleCreate,
+    EvidenceBundleImportCreate,
+    EvidenceBundleImportResponse,
     EvidenceBundleListResponse,
     EvidenceBundlePageResponse,
     EvidenceBundleResponse,
@@ -396,6 +398,25 @@ def create_evidence_bundle(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return _bundle_response(bundle)
+
+
+@router.post(
+    "/evidence-bundle-imports",
+    response_model=EvidenceBundleImportResponse,
+)
+def import_evidence_bundles(
+    payload: EvidenceBundleImportCreate, session: DbSession, response: Response
+) -> EvidenceBundleImportResponse:
+    items, created = service.create_evidence_bundle_imports(session, payload)
+    # At least one new bundle -> 201; a batch of only existing identities
+    # -> 200, with each identity's original public view and no new writes.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return EvidenceBundleImportResponse(
+        items=[_bundle_response(item) for item in items],
+        count=len(items),
+    )
 
 
 @router.get(

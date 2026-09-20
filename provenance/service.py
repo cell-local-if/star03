@@ -59,6 +59,7 @@ from provenance.schemas import (
     ContentCreate,
     ContentRelationCreate,
     EvidenceBundleCreate,
+    EvidenceBundleImportCreate,
 )
 from provenance.time_utils import utc_now
 
@@ -273,6 +274,16 @@ def list_claims_for_content(session: Session, content_id: str) -> list[Claim]:
     return list(session.execute(stmt).scalars().all())
 
 
+def _evidence_bundle_identity(payload: EvidenceBundleCreate) -> tuple[str, str, str, str]:
+    """The dedup identity of a bundle: claim, type, algorithm, and digest."""
+    return (
+        payload.claim_id,
+        payload.evidence_type,
+        payload.digest_algorithm,
+        payload.digest_hex,
+    )
+
+
 def _evidence_bundle_identity_select(payload: EvidenceBundleCreate):
     return select(EvidenceBundle).where(
         EvidenceBundle.claim_id == payload.claim_id,
@@ -341,6 +352,109 @@ def create_evidence_bundle(
         return raced, False
     session.refresh(bundle)
     return bundle, True
+
+
+def create_evidence_bundle_imports(
+    session: Session, payload: EvidenceBundleImportCreate
+) -> tuple[list[EvidenceBundle], bool]:
+    """Import a batch of evidence bundles atomically.
+
+    Returns ``(bundles, created_any)``: one bundle per unique
+    (claim, evidence type, digest algorithm, digest) identity, in the
+    identity's first-occurrence order within the batch. ``created_any`` is
+    true iff at least one identity was newly created by this batch.
+
+    Every item is validated by the request schema exactly as a single
+    create, and every referenced claim must exist: the first missing claim
+    (in request order) raises :class:`ClaimNotFoundError` and the whole
+    batch writes nothing -- no bundle rows and no audit events.
+
+    In-batch duplicates of an identity collapse to their first occurrence;
+    an identity matching an existing bundle returns that bundle with its
+    original first-submission metadata, unchanged. Only genuinely new
+    identities are inserted, each with its own ``evidence_bundle.created``
+    audit event, and all new rows and events commit in a single
+    transaction.
+    """
+    # Validate every referenced claim before any write: a single missing
+    # claim rejects the entire batch.
+    claim_ids = list(dict.fromkeys(item.claim_id for item in payload.items))
+    existing_claim_ids = set(
+        session.execute(
+            select(Claim.id).where(Claim.id.in_(claim_ids))
+        ).scalars().all()
+    )
+    for claim_id in claim_ids:
+        if claim_id not in existing_claim_ids:
+            raise ClaimNotFoundError(claim_id)
+
+    # In-batch identity dedup: the first occurrence of each identity wins;
+    # later duplicates are dropped from both the writes and the response.
+    unique_items: list[EvidenceBundleCreate] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for item in payload.items:
+        identity = _evidence_bundle_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique_items.append(item)
+
+    while True:
+        existing: dict[tuple[str, str, str, str], EvidenceBundle] = {}
+        rows = session.execute(
+            select(EvidenceBundle).where(EvidenceBundle.claim_id.in_(claim_ids))
+        ).scalars().all()
+        for row in rows:
+            existing[
+                (row.claim_id, row.evidence_type, row.digest_algorithm, row.digest_hex)
+            ] = row
+
+        results: list[EvidenceBundle] = []
+        new_bundles: list[EvidenceBundle] = []
+        for item in unique_items:
+            bundle = existing.get(_evidence_bundle_identity(item))
+            if bundle is None:
+                bundle = EvidenceBundle(
+                    id=ids.evidence_bundle_id(
+                        item.claim_id,
+                        item.evidence_type,
+                        item.digest_algorithm,
+                        item.digest_hex,
+                    ),
+                    claim_id=item.claim_id,
+                    evidence_type=item.evidence_type,
+                    digest_algorithm=item.digest_algorithm,
+                    digest_hex=item.digest_hex,
+                    media_type=item.media_type,
+                    metadata_=item.metadata,
+                )
+                new_bundles.append(bundle)
+            results.append(bundle)
+
+        if not new_bundles:
+            # Every identity already existed: the batch writes nothing and
+            # adds no audit event.
+            return results, False
+
+        for bundle in new_bundles:
+            session.add(bundle)
+            session.add(
+                AuditEvent(
+                    event_type=EVENT_EVIDENCE_BUNDLE_CREATED,
+                    resource_id=bundle.id,
+                )
+            )
+        try:
+            session.commit()
+        except IntegrityError:
+            # A concurrent import created at least one of these identities:
+            # roll back and re-resolve; the raced identities now exist and
+            # only the still-missing ones are retried.
+            session.rollback()
+            continue
+        for bundle in new_bundles:
+            session.refresh(bundle)
+        return results, True
 
 
 def get_evidence_bundle(

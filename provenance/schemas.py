@@ -295,6 +295,30 @@ class EvidenceBundleResponse(BaseModel):
     created_at: datetime
 
 
+class EvidenceBundleImportCreate(BaseModel):
+    # The batch carries exactly an ``items`` array; undeclared fields are
+    # rejected rather than silently discarded. Each item is validated exactly
+    # as a single bundle create, so raw-byte smuggling and non-object
+    # metadata are rejected at the boundary for every element.
+    model_config = ConfigDict(extra="forbid")
+
+    #: 1 to 100 bundle requests per atomic import.
+    items: list[EvidenceBundleCreate] = Field(..., min_length=1, max_length=100)
+
+
+class EvidenceBundleImportResponse(BaseModel):
+    """Batch result: one public view per unique identity.
+
+    ``items`` follows the first-occurrence order of each unique
+    (claim, evidence type, digest) identity in the request; in-batch
+    duplicates never appear.
+    """
+
+    items: list[EvidenceBundleResponse]
+    #: Number of unique identities in the batch (== len(items)).
+    count: int
+
+
 class EvidenceBundleListResponse(BaseModel):
     items: list[EvidenceBundleResponse]
     count: int
