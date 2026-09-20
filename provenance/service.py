@@ -473,6 +473,18 @@ def get_evidence_bundle(
     return bundle
 
 
+def find_evidence_bundle(
+    session: Session, evidence_bundle_id: str
+) -> EvidenceBundle | None:
+    """Return the evidence bundle with this id, or ``None`` when none exists.
+
+    Strictly read-only: it writes no resource and no audit event.
+    """
+    return session.execute(
+        select(EvidenceBundle).where(EvidenceBundle.id == evidence_bundle_id)
+    ).scalar_one_or_none()
+
+
 def list_evidence_bundles_for_claim(
     session: Session, claim_id: str
 ) -> list[EvidenceBundle]:
