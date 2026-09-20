@@ -730,6 +730,16 @@ class EvidenceBundleExchangeImportResponse(BaseModel):
     received_at: datetime
 
 
+class EvidenceBundleExchangeImportPageResponse(BaseModel):
+    """A cursor-paginated page of exchange-import receipt public views."""
+
+    items: list[EvidenceBundleExchangeImportResponse]
+    #: Total number of receipts after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class AttestationListResponse(BaseModel):
     items: list[AttestationResponse]
     count: int
