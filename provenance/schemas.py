@@ -375,6 +375,27 @@ class EvidenceBundleExchangeResponse(BaseModel):
     attestations: list[AttestationResponse]
 
 
+#: Fixed version label of the read-only exchange manifest; the digest input
+#: and response shape are pinned to this one version.
+EXCHANGE_MANIFEST_VERSION = "provenance-exchange-manifest-v1"
+
+
+class EvidenceBundleExchangeManifestResponse(BaseModel):
+    """A read-only integrity manifest over one exchange snapshot.
+
+    Exactly four members: the fixed :data:`EXCHANGE_MANIFEST_VERSION`, the
+    bundle id, the fixed digest algorithm ``"sha256"``, and the lowercase hex
+    SHA-256 digest of the canonical JSON object of the bundle's exchange
+    snapshot (its ``content``, ``claim``, ``evidence_bundle``, and
+    ``attestations`` members and nothing else).
+    """
+
+    manifest_version: str
+    evidence_bundle_id: str
+    digest_algorithm: str
+    manifest_digest_hex: str
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)

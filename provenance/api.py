@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from typing import Annotated, Literal
 
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from provenance import access_signing, pagination, service
 from provenance.access_signing import AccessAuthError
+from provenance.canonical import canonical_json_bytes
 from provenance.errors import (
     LineageValidationError,
     ProtectedAccessValidationError,
@@ -23,6 +25,7 @@ from provenance.time_utils import parse_rfc3339_utc
 from provenance.schemas import (
     ActorCreate,
     ActorResponse,
+    EXCHANGE_MANIFEST_VERSION,
     AttestationAccessGrantCreate,
     AttestationAccessGrantResponse,
     AttestationCreate,
@@ -49,6 +52,7 @@ from provenance.schemas import (
     ContentRelationResponse,
     ContentResponse,
     EvidenceBundleCreate,
+    EvidenceBundleExchangeManifestResponse,
     EvidenceBundleExchangeResponse,
     EvidenceBundleImportCreate,
     EvidenceBundleImportResponse,
@@ -161,6 +165,19 @@ def _query_validation_error(field: str, msg: str, error_type: str):
     return LineageValidationError(
         [{"loc": ["query", field], "msg": msg, "type": error_type}]
     )
+
+
+def _reject_any_query_params(raw) -> None:
+    """Reject a parameter-free route's query string as a 422.
+
+    Any parameter at all (known or unknown, blank or repeated) is rejected
+    rather than silently ignored.
+    """
+    if raw:
+        field = sorted(set(raw))[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
 
 
 def _parse_once(raw, field: str) -> str | None:
@@ -431,21 +448,10 @@ def get_evidence_bundle(
     return _bundle_response(bundle)
 
 
-@router.get(
-    "/evidence-bundles/{evidence_bundle_id}/exchange",
-    response_model=EvidenceBundleExchangeResponse,
-)
-def get_evidence_bundle_exchange(
-    evidence_bundle_id: str, request: Request, session: DbSession
+def _evidence_bundle_exchange_view(
+    session: DbSession, evidence_bundle_id: str
 ) -> EvidenceBundleExchangeResponse:
-    # The exchange takes no query parameters: any parameter at all (known or
-    # unknown, blank or repeated) is a 422 rather than silently ignored.
-    raw = request.query_params
-    if raw:
-        field = sorted(set(raw))[0]
-        raise _query_validation_error(
-            field, f"unknown query parameter: {field}", "value_error.unknown"
-        )
+    """Build the read-only exchange snapshot response for one bundle."""
     # Strictly read-only: the snapshot writes no resource and no audit event.
     bundle, claim, content, attestations = service.get_evidence_bundle_exchange(
         session, evidence_bundle_id
@@ -455,6 +461,47 @@ def get_evidence_bundle_exchange(
         claim=ClaimResponse.model_validate(claim),
         evidence_bundle=_bundle_response(bundle),
         attestations=[_attestation_response(item) for item in attestations],
+    )
+
+
+@router.get(
+    "/evidence-bundles/{evidence_bundle_id}/exchange",
+    response_model=EvidenceBundleExchangeResponse,
+)
+def get_evidence_bundle_exchange(
+    evidence_bundle_id: str, request: Request, session: DbSession
+) -> EvidenceBundleExchangeResponse:
+    # The exchange takes no query parameters: any parameter at all (known or
+    # unknown, blank or repeated) is a 422 rather than silently ignored.
+    _reject_any_query_params(request.query_params)
+    return _evidence_bundle_exchange_view(session, evidence_bundle_id)
+
+
+@router.get(
+    "/evidence-bundles/{evidence_bundle_id}/exchange/manifest",
+    response_model=EvidenceBundleExchangeManifestResponse,
+)
+def get_evidence_bundle_exchange_manifest(
+    evidence_bundle_id: str, request: Request, session: DbSession
+) -> EvidenceBundleExchangeManifestResponse:
+    # Like the snapshot route, the manifest takes no query parameters and
+    # validates them before any existence lookup: an unknown bundle with a
+    # parameter is a 422, not a 404.
+    _reject_any_query_params(request.query_params)
+    # The digest input is exactly the exchange snapshot's canonical JSON
+    # object, built through the same read-only path as the snapshot route;
+    # nothing else (internal sequence numbers, raw signatures, claim
+    # payloads, content or evidence bytes) is reachable here.
+    snapshot = _evidence_bundle_exchange_view(session, evidence_bundle_id)
+    snapshot_object = snapshot.model_dump(mode="json")
+    manifest_digest_hex = hashlib.sha256(
+        canonical_json_bytes(snapshot_object)
+    ).hexdigest()
+    return EvidenceBundleExchangeManifestResponse(
+        manifest_version=EXCHANGE_MANIFEST_VERSION,
+        evidence_bundle_id=evidence_bundle_id,
+        digest_algorithm="sha256",
+        manifest_digest_hex=manifest_digest_hex,
     )
 
 
@@ -481,12 +528,7 @@ def get_content_export(
 ) -> ContentExportResponse:
     # The export takes no query parameters: any parameter at all (known or
     # unknown, blank or repeated) is a 422 rather than silently ignored.
-    raw = request.query_params
-    if raw:
-        field = sorted(set(raw))[0]
-        raise _query_validation_error(
-            field, f"unknown query parameter: {field}", "value_error.unknown"
-        )
+    _reject_any_query_params(request.query_params)
     # Strictly read-only: the export writes no resource and no audit event.
     content, claims, bundles_by_claim = service.get_content_export(
         session, content_id
