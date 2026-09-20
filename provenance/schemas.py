@@ -602,3 +602,21 @@ class AuthenticationKeyRotationResponse(BaseModel):
     created_at: datetime
     #: UTC retirement time, or null while the key is active.
     retired_at: datetime | None
+
+
+class EvidenceBundleExchangeResponse(BaseModel):
+    """Interoperability snapshot of one evidence bundle for external verifiers.
+
+    Exactly ``content`` (the full public view of the single content the
+    bundle's claim directly asserts), ``claim`` (the directly associated
+    claim's full public view), ``evidence_bundle`` (the bundle's existing
+    full public view), and ``attestations`` (the existing attestations that
+    target this exact bundle, each identical to its attestation detail).
+    No lineage traversal is performed and no raw signature, claim payload,
+    content bytes, or evidence bytes are ever present.
+    """
+
+    content: ContentResponse
+    claim: ClaimResponse
+    evidence_bundle: EvidenceBundleResponse
+    attestations: list[AttestationResponse]

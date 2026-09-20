@@ -490,6 +490,49 @@ def list_evidence_bundles_for_claim(
     return list(session.execute(stmt).scalars().all())
 
 
+def get_evidence_bundle_exchange(
+    session: Session, evidence_bundle_id: str
+) -> tuple[Content, Claim, EvidenceBundle, list[Attestation]]:
+    """Return a bundle's interoperability snapshot for external verifiers.
+
+    The result is ``(content, claim, bundle, attestations)``: the single
+    content the bundle's claim directly asserts, that directly associated
+    claim, the bundle itself, and the existing attestations whose target is
+    exactly this bundle (``target_type='evidence_bundle'`` and
+    ``target_id`` equal to the bundle id). Attestations follow their stable
+    creation order and revoked attestations are retained alongside active
+    ones for historical auditability.
+
+    No lineage traversal is performed: attestations of the claim or of any
+    other bundle, claims on other contents, and other bundles are never
+    included. The function is strictly read-only: it writes no resource and
+    no audit event.
+
+    The bundle must exist; an unknown evidence bundle id is a missing
+    resource, raising :class:`EvidenceBundleNotFoundError`.
+    """
+    bundle = get_evidence_bundle(session, evidence_bundle_id)
+    claim = session.execute(
+        select(Claim).where(Claim.id == bundle.claim_id)
+    ).scalar_one()
+    content = session.execute(
+        select(Content).where(Content.id == claim.content_id)
+    ).scalar_one()
+    attestations = list(
+        session.execute(
+            select(Attestation)
+            .where(
+                Attestation.target_type == signing.TARGET_EVIDENCE_BUNDLE,
+                Attestation.target_id == bundle.id,
+            )
+            .order_by(*_ATTESTATION_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    return content, claim, bundle, attestations
+
+
 DEFAULT_CONTENT_EVIDENCE_LIMIT = 50
 MIN_CONTENT_EVIDENCE_LIMIT = 1
 MAX_CONTENT_EVIDENCE_LIMIT = 100
