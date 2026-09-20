@@ -11,6 +11,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     ForeignKey,
     Index,
     Integer,
@@ -42,6 +43,8 @@ EVENT_ATTESTATION_CREATED = "attestation.created"
 EVENT_ATTESTATION_REVOKED = "attestation.revoked"
 EVENT_ATTESTATION_ACCESS_GRANTED = "attestation.access_granted"
 EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
+EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
+EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -356,6 +359,57 @@ class AttestationAccessGrant(Base):
 
     attestation: Mapped[Attestation] = relationship()
     grantee_actor: Mapped[Actor] = relationship()
+
+
+class AuthenticationKeyRotation(Base):
+    """An authentication public-key rotation record for one actor.
+
+    Only the 32-byte Ed25519 public key is ever stored -- never a private
+    key or any signature. An active record's key authenticates the actor on
+    the protected routes alongside the keys of its non-revoked attestations.
+    Retiring a record flips ``active`` and stamps ``retired_at`` in place --
+    the record and its audit relationship are preserved, and the key stops
+    authenticating immediately. There is deliberately no delete path.
+    """
+
+    __tablename__ = "authentication_key_rotations"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id",
+            "public_key",
+            name="uq_authentication_key_rotations_identity",
+        ),
+        Index(
+            "ix_authentication_key_rotations_actor_order",
+            "actor_id",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("akr_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The subject actor whose authentication key set holds this key.
+    actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The 32 raw Ed25519 public-key bytes (Base64 on the wire).
+    public_key: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    #: True while the key authenticates; False once retired.
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+    #: UTC retirement instant; null while the record is active.
+    retired_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+
+    actor: Mapped[Actor] = relationship()
 
 
 class ContentRelation(Base):

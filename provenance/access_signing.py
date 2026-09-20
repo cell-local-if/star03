@@ -1,8 +1,10 @@
 """Authentication for protected proof access (the ``X-PA``/``X-PT``/``X-PS`` contract).
 
-Both ``POST /v1/attestation-access-grants`` and
-``GET /v1/protected/attestations/{attestation_id}`` authenticate the caller
-with three headers:
+The protected routes -- ``POST /v1/attestation-access-grants``,
+``GET /v1/protected/attestations/{attestation_id}``,
+``POST /v1/authentication-key-rotations``, and
+``POST /v1/authentication-key-rotations/{rotation_id}/retire`` --
+authenticate the caller with three headers:
 
 ``X-PA``
     The calling actor id.
@@ -20,10 +22,12 @@ with three headers:
     value, and ``body_sha256`` is the lowercase-hex SHA-256 of the actual
     request body bytes (zero bytes for an empty body).
 
-The signature is accepted if it verifies under **any** public key of an
-attestation created by the calling actor that carries no revocation record.
-Revoked attestation keys never authenticate, regardless of the target the
-request operates on.
+The signature is accepted if it verifies under **any** current
+authentication key of the calling actor: a public key of an attestation
+created by the actor that carries no revocation record, or the key of an
+active (non-retired) authentication-key rotation record. Revoked attestation
+keys and retired rotation keys never authenticate, regardless of the target
+the request operates on.
 
 Failures split into two categories:
 
@@ -51,7 +55,11 @@ from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
 from provenance import ed25519
-from provenance.models import Attestation, AttestationRevocation
+from provenance.models import (
+    Attestation,
+    AttestationRevocation,
+    AuthenticationKeyRotation,
+)
 
 #: Required headers, in the order documented by the contract.
 HEADER_ACTOR = "X-PA"
@@ -146,11 +154,16 @@ def _decode_signature(raw: str) -> bytes:
 
 
 def _actor_public_keys(session: Session, actor_id: str) -> list[bytes]:
-    """Distinct public keys of the actor's attestations carrying no revocation."""
+    """The actor's current authentication keys.
+
+    The union of the public keys of the actor's attestations carrying no
+    revocation and the actor's active key-rotation records. A revoked
+    attestation's key and a retired rotation's key never authenticate.
+    """
     revoked = exists().where(
         AttestationRevocation.attestation_id == Attestation.id
     )
-    return list(
+    attestation_keys = list(
         session.execute(
             select(Attestation.public_key)
             .where(
@@ -162,6 +175,19 @@ def _actor_public_keys(session: Session, actor_id: str) -> list[bytes]:
         .scalars()
         .all()
     )
+    rotation_keys = list(
+        session.execute(
+            select(AuthenticationKeyRotation.public_key)
+            .where(
+                AuthenticationKeyRotation.actor_id == actor_id,
+                AuthenticationKeyRotation.active.is_(True),
+            )
+            .distinct()
+        )
+        .scalars()
+        .all()
+    )
+    return attestation_keys + rotation_keys
 
 
 def authenticate(session: Session, request, body: bytes) -> str:

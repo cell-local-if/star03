@@ -482,6 +482,41 @@ class AttestationAccessGrantResponse(BaseModel):
     created_at: datetime
 
 
+class AuthenticationKeyRotationCreate(BaseModel):
+    # A rotation carries exactly its declared fields; undeclared fields are
+    # rejected rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The subject actor whose authentication key set gains the new key.
+    actor_id: str = Field(..., min_length=1, max_length=255)
+    #: Base64 Ed25519 public key; must decode to exactly 32 bytes. Only the
+    #: public key is ever submitted -- private keys never reach the service.
+    new_public_key: bytes
+
+    @field_validator("actor_id")
+    @classmethod
+    def _actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "actor_id")
+
+    @field_validator("new_public_key", mode="before")
+    @classmethod
+    def _new_public_key_is_32_bytes(cls, v: Any) -> bytes:
+        return _decode_base64(v, "new_public_key", PUBLIC_KEY_LENGTH)
+
+
+class AuthenticationKeyRotationResponse(BaseModel):
+    """Public rotation view: subject, public key, state, and UTC timestamps."""
+
+    id: str
+    actor_id: str
+    #: Base64 of the 32-byte Ed25519 public key.
+    public_key: str
+    active: bool
+    created_at: datetime
+    #: UTC retirement instant; null while the record is active.
+    retired_at: datetime | None
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 

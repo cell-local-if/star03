@@ -32,6 +32,8 @@ from provenance.models import (
     EVENT_ATTESTATION_ACCESS_GRANTED,
     EVENT_ATTESTATION_CREATED,
     EVENT_ATTESTATION_REVOKED,
+    EVENT_AUTHENTICATION_KEY_RETIRED,
+    EVENT_AUTHENTICATION_KEY_ROTATED,
     EVENT_CLAIM_CREATED,
     EVENT_CONTENT_CREATED,
     EVENT_CONTENT_RELATION_CREATED,
@@ -41,6 +43,7 @@ from provenance.models import (
     AttestationAccessGrant,
     AttestationRevocation,
     AuditEvent,
+    AuthenticationKeyRotation,
     Claim,
     Content,
     ContentRelation,
@@ -51,11 +54,13 @@ from provenance.schemas import (
     AttestationAccessGrantCreate,
     AttestationCreate,
     AttestationRevocationCreate,
+    AuthenticationKeyRotationCreate,
     ClaimCreate,
     ContentCreate,
     ContentRelationCreate,
     EvidenceBundleCreate,
 )
+from provenance.time_utils import utc_now
 
 # Stable creation order: timestamp first, with the monotonic sequence as a
 # deterministic tiebreaker.
@@ -745,6 +750,119 @@ def get_accessible_attestation(
         )
     ).first()
     return attestation if grant_exists is not None else None
+
+
+def _authentication_key_rotation_identity_select(
+    actor_id: str, public_key: bytes
+):
+    return select(AuthenticationKeyRotation).where(
+        AuthenticationKeyRotation.actor_id == actor_id,
+        AuthenticationKeyRotation.public_key == public_key,
+    )
+
+
+def create_authentication_key_rotation(
+    session: Session,
+    payload: AuthenticationKeyRotationCreate,
+    caller_actor_id: str,
+) -> tuple[AuthenticationKeyRotation, bool]:
+    """Create an authentication key rotation, returning ``(record, created)``.
+
+    The authenticated caller must be the subject actor: a rotation is only
+    ever created for oneself. Only the 32-byte public key is stored -- never
+    a private key or any signature. A repeat submission of the same actor
+    and public key returns the original record with ``created=False`` and
+    writes no row or audit event (even if that record has since been
+    retired); any different key forms an independent record. On first
+    creation the rotation row and its ``authentication_key.rotated`` audit
+    event commit in a single transaction, and the key immediately joins the
+    actor's authentication set for the protected routes.
+    """
+    # The caller must be the subject of the rotation, checked before any
+    # existence lookup so no information about other actors leaks.
+    if payload.actor_id != caller_actor_id:
+        raise ProtectedAccessValidationError("caller_not_subject")
+    actor = session.get(Actor, payload.actor_id)
+    if actor is None:
+        raise ProtectedAccessValidationError("unknown_actor")
+
+    existing = session.execute(
+        _authentication_key_rotation_identity_select(
+            payload.actor_id, payload.new_public_key
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    rotation = AuthenticationKeyRotation(
+        id=ids.authentication_key_rotation_id(
+            payload.actor_id, payload.new_public_key.hex()
+        ),
+        actor_id=payload.actor_id,
+        public_key=payload.new_public_key,
+        active=True,
+    )
+    session.add(rotation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_AUTHENTICATION_KEY_ROTATED,
+            resource_id=rotation.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical rotation won the race: return its record.
+        session.rollback()
+        raced = session.execute(
+            _authentication_key_rotation_identity_select(
+                payload.actor_id, payload.new_public_key
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(rotation)
+    return rotation, True
+
+
+def retire_authentication_key_rotation(
+    session: Session, rotation_id: str, caller_actor_id: str
+) -> AuthenticationKeyRotation:
+    """Retire an active rotation record, deactivating its key immediately.
+
+    Only the subject actor may retire its own record, and only while it is
+    active. An unknown record, a caller who is not the subject, and a
+    repeated retirement are all ``422`` validation errors that write
+    nothing. On success the record's ``active``/``retired_at`` update and
+    its ``authentication_key.retired`` audit event commit in a single
+    transaction; the record itself is preserved, never deleted.
+    """
+    rotation = session.execute(
+        select(AuthenticationKeyRotation).where(
+            AuthenticationKeyRotation.id == rotation_id
+        )
+    ).scalar_one_or_none()
+    if rotation is None:
+        raise ProtectedAccessValidationError(
+            "authentication_key_rotation_not_found"
+        )
+    if rotation.actor_id != caller_actor_id:
+        raise ProtectedAccessValidationError("caller_not_subject")
+    if not rotation.active:
+        raise ProtectedAccessValidationError("rotation_already_retired")
+
+    rotation.active = False
+    rotation.retired_at = utc_now()
+    session.add(
+        AuditEvent(
+            event_type=EVENT_AUTHENTICATION_KEY_RETIRED,
+            resource_id=rotation.id,
+        )
+    )
+    session.commit()
+    session.refresh(rotation)
+    return rotation
 
 
 # Trust evaluation threshold bounds.
