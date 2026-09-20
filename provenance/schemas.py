@@ -375,6 +375,29 @@ class EvidenceBundleExchangeResponse(BaseModel):
     attestations: list[AttestationResponse]
 
 
+#: Fixed manifest format version emitted by this service.
+EXCHANGE_MANIFEST_VERSION = "provenance-exchange-manifest-v1"
+#: The sole digest algorithm used for exchange manifests.
+EXCHANGE_MANIFEST_DIGEST_ALGORITHM = "sha256"
+
+
+class EvidenceBundleExchangeManifestResponse(BaseModel):
+    """A read-only integrity manifest over one exchange snapshot.
+
+    Exactly four members: the fixed manifest ``manifest_version`` and
+    ``digest_algorithm``, the referenced bundle id, and the SHA-256 hex
+    digest of the bundle's canonical exchange snapshot. The manifest is
+    derived purely from the existing snapshot: it introduces no resource,
+    record, or audit event, and its value is stable for unchanged
+    persisted state.
+    """
+
+    manifest_version: Literal[EXCHANGE_MANIFEST_VERSION]
+    evidence_bundle_id: str
+    digest_algorithm: Literal[EXCHANGE_MANIFEST_DIGEST_ALGORITHM]
+    manifest_digest_hex: str
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)
