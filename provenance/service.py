@@ -473,6 +473,22 @@ def get_evidence_bundle(
     return bundle
 
 
+def find_evidence_bundle(
+    session: Session, evidence_bundle_id: str
+) -> EvidenceBundle | None:
+    """Return the evidence bundle with exactly this id, or ``None``.
+
+    A missing bundle is an ordinary outcome, not an error: callers
+    reconciling an external reference against local state use this instead
+    of :func:`get_evidence_bundle`. The lookup is strictly by primary key --
+    no digest or other reverse association is consulted -- and strictly
+    read-only: it writes no resource and no audit event.
+    """
+    return session.execute(
+        select(EvidenceBundle).where(EvidenceBundle.id == evidence_bundle_id)
+    ).scalar_one_or_none()
+
+
 def list_evidence_bundles_for_claim(
     session: Session, claim_id: str
 ) -> list[EvidenceBundle]:

@@ -740,6 +740,25 @@ class EvidenceBundleExchangeImportPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class EvidenceBundleExchangeImportReconciliationResponse(BaseModel):
+    """A read-only reconciliation of one exchange-import receipt with local state.
+
+    Exactly four members: the receipt's stable ``eir_`` id, whether a local
+    evidence bundle exists under the receipt's ``evidence_bundle_id``, the
+    bundle's current exchange manifest digest (computed under the existing
+    manifest rules) or null when no such local bundle exists, and whether
+    that current digest is character-for-character equal to the receipt's
+    ``manifest_digest_hex``. The snapshot, raw signatures, payloads, and
+    bytes are never part of this view, and the reconciliation introduces no
+    resource, record, or audit event.
+    """
+
+    import_id: str
+    local_available: bool
+    local_manifest_digest_hex: str | None
+    matches: bool
+
+
 class AttestationListResponse(BaseModel):
     items: list[AttestationResponse]
     count: int

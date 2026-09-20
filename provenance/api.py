@@ -54,6 +54,7 @@ from provenance.schemas import (
     EvidenceBundleCreate,
     EvidenceBundleExchangeImportCreate,
     EvidenceBundleExchangeImportPageResponse,
+    EvidenceBundleExchangeImportReconciliationResponse,
     EvidenceBundleExchangeImportResponse,
     EvidenceBundleExchangeManifestResponse,
     EvidenceBundleExchangePackageResponse,
@@ -741,6 +742,47 @@ def get_evidence_bundle_exchange_import(
     # event. An unknown id is an explicit, specific 404.
     record = service.get_evidence_bundle_exchange_import(session, import_id)
     return _exchange_import_response(record)
+
+
+@router.get(
+    "/evidence-bundle-exchange-imports/{import_id}/reconciliation",
+    response_model=EvidenceBundleExchangeImportReconciliationResponse,
+)
+def get_evidence_bundle_exchange_import_reconciliation(
+    import_id: str, request: Request, session: DbSession
+) -> EvidenceBundleExchangeImportReconciliationResponse:
+    # Same boundary as the other exchange-style read routes: any (or
+    # repeated) query parameter is a 422 before the receipt lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only: the reconciliation writes no resource, record, or
+    # audit event. An unknown receipt id is the existing
+    # evidence_bundle_exchange_import_not_found 404.
+    record = service.get_evidence_bundle_exchange_import(session, import_id)
+    # The receipt's evidence_bundle_id is the only lookup key: the local
+    # bundle is resolved by that id alone, never by the receipt's digest or
+    # any other reverse association. A missing local bundle is still a 200.
+    bundle = service.find_evidence_bundle(session, record.evidence_bundle_id)
+    if bundle is None:
+        return EvidenceBundleExchangeImportReconciliationResponse(
+            import_id=record.id,
+            local_available=False,
+            local_manifest_digest_hex=None,
+            matches=False,
+        )
+    # The current local digest is computed exactly as on the existing
+    # exchange manifest route, over the bundle's current snapshot.
+    snapshot = _exchange_snapshot_response(record.evidence_bundle_id, session)
+    local_digest_hex = _exchange_manifest_response(
+        record.evidence_bundle_id, snapshot
+    ).manifest_digest_hex
+    return EvidenceBundleExchangeImportReconciliationResponse(
+        import_id=record.id,
+        local_available=True,
+        local_manifest_digest_hex=local_digest_hex,
+        # Only character-for-character equality with the receipt's digest
+        # counts as a match.
+        matches=local_digest_hex == record.manifest_digest_hex,
+    )
 
 
 @router.get(
