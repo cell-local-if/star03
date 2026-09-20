@@ -355,6 +355,170 @@ def get_evidence_bundle(
     return bundle
 
 
+def _evidence_bundle_identity_key(payload: EvidenceBundleCreate):
+    return (
+        payload.claim_id,
+        payload.evidence_type,
+        payload.digest_algorithm,
+        payload.digest_hex,
+    )
+
+
+def import_evidence_bundles(
+    session: Session, payloads: list[EvidenceBundleCreate]
+) -> tuple[list[EvidenceBundle], bool]:
+    """Atomically import a batch of evidence bundles.
+
+    Returns ``(bundles, created)`` where ``bundles`` holds one bundle per
+    unique identity in first-appearance order and ``created`` is true iff at
+    least one bundle row was written by this call.
+
+    The in-batch identity is ``(claim_id, evidence_type, digest_algorithm,
+    digest_hex)``: a repeated identity keeps its first occurrence (later
+    repeats, with any differing ``media_type``/``metadata``, are discarded
+    and never appear in the response). Every referenced claim must exist
+    before any row is written, and the all-items/all-references check
+    precedes existence checks and inserts, so a single missing claim raises
+    :class:`ClaimNotFoundError` and the whole batch creates neither bundles
+    nor audit events. Identities already stored return their original
+    public views. Every genuinely new bundle and its
+    ``evidence_bundle.created`` audit event are added together and committed
+    in a single transaction -- either all new bundles commit or none do.
+    """
+    # First-wins in-batch dedup, preserving first-appearance order.
+    unique_payloads: list[EvidenceBundleCreate] = []
+    seen_identities: set[tuple[str, str, str, str]] = set()
+    for payload in payloads:
+        key = _evidence_bundle_identity_key(payload)
+        if key not in seen_identities:
+            seen_identities.add(key)
+            unique_payloads.append(payload)
+
+    # Validate every referenced claim up front (in first-appearance order so
+    # the reported missing id is deterministic); nothing is written until
+    # the full reference set is known to exist.
+    referenced_claim_ids: list[str] = []
+    seen_claims: set[str] = set()
+    for payload in unique_payloads:
+        if payload.claim_id not in seen_claims:
+            seen_claims.add(payload.claim_id)
+            referenced_claim_ids.append(payload.claim_id)
+    found_claims = set(
+        session.execute(
+            select(Claim.id).where(Claim.id.in_(referenced_claim_ids))
+        )
+        .scalars()
+        .all()
+    )
+    for claim_id in referenced_claim_ids:
+        if claim_id not in found_claims:
+            raise ClaimNotFoundError(claim_id)
+
+    # A contended batch (another transaction inserting one of the same
+    # identities) is retried after rollback: each retry re-classifies
+    # existence, so the set still to insert shrinks and the loop converges.
+    for _attempt in range(10):
+        existing_rows = (
+            session.execute(
+                select(EvidenceBundle).where(
+                    EvidenceBundle.claim_id.in_(referenced_claim_ids)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        existing_by_identity = {
+            _evidence_bundle_identity_key_from_row(row): row
+            for row in existing_rows
+        }
+
+        # Classify each unique identity (in first-appearance order) as
+        # already stored or still to create. The first submission's
+        # media_type/metadata on a stored bundle are retained unchanged.
+        existing_ordered: list[EvidenceBundle] = []
+        to_create: list[EvidenceBundleCreate] = []
+        for payload in unique_payloads:
+            key = _evidence_bundle_identity_key(payload)
+            stored = existing_by_identity.get(key)
+            if stored is not None:
+                existing_ordered.append(stored)
+            else:
+                to_create.append(payload)
+
+        if not to_create:
+            # Every unique identity already exists: strictly read-only,
+            # nothing to commit.
+            return existing_ordered, False
+
+        for payload in to_create:
+            bundle = EvidenceBundle(
+                id=ids.evidence_bundle_id(
+                    payload.claim_id,
+                    payload.evidence_type,
+                    payload.digest_algorithm,
+                    payload.digest_hex,
+                ),
+                claim_id=payload.claim_id,
+                evidence_type=payload.evidence_type,
+                digest_algorithm=payload.digest_algorithm,
+                digest_hex=payload.digest_hex,
+                media_type=payload.media_type,
+                metadata_=payload.metadata,
+            )
+            session.add(bundle)
+            session.add(
+                AuditEvent(
+                    event_type=EVENT_EVIDENCE_BUNDLE_CREATED,
+                    resource_id=bundle.id,
+                )
+            )
+
+        try:
+            session.commit()
+        except IntegrityError:
+            # A concurrent transaction committed one of the same identities
+            # first, rolling back every row and event staged above. Retry:
+            # the contended identity is now pre-existing and only the still
+            # genuinely-new bundles are re-inserted (and committed)
+            # atomically.
+            session.rollback()
+            continue
+
+        # Reload every unique identity (pre-existing and newly committed)
+        # and present it in first-appearance order.
+        session.expire_all()
+        committed_rows = (
+            session.execute(
+                select(EvidenceBundle).where(
+                    EvidenceBundle.claim_id.in_(referenced_claim_ids)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        committed_by_identity = {
+            _evidence_bundle_identity_key_from_row(row): row
+            for row in committed_rows
+        }
+        result = [
+            committed_by_identity[_evidence_bundle_identity_key(payload)]
+            for payload in unique_payloads
+        ]
+        return result, True
+
+    # pragma: no cover - defensive: contention that never converges.
+    raise RuntimeError("evidence bundle import did not converge")  # pragma: no cover
+
+
+def _evidence_bundle_identity_key_from_row(row: EvidenceBundle):
+    return (
+        row.claim_id,
+        row.evidence_type,
+        row.digest_algorithm,
+        row.digest_hex,
+    )
+
+
 def list_evidence_bundles_for_claim(
     session: Session, claim_id: str
 ) -> list[EvidenceBundle]:

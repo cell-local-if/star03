@@ -49,6 +49,8 @@ from provenance.schemas import (
     ContentRelationResponse,
     ContentResponse,
     EvidenceBundleCreate,
+    EvidenceBundleImportRequest,
+    EvidenceBundleImportResponse,
     EvidenceBundleListResponse,
     EvidenceBundlePageResponse,
     EvidenceBundleResponse,
@@ -396,6 +398,26 @@ def create_evidence_bundle(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return _bundle_response(bundle)
+
+
+@router.post(
+    "/evidence-bundle-imports",
+    response_model=EvidenceBundleImportResponse,
+)
+def import_evidence_bundles(
+    payload: EvidenceBundleImportRequest, session: DbSession, response: Response
+) -> EvidenceBundleImportResponse:
+    # All items and every referenced claim are validated before any write:
+    # a malformed item is a 422 and a missing claim is the existing 404
+    # claim_not_found, in either case creating no bundle or audit event.
+    bundles, created = service.import_evidence_bundles(session, payload.items)
+    # At least one new bundle committed (with its audit event) -> 201; a
+    # batch consisting entirely of already-existing identities -> 200.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    items = [_bundle_response(bundle) for bundle in bundles]
+    return EvidenceBundleImportResponse(items=items, count=len(items))
 
 
 @router.get(

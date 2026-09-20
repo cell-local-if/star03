@@ -310,6 +310,33 @@ class EvidenceBundlePageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class EvidenceBundleImportRequest(BaseModel):
+    """An atomic batch import of evidence bundles for an external forensics system.
+
+    The body carries exactly ``items``: 1 to 100 entries, each validated by
+    the same rules as a single :class:`EvidenceBundleCreate`. Any field
+    other than ``items`` -- including a byte-bearing one smuggled at the
+    top level -- is a client error rather than silently dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[EvidenceBundleCreate] = Field(min_length=1, max_length=100)
+
+
+class EvidenceBundleImportResponse(BaseModel):
+    """The result of an atomic batch import.
+
+    ``items`` holds one public bundle view per unique identity, in the order
+    of that identity's first appearance in the request; repeated in-batch
+    identities produce no second entry. ``count`` is the number of unique
+    identities (the length of ``items``).
+    """
+
+    items: list[EvidenceBundleResponse]
+    count: int
+
+
 class ClaimExportItem(ClaimResponse):
     """A claim in a content export: the full public view plus its evidence.
 
