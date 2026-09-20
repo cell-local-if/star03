@@ -23,6 +23,7 @@ from provenance.errors import (
     ContentNotFoundError,
     ContentRelationNotFoundError,
     ContentRelationValidationError,
+    EvidenceBundleExchangeImportNotFoundError,
     EvidenceBundleNotFoundError,
     ProtectedAccessValidationError,
     UnknownActorError,
@@ -38,6 +39,7 @@ from provenance.models import (
     EVENT_CONTENT_CREATED,
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
+    EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
     Actor,
     Attestation,
     AttestationAccessGrant,
@@ -48,6 +50,7 @@ from provenance.models import (
     Content,
     ContentRelation,
     EvidenceBundle,
+    ExchangeImportRecord,
 )
 from provenance.schemas import (
     ActorCreate,
@@ -58,6 +61,7 @@ from provenance.schemas import (
     ClaimCreate,
     ContentCreate,
     ContentRelationCreate,
+    EvidenceBundleExchangeImportCreate,
     EvidenceBundleCreate,
     EvidenceBundleImportCreate,
 )
@@ -1092,6 +1096,98 @@ def get_evidence_bundle_exchange(
         .all()
     )
     return bundle, claim, content, attestations
+
+
+def _exchange_import_identity_select(
+    manifest_version: str, evidence_bundle_id: str, manifest_digest_hex: str
+):
+    return select(ExchangeImportRecord).where(
+        ExchangeImportRecord.manifest_version == manifest_version,
+        ExchangeImportRecord.evidence_bundle_id == evidence_bundle_id,
+        ExchangeImportRecord.manifest_digest_hex == manifest_digest_hex,
+    )
+
+
+def create_evidence_bundle_exchange_import(
+    session: Session,
+    payload: EvidenceBundleExchangeImportCreate,
+) -> tuple[ExchangeImportRecord, bool]:
+    """Register one offline-verified exchange package, returning ``(record, created)``.
+
+    The caller has already verified the package: the request parses under
+    the existing exchange manifest and snapshot structures, its internal
+    associations are consistent, and the manifest digest matches the
+    canonical SHA-256 of the snapshot exactly as received. This function
+    performs no such verification and no local-resource lookup: the bundle
+    id in the manifest is an opaque reference, so whether the referenced
+    resources exist locally never changes the outcome.
+
+    The receiving identity is ``(manifest_version, evidence_bundle_id,
+    manifest_digest_hex)``; the snapshot itself is never stored. A first
+    submission writes the receipt row and its
+    ``evidence_bundle.exchange_imported`` audit event in a single
+    transaction. A retried submission for the same identity returns the
+    existing record with ``created=False`` and writes nothing -- no second
+    row and no second audit event.
+    """
+    manifest = payload.manifest
+    manifest_version = manifest.manifest_version
+    evidence_bundle_id = manifest.evidence_bundle_id
+    manifest_digest_hex = manifest.manifest_digest_hex
+
+    existing = session.execute(
+        _exchange_import_identity_select(
+            manifest_version, evidence_bundle_id, manifest_digest_hex
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    while True:
+        record = ExchangeImportRecord(
+            id=ids.exchange_import_id(
+                manifest_version, evidence_bundle_id, manifest_digest_hex
+            ),
+            manifest_version=manifest_version,
+            evidence_bundle_id=evidence_bundle_id,
+            manifest_digest_hex=manifest_digest_hex,
+        )
+        session.add(record)
+        session.add(
+            AuditEvent(
+                event_type=EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
+                resource_id=record.id,
+            )
+        )
+        try:
+            session.commit()
+        except IntegrityError:
+            # A concurrent import registered this identity first: roll back
+            # and return that record instead of duplicating it or writing a
+            # second audit event.
+            session.rollback()
+            raced = session.execute(
+                _exchange_import_identity_select(
+                    manifest_version, evidence_bundle_id, manifest_digest_hex
+                )
+            ).scalar_one_or_none()
+            if raced is None:  # pragma: no cover - defensive
+                raise
+            return raced, False
+        session.refresh(record)
+        return record, True
+
+
+def get_evidence_bundle_exchange_import(
+    session: Session, import_id: str
+) -> ExchangeImportRecord:
+    """Return an exchange-import receipt by id or raise the 404 domain error."""
+    record = session.execute(
+        select(ExchangeImportRecord).where(ExchangeImportRecord.id == import_id)
+    ).scalar_one_or_none()
+    if record is None:
+        raise EvidenceBundleExchangeImportNotFoundError(import_id)
+    return record
 
 
 # Trust evaluation threshold bounds.

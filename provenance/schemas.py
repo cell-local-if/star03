@@ -558,6 +558,40 @@ class ExchangeManifestVerificationSnapshot(BaseModel):
     attestations: list[ExchangeManifestVerificationSnapshotAttestation]
 
 
+def _validate_exchange_snapshot_associations(
+    snapshot: ExchangeManifestVerificationSnapshot, evidence_bundle_id: str
+) -> None:
+    """Validate the internal references of one exchange snapshot.
+
+    The bundle id must match the enclosing manifest reference, the claim
+    must match the bundle's direct association, the content must match the
+    claim's, and every attestation must target this exact evidence bundle.
+    These checks are purely structural and never resolve any id against
+    local state, so they apply identically to offline verification and to
+    controlled imports.
+    """
+    if snapshot.evidence_bundle.id != evidence_bundle_id:
+        raise ValueError(
+            "snapshot.evidence_bundle.id must equal evidence_bundle_id"
+        )
+    if snapshot.claim.id != snapshot.evidence_bundle.claim_id:
+        raise ValueError(
+            "snapshot.claim.id must equal snapshot.evidence_bundle.claim_id"
+        )
+    if snapshot.content.id != snapshot.claim.content_id:
+        raise ValueError(
+            "snapshot.content.id must equal snapshot.claim.content_id"
+        )
+    for attestation in snapshot.attestations:
+        if (
+            attestation.target_type != "evidence_bundle"
+            or attestation.target_id != evidence_bundle_id
+        ):
+            raise ValueError(
+                "every snapshot attestation must target this evidence bundle"
+            )
+
+
 class ExchangeManifestVerificationCreate(BaseModel):
     """An offline exchange-manifest verification request.
 
@@ -595,27 +629,9 @@ class ExchangeManifestVerificationCreate(BaseModel):
 
     @model_validator(mode="after")
     def _snapshot_associations_consistent(self):
-        snapshot = self.snapshot
-        if snapshot.evidence_bundle.id != self.evidence_bundle_id:
-            raise ValueError(
-                "snapshot.evidence_bundle.id must equal evidence_bundle_id"
-            )
-        if snapshot.claim.id != snapshot.evidence_bundle.claim_id:
-            raise ValueError(
-                "snapshot.claim.id must equal snapshot.evidence_bundle.claim_id"
-            )
-        if snapshot.content.id != snapshot.claim.content_id:
-            raise ValueError(
-                "snapshot.content.id must equal snapshot.claim.content_id"
-            )
-        for attestation in snapshot.attestations:
-            if (
-                attestation.target_type != "evidence_bundle"
-                or attestation.target_id != self.evidence_bundle_id
-            ):
-                raise ValueError(
-                    "every snapshot attestation must target this evidence bundle"
-                )
+        _validate_exchange_snapshot_associations(
+            self.snapshot, self.evidence_bundle_id
+        )
         return self
 
 
@@ -630,6 +646,88 @@ class ExchangeManifestVerificationResponse(BaseModel):
     #: The digest computed from the submitted snapshot under the manifest
     #: canonical rules; omitted when it matches the claimed digest.
     computed_digest_hex: str | None = None
+
+
+class EvidenceBundleExchangeImportManifest(BaseModel):
+    """The manifest half of a received exchange package under controlled import.
+
+    Exactly the existing four-field exchange manifest structure: the fixed
+    ``manifest_version`` and ``digest_algorithm``, the referenced bundle id,
+    and the claimed snapshot digest. Undeclared members are rejected rather
+    than ignored, exactly as on the read and verification routes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest_version: Literal[EXCHANGE_MANIFEST_VERSION]
+    evidence_bundle_id: str = Field(..., min_length=1, max_length=80)
+    digest_algorithm: Literal[EXCHANGE_MANIFEST_DIGEST_ALGORITHM]
+    manifest_digest_hex: str
+
+    @field_validator("evidence_bundle_id")
+    @classmethod
+    def _evidence_bundle_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "evidence_bundle_id")
+
+    @field_validator("manifest_digest_hex")
+    @classmethod
+    def _manifest_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "manifest_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class EvidenceBundleExchangeImportCreate(BaseModel):
+    """A controlled import of one already-received exchange package.
+
+    Exactly two members: ``manifest`` carries the existing four-field
+    exchange manifest and ``snapshot`` carries the existing four-member
+    exchange snapshot. Both are validated exactly as on the stateless
+    verification route (fixed version/algorithm, strict digest spelling,
+    existing public-view fields only, and consistent internal
+    associations); the digest match itself is enforced at the route, over
+    the raw received JSON so root member and array order participate.
+
+    Verification is a pure function of the request body and never resolves
+    any identifier against local resources: the package need not describe
+    any locally stored content, claim, bundle, or attestation. The request
+    has no field capable of carrying a raw signature, claim payload,
+    content bytes, or evidence bytes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest: EvidenceBundleExchangeImportManifest
+    snapshot: ExchangeManifestVerificationSnapshot
+
+    @model_validator(mode="after")
+    def _snapshot_associations_consistent(self):
+        _validate_exchange_snapshot_associations(
+            self.snapshot, self.manifest.evidence_bundle_id
+        )
+        return self
+
+
+class EvidenceBundleExchangeImportResponse(BaseModel):
+    """The public immutable receipt for one registered exchange import.
+
+    Exactly the stable ``eir_`` receipt id, the three receiving-identity
+    fields (manifest version, evidence bundle id, manifest digest), and the
+    UTC ``received_at`` instant. The snapshot itself is deliberately not
+    part of the receipt: it is neither copied into the record nor echoed
+    here.
+    """
+
+    id: str
+    manifest_version: str
+    evidence_bundle_id: str
+    manifest_digest_hex: str
+    received_at: datetime
 
 
 class AttestationListResponse(BaseModel):

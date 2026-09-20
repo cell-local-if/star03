@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from provenance import access_signing, canonical, pagination, service
 from provenance.access_signing import AccessAuthError
 from provenance.errors import (
+    EvidenceBundleExchangeImportValidationError,
     LineageValidationError,
     ProtectedAccessValidationError,
     ProtectedResourceNotFoundError,
@@ -51,6 +52,8 @@ from provenance.schemas import (
     ContentRelationResponse,
     ContentResponse,
     EvidenceBundleCreate,
+    EvidenceBundleExchangeImportCreate,
+    EvidenceBundleExchangeImportResponse,
     EvidenceBundleExchangeManifestResponse,
     EvidenceBundleExchangePackageResponse,
     EvidenceBundleExchangeResponse,
@@ -558,6 +561,67 @@ async def verify_exchange_manifest(
     return ExchangeManifestVerificationResponse(
         valid=False, computed_digest_hex=computed_digest_hex
     )
+
+
+def _exchange_import_response(record) -> EvidenceBundleExchangeImportResponse:
+    return EvidenceBundleExchangeImportResponse(
+        id=record.id,
+        manifest_version=record.manifest_version,
+        evidence_bundle_id=record.evidence_bundle_id,
+        manifest_digest_hex=record.manifest_digest_hex,
+        received_at=record.created_at,
+    )
+
+
+@router.post(
+    "/evidence-bundle-exchange-imports",
+    response_model=EvidenceBundleExchangeImportResponse,
+)
+async def import_evidence_bundle_exchange(
+    payload: EvidenceBundleExchangeImportCreate,
+    request: Request,
+    session: DbSession,
+    response: Response,
+) -> EvidenceBundleExchangeImportResponse:
+    # Structure, fixed version/algorithm, strict digest spelling, the
+    # existing public-view fields, and the snapshot's internal associations
+    # have all passed request validation. The digest match is enforced here
+    # over the raw received JSON, so root member order, array order, and
+    # datetime spellings participate exactly as on the stateless
+    # verification route; a mismatch is a 422 and writes nothing.
+    body = await request.json()
+    computed_digest_hex = canonical.exchange_manifest_digest_hex(body["snapshot"])
+    if computed_digest_hex != payload.manifest.manifest_digest_hex:
+        raise EvidenceBundleExchangeImportValidationError(
+            "manifest_digest_mismatch",
+            details={"computed_digest_hex": computed_digest_hex},
+        )
+
+    # Verification is decided entirely by the request body: the service
+    # never resolves the bundle id (or any other id) against local
+    # resources, so whether they exist locally cannot change the receipt.
+    record, created = service.create_evidence_bundle_exchange_import(
+        session, payload
+    )
+    # First registration of this receiving identity -> 201; a retried
+    # submission -> 200 with the original record and no new audit event.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _exchange_import_response(record)
+
+
+@router.get(
+    "/evidence-bundle-exchange-imports/{import_id}",
+    response_model=EvidenceBundleExchangeImportResponse,
+)
+def get_evidence_bundle_exchange_import(
+    import_id: str, session: DbSession
+) -> EvidenceBundleExchangeImportResponse:
+    # Strictly read-only: a receipt read writes no resource and no audit
+    # event. An unknown id is an explicit, specific 404.
+    record = service.get_evidence_bundle_exchange_import(session, import_id)
+    return _exchange_import_response(record)
 
 
 @router.get(

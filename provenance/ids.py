@@ -162,3 +162,31 @@ def authentication_key_rotation_id(
         ensure_ascii=False,
     ).encode("utf-8")
     return "akr_" + hashlib.sha256(material).hexdigest()
+
+
+def exchange_import_id(
+    manifest_version: str,
+    evidence_bundle_id: str,
+    manifest_digest_hex: str,
+) -> str:
+    """Return a stable ``eir_``-prefixed receipt id for an exchange import.
+
+    The identity is exactly the receiving identity: the manifest version,
+    the referenced evidence bundle id, and the manifest SHA-256 digest. The
+    snapshot itself never enters the material -- only its verified digest --
+    so the same offline-verified package always maps to the same receipt id
+    even though no snapshot bytes are persisted. The material is a canonical
+    JSON array so fields containing separators cannot collide with different
+    field splits.
+    """
+    material = json.dumps(
+        [
+            "evidence_bundle_exchange_import",
+            manifest_version,
+            evidence_bundle_id,
+            manifest_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "eir_" + hashlib.sha256(material).hexdigest()

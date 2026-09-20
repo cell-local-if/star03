@@ -45,6 +45,7 @@ EVENT_ATTESTATION_ACCESS_GRANTED = "attestation.access_granted"
 EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
+EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -488,6 +489,59 @@ class AuditEvent(Base):
     )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     resource_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+
+class ExchangeImportRecord(Base):
+    """An immutable receipt for one offline-verified exchange-bundle package.
+
+    The record is the controlled-import counterpart of the stateless
+    verification route: a package whose manifest matches its snapshot under
+    the existing canonical SHA-256 rules, and whose snapshot internal
+    associations are consistent, is registered exactly once. The receipt
+    stores only the receiving identity -- the manifest version, referenced
+    evidence bundle id, and manifest digest -- never the snapshot itself and
+    never any raw signature, claim payload, content, or evidence bytes; the
+    full package must be re-presented on a retry. Verification never depends
+    on whether the referenced resources exist locally, so no foreign keys and
+    no local resource lookup participate in the decision.
+
+    Records are append-only and immutable; there is deliberately no update
+    or delete path. The identity triple is unique, so a retried submission
+    for the same package returns the original record without another audit
+    event.
+    """
+
+    __tablename__ = "evidence_bundle_exchange_imports"
+    __table_args__ = (
+        UniqueConstraint(
+            "manifest_version",
+            "evidence_bundle_id",
+            "manifest_digest_hex",
+            name="uq_exchange_imports_identity",
+        ),
+        Index(
+            "ix_exchange_imports_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable receipt identifier ("eir_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: Fixed exchange manifest format version committed to by the package.
+    manifest_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The bundle id named by the manifest (an opaque reference, never a
+    #: local lookup key at import time).
+    evidence_bundle_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    #: The SHA-256 manifest digest the received snapshot was verified against.
+    manifest_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, nullable=False, default=utc_now
     )
