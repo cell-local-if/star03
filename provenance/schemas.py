@@ -758,6 +758,33 @@ class EvidenceBundleExchangeImportReconciliationResponse(BaseModel):
     matches: bool
 
 
+class EvidenceBundleExchangeImportReconciliationItem(
+    EvidenceBundleExchangeImportResponse
+):
+    """One receipt's public view together with its current local reconciliation.
+
+    The receipt fields are exactly the existing single-receipt public view;
+    the three reconciliation members are computed exactly as on the existing
+    per-receipt reconciliation route (``local_available``,
+    ``local_manifest_digest_hex`` (null when unavailable), and ``matches``).
+    The snapshot, raw signatures, payloads, and bytes are never echoed.
+    """
+
+    local_available: bool
+    local_manifest_digest_hex: str | None
+    matches: bool
+
+
+class EvidenceBundleExchangeImportReconciliationPageResponse(BaseModel):
+    """A cursor-paginated page of receipt reconciliations in creation order."""
+
+    items: list[EvidenceBundleExchangeImportReconciliationItem]
+    #: Total number of receipts, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class AttestationListResponse(BaseModel):
     items: list[AttestationResponse]
     count: int

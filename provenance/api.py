@@ -54,6 +54,8 @@ from provenance.schemas import (
     EvidenceBundleCreate,
     EvidenceBundleExchangeImportCreate,
     EvidenceBundleExchangeImportPageResponse,
+    EvidenceBundleExchangeImportReconciliationItem,
+    EvidenceBundleExchangeImportReconciliationPageResponse,
     EvidenceBundleExchangeImportReconciliationResponse,
     EvidenceBundleExchangeImportResponse,
     EvidenceBundleExchangeManifestResponse,
@@ -758,28 +760,140 @@ def reconcile_evidence_bundle_exchange_import(
     # audit event. An unknown receipt id is the existing
     # evidence_bundle_exchange_import_not_found 404.
     record = service.get_evidence_bundle_exchange_import(session, import_id)
-    # The receipt's evidence_bundle_id is the only lookup key: the local
-    # bundle is resolved by that id alone, never in reverse (no digest or
-    # receipt search). A missing local bundle is still a 200.
+    local_available, local_digest_hex, matches = _reconcile_import_record(
+        session, record
+    )
+    return EvidenceBundleExchangeImportReconciliationResponse(
+        import_id=record.id,
+        local_available=local_available,
+        local_manifest_digest_hex=local_digest_hex,
+        matches=matches,
+    )
+
+
+def _reconcile_import_record(session: Session, record) -> tuple[bool, str | None, bool]:
+    """Reconcile one receipt against current local state.
+
+    Returns ``(local_available, local_manifest_digest_hex, matches)``. The
+    receipt's evidence_bundle_id is the only lookup key: the local bundle is
+    resolved by that id alone, never in reverse (no digest or receipt
+    search). A missing local bundle yields ``(False, None, False)``; when the
+    bundle exists the current digest is computed under exactly the exchange
+    manifest route's rules from a single read-only snapshot read, and matches
+    is true only on character-for-character equality with the receipt's
+    digest. Strictly read-only.
+    """
     bundle = service.find_evidence_bundle(session, record.evidence_bundle_id)
     if bundle is None:
-        return EvidenceBundleExchangeImportReconciliationResponse(
-            import_id=record.id,
-            local_available=False,
-            local_manifest_digest_hex=None,
-            matches=False,
-        )
-    # The current local digest is computed under exactly the exchange
-    # manifest route's rules, from a single read-only snapshot read.
+        return False, None, False
     snapshot = _exchange_snapshot_response(record.evidence_bundle_id, session)
     manifest = _exchange_manifest_response(record.evidence_bundle_id, snapshot)
     local_digest_hex = manifest.manifest_digest_hex
-    return EvidenceBundleExchangeImportReconciliationResponse(
-        import_id=record.id,
-        local_available=True,
-        local_manifest_digest_hex=local_digest_hex,
-        # Exact character-for-character equality; anything else is false.
-        matches=local_digest_hex == record.manifest_digest_hex,
+    return True, local_digest_hex, local_digest_hex == record.manifest_digest_hex
+
+
+_EXCHANGE_IMPORT_RECONCILIATIONS_PARAMS = frozenset({"limit", "cursor"})
+
+
+@router.get(
+    "/evidence-bundle-exchange-import-reconciliations",
+    response_model=EvidenceBundleExchangeImportReconciliationPageResponse,
+)
+def list_evidence_bundle_exchange_import_reconciliations(
+    request: Request,
+    session: DbSession,
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> EvidenceBundleExchangeImportReconciliationPageResponse:
+    # Read-only paging over every existing receipt, enriched with each
+    # receipt's current local reconciliation. Raw multi-values are inspected
+    # deliberately: a repeated scalar is rejected instead of silently taking
+    # the last value, any undeclared parameter is rejected rather than
+    # ignored, and a blank/illegal limit is never coerced to the default.
+    raw = request.query_params
+
+    unknown = set(raw) - _EXCHANGE_IMPORT_RECONCILIATIONS_PARAMS
+    if unknown:
+        # There are no filters on this search: any other parameter is a typo
+        # that must never silently change the result.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_EXCHANGE_IMPORTS_LIMIT,
+        service.MIN_EXCHANGE_IMPORTS_LIMIT,
+        service.MAX_EXCHANGE_IMPORTS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.exchange_import_reconciliations_cursor_secret,
+                pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: this search has
+        # no filters, so the effective limit is the only bound claim.
+        if claims["limit"] != page_limit:
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: page over the receipts in their stable creation
+    # order (same ordering as the receipt search); no resource, receipt, or
+    # audit event is written.
+    records = service.list_evidence_bundle_exchange_imports(session)
+    total = len(records)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = records[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.exchange_import_reconciliations_cursor_secret,
+                pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
+                {"limit": page_limit, "offset": next_offset},
+            )
+
+    items = []
+    for record in page:
+        local_available, local_digest_hex, matches = _reconcile_import_record(
+            session, record
+        )
+        receipt = _exchange_import_response(record)
+        items.append(
+            EvidenceBundleExchangeImportReconciliationItem(
+                **receipt.model_dump(),
+                local_available=local_available,
+                local_manifest_digest_hex=local_digest_hex,
+                matches=matches,
+            )
+        )
+
+    return EvidenceBundleExchangeImportReconciliationPageResponse(
+        items=items,
+        count=total,
+        next_cursor=next_cursor,
     )
 
 
