@@ -36,6 +36,8 @@ from provenance.schemas import (
     AttestationRevocationCreate,
     AttestationRevocationListResponse,
     AttestationRevocationResponse,
+    AuditCheckpointVerificationCreate,
+    AuditCheckpointVerificationResponse,
     AuditEventCheckpointResponse,
     AuditEventItem,
     AuditEventPageResponse,
@@ -1562,4 +1564,29 @@ def get_audit_events_checkpoint(
         digest_algorithm=AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
         event_count=len(events),
         events_digest_hex=canonical.audit_events_digest_hex(events),
+    )
+
+
+@router.post(
+    "/audit-events/checkpoint-verifications",
+    response_model=AuditCheckpointVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_audit_events_checkpoint(
+    payload: AuditCheckpointVerificationCreate, request: Request
+) -> AuditCheckpointVerificationResponse:
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no audit event is written. Verification
+    # uses the request body alone; no event or resource id is ever resolved
+    # against local state, so unknown events verify exactly like known ones.
+    body = await request.json()
+    # The digest commits to the events exactly as received: the raw JSON
+    # values (array order, datetime spellings), not any parsed or
+    # re-serialized form. Field validation has already guaranteed every
+    # event is canonicalizable.
+    computed_digest_hex = canonical.audit_events_digest_hex(body["events"])
+    if computed_digest_hex == payload.checkpoint.events_digest_hex:
+        return AuditCheckpointVerificationResponse(valid=True)
+    return AuditCheckpointVerificationResponse(
+        valid=False, computed_digest_hex=computed_digest_hex
     )
