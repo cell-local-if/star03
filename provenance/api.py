@@ -22,6 +22,8 @@ from provenance.pagination import InvalidCursorError
 from provenance.signing import ATTESTATION_TARGET_TYPES
 from provenance.time_utils import parse_rfc3339_utc
 from provenance.schemas import (
+    AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
+    AUDIT_CHECKPOINT_VERSION,
     EXCHANGE_MANIFEST_DIGEST_ALGORITHM,
     EXCHANGE_MANIFEST_VERSION,
     ActorCreate,
@@ -34,6 +36,7 @@ from provenance.schemas import (
     AttestationRevocationCreate,
     AttestationRevocationListResponse,
     AttestationRevocationResponse,
+    AuditEventCheckpointResponse,
     AuditEventItem,
     AuditEventPageResponse,
     AuthenticationKeyRotationCreate,
@@ -1503,4 +1506,60 @@ def list_audit_events(request: Request, session: DbSession) -> AuditEventPageRes
         items=[AuditEventItem.model_validate(item) for item in page],
         count=total,
         next_cursor=next_cursor,
+    )
+
+
+_AUDIT_CHECKPOINT_PARAMS = frozenset({"event_type", "resource_id", "from", "to"})
+
+
+@router.get(
+    "/audit-events/checkpoint",
+    response_model=AuditEventCheckpointResponse,
+)
+def get_audit_events_checkpoint(
+    request: Request, session: DbSession
+) -> AuditEventCheckpointResponse:
+    # Same parameter contract as the audit-event search, minus pagination:
+    # a repeated scalar is rejected instead of silently taking the last
+    # value, undeclared parameters (including limit/cursor) are rejected
+    # rather than ignored, and blank or malformed values are never coerced.
+    raw = request.query_params
+
+    unknown = set(raw) - _AUDIT_CHECKPOINT_PARAMS
+    if unknown:
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    event_type = _parse_nonempty_filter(raw, "event_type")
+    resource_id = _parse_nonempty_filter(raw, "resource_id")
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    # Strictly read-only: the checkpoint only re-reads the filtered events
+    # in their stable creation order and hashes them; it writes no resource
+    # and no audit event, and an empty match set still yields a digest.
+    items = service.list_audit_events(
+        session, event_type, resource_id, from_dt, to_dt
+    )
+    # mode="json" yields exactly the wire view the search serves (UTC
+    # datetimes as RFC 3339 strings), so the digest is reproducible by an
+    # external verifier from the audit-event listing alone.
+    events = [
+        AuditEventItem.model_validate(item).model_dump(mode="json")
+        for item in items
+    ]
+    return AuditEventCheckpointResponse(
+        checkpoint_version=AUDIT_CHECKPOINT_VERSION,
+        digest_algorithm=AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
+        event_count=len(events),
+        events_digest_hex=canonical.audit_events_digest_hex(events),
     )

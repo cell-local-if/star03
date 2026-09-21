@@ -894,6 +894,30 @@ class AuditEventPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+#: Fixed checkpoint format version emitted by this service.
+AUDIT_CHECKPOINT_VERSION = "provenance-audit-checkpoint-v1"
+#: The sole digest algorithm used for audit-event checkpoints.
+AUDIT_CHECKPOINT_DIGEST_ALGORITHM = "sha256"
+
+
+class AuditEventCheckpointResponse(BaseModel):
+    """A read-only integrity checkpoint over a filtered audit-event sequence.
+
+    Exactly four members: the fixed ``checkpoint_version`` and
+    ``digest_algorithm``, the number of events in the filtered sequence,
+    and the SHA-256 hex digest of the canonical event array (each event
+    reduced to ``event_type``/``resource_id``/UTC ``created_at``). The
+    checkpoint is derived purely from the existing events: it introduces
+    no resource, record, or audit event, and its value is stable for
+    unchanged persisted state -- including the empty sequence.
+    """
+
+    checkpoint_version: Literal[AUDIT_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[AUDIT_CHECKPOINT_DIGEST_ALGORITHM]
+    event_count: int
+    events_digest_hex: str
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 

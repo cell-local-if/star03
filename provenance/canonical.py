@@ -69,3 +69,15 @@ def canonical_exchange_snapshot_bytes(snapshot: Any) -> bytes:
 def exchange_manifest_digest_hex(snapshot: Any) -> str:
     """Return the SHA-256 hex digest of the canonical exchange snapshot bytes."""
     return hashlib.sha256(canonical_exchange_snapshot_bytes(snapshot)).hexdigest()
+
+
+def audit_events_digest_hex(events: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical audit-event array bytes.
+
+    The array keeps its element order; each element's object members are
+    sorted by Unicode code point, with compact separators, non-ASCII
+    emitted unescaped, and UTF-8 encoding -- the same canonical form as
+    :func:`canonical_json_bytes`, so the digest is reproducible offline
+    from the filtered audit-event listing alone.
+    """
+    return hashlib.sha256(canonical_json_bytes(events)).hexdigest()
