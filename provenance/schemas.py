@@ -12,11 +12,19 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from provenance.canonical import canonical_json_bytes
 from provenance.ed25519 import PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH
 from provenance.models import SUPPORTED_DIGEST_ALGORITHMS
+from provenance.time_utils import parse_rfc3339_utc
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -916,6 +924,107 @@ class AuditEventCheckpointResponse(BaseModel):
     digest_algorithm: Literal[AUDIT_CHECKPOINT_DIGEST_ALGORITHM]
     event_count: int
     events_digest_hex: str
+
+
+class AuditCheckpointVerificationEvent(BaseModel):
+    """An event under checkpoint verification: exactly the three public fields.
+
+    ``created_at`` is kept as the raw string so the digest commits to the
+    timestamp exactly as spelled on the wire; it must be a strict RFC 3339
+    UTC timestamp, exactly as the audit-event time filters require.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: str = Field(..., min_length=1)
+    resource_id: str = Field(..., min_length=1)
+    created_at: str
+
+    @field_validator("event_type")
+    @classmethod
+    def _event_type_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "event_type")
+
+    @field_validator("resource_id")
+    @classmethod
+    def _resource_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "resource_id")
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_strict_rfc3339_utc(cls, v: str) -> str:
+        if parse_rfc3339_utc(v) is None:
+            raise ValueError(
+                "created_at must be a strict RFC 3339 UTC timestamp"
+            )
+        return v
+
+
+class AuditCheckpointVerificationCheckpoint(BaseModel):
+    """The claimed checkpoint under stateless verification.
+
+    Exactly the existing four-field audit checkpoint structure: the fixed
+    ``checkpoint_version`` and ``digest_algorithm``, the claimed event
+    count, and the claimed events digest. Undeclared members are rejected
+    rather than ignored, exactly as on the checkpoint read route.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_version: Literal[AUDIT_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[AUDIT_CHECKPOINT_DIGEST_ALGORITHM]
+    #: Non-negative integer count the submitted event array must match.
+    event_count: StrictInt = Field(..., ge=0)
+    events_digest_hex: str
+
+    @field_validator("events_digest_hex")
+    @classmethod
+    def _events_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "events_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class AuditCheckpointVerificationCreate(BaseModel):
+    """A stateless audit-checkpoint verification request.
+
+    Exactly two members: ``checkpoint`` carries the claimed four-field
+    audit checkpoint and ``events`` carries the event sequence it commits
+    to, with exactly ``checkpoint.event_count`` elements. Verification is
+    pure: it reads and writes no server state, so no event or resource id
+    is ever resolved against local state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint: AuditCheckpointVerificationCheckpoint
+    events: list[AuditCheckpointVerificationEvent]
+
+    @model_validator(mode="after")
+    def _events_match_claimed_count(self):
+        if len(self.events) != self.checkpoint.event_count:
+            raise ValueError(
+                "events must contain exactly checkpoint.event_count elements"
+            )
+        return self
+
+
+class AuditCheckpointVerificationResponse(BaseModel):
+    """The stateless checkpoint verification verdict.
+
+    ``computed_digest_hex`` is present only on a mismatch, so a matching
+    checkpoint renders exactly ``{"valid": true}``.
+    """
+
+    valid: bool
+    #: The digest computed from the submitted event array under the
+    #: checkpoint canonical rules; omitted when it matches the claim.
+    computed_digest_hex: str | None = None
 
 
 class TrustEvaluationResponse(BaseModel):
