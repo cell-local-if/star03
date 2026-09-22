@@ -1109,6 +1109,38 @@ class AuditCheckpointImportReconciliationResponse(BaseModel):
     matches: bool
 
 
+class AuditCheckpointImportReconciliationItem(BaseModel):
+    """One receipt's current local reconciliation in a list page.
+
+    Carries the existing single-receipt public view exactly (``id``,
+    ``checkpoint_version``, ``events_digest_hex``, ``event_count``,
+    ``received_at``) plus ``local_checkpoint`` -- the four-field checkpoint
+    computed over the complete, unfiltered local audit sequence under the
+    existing checkpoint rules -- and ``matches``, true only when the
+    receipt's ``checkpoint_version``, ``event_count``, and
+    ``events_digest_hex`` all equal that local checkpoint. The imported
+    event array is never echoed.
+    """
+
+    id: str
+    checkpoint_version: str
+    events_digest_hex: str
+    event_count: int
+    received_at: datetime
+    local_checkpoint: AuditEventCheckpointResponse
+    matches: bool
+
+
+class AuditCheckpointImportReconciliationPageResponse(BaseModel):
+    """A cursor-paginated page of receipt local reconciliations."""
+
+    items: list[AuditCheckpointImportReconciliationItem]
+    #: Total number of receipts, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 
