@@ -585,6 +585,44 @@ def list_evidence_bundles_for_content(
     return list(session.execute(stmt).scalars().all())
 
 
+# Reviewer evidence-bundle search paging bounds.
+DEFAULT_EVIDENCE_BUNDLES_LIMIT = 50
+MIN_EVIDENCE_BUNDLES_LIMIT = 1
+MAX_EVIDENCE_BUNDLES_LIMIT = 100
+
+
+def list_evidence_bundles(
+    session: Session,
+    claim_id: str | None = None,
+    evidence_type: str | None = None,
+    media_type: str | None = None,
+    digest_hex: str | None = None,
+) -> list[EvidenceBundle]:
+    """Return existing evidence bundles in stable creation order, filtered.
+
+    Every filter is an exact, case- and whitespace-sensitive string match
+    applied as logical AND; ``None`` means unfiltered. ``digest_hex`` is the
+    strict 64-lowercase-hex spelling already enforced at the boundary.
+    Results follow the bundles' stable creation order (``created_at`` with
+    the monotonic ``seq`` tiebreaker). The search is strictly read-only: it
+    writes no resource, bundle, or audit event, and no referenced claim
+    existence is required, so a filter that matches nothing is an empty
+    result rather than a missing resource. Raw evidence bytes are never
+    stored and therefore never appear here.
+    """
+    stmt = select(EvidenceBundle)
+    if claim_id is not None:
+        stmt = stmt.where(EvidenceBundle.claim_id == claim_id)
+    if evidence_type is not None:
+        stmt = stmt.where(EvidenceBundle.evidence_type == evidence_type)
+    if media_type is not None:
+        stmt = stmt.where(EvidenceBundle.media_type == media_type)
+    if digest_hex is not None:
+        stmt = stmt.where(EvidenceBundle.digest_hex == digest_hex)
+    stmt = stmt.order_by(*_EVIDENCE_BUNDLE_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 def _attestation_identity_select(
     payload: AttestationCreate, signature_digest_hex: str
 ):

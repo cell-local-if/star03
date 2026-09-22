@@ -1232,6 +1232,129 @@ def list_content_evidence_bundles(
     )
 
 
+_EVIDENCE_BUNDLES_PARAMS = frozenset(
+    {
+        "claim_id",
+        "evidence_type",
+        "media_type",
+        "digest_hex",
+        "limit",
+        "cursor",
+    }
+)
+
+
+@router.get("/evidence-bundles", response_model=EvidenceBundlePageResponse)
+def list_evidence_bundles(
+    request: Request,
+    session: DbSession,
+    claim_id: str | None = Query(default=None),
+    evidence_type: str | None = Query(default=None),
+    media_type: str | None = Query(default=None),
+    digest_hex: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> EvidenceBundlePageResponse:
+    # Read-only reviewer search over existing evidence bundles. Raw
+    # multi-values are inspected deliberately: a repeated scalar is rejected
+    # instead of silently taking the last value, undeclared parameters are
+    # rejected rather than ignored, and a blank filter/limit is never
+    # coerced to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _EVIDENCE_BUNDLES_PARAMS
+    if unknown:
+        # A typo (e.g. ``evidence_types``) never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    claim_id = _parse_nonempty_filter(raw, "claim_id")
+    evidence_type = _parse_nonempty_filter(raw, "evidence_type")
+    media_type = _parse_nonempty_filter(raw, "media_type")
+    digest_hex = _parse_digest_hex_param(raw, "digest_hex")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_EVIDENCE_BUNDLES_LIMIT,
+        service.MIN_EVIDENCE_BUNDLES_LIMIT,
+        service.MAX_EVIDENCE_BUNDLES_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.evidence_bundles_cursor_secret,
+                pagination.EVIDENCE_BUNDLES_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter and the effective limit must match exactly.
+        expected = {
+            "claim_id": claim_id,
+            "evidence_type": evidence_type,
+            "media_type": media_type,
+            "digest_hex": digest_hex,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no resource, bundle, or audit
+    # event. No filter value is resolved for existence, so no match is an
+    # empty collection rather than a 404.
+    items = service.list_evidence_bundles(
+        session, claim_id, evidence_type, media_type, digest_hex
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.evidence_bundles_cursor_secret,
+                pagination.EVIDENCE_BUNDLES_CURSOR,
+                {
+                    "claim_id": claim_id,
+                    "evidence_type": evidence_type,
+                    "media_type": media_type,
+                    "digest_hex": digest_hex,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the existing bundle public view: associations, digest,
+    # metadata, and UTC timestamp. Raw evidence bytes are never stored and
+    # so can never be echoed.
+    return EvidenceBundlePageResponse(
+        items=[_bundle_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+
+
 def _attestation_response(attestation) -> AttestationResponse:
     # The raw signature is never available here: only the stored public key
     # bytes and signature digest leave the service.

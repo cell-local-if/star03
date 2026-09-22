@@ -56,6 +56,9 @@ CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "cr1"
 #: Marker for cursors that page through the reviewer claim search.
 CLAIMS_CURSOR_VERSION = "cl1"
 
+#: Marker for cursors that page through the reviewer evidence-bundle search.
+EVIDENCE_BUNDLES_CURSOR_VERSION = "eb1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -353,6 +356,44 @@ CLAIMS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_claims_claims,
+)
+
+
+def _validate_evidence_bundles_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null) or non-empty strings;
+    # matching is case- and whitespace-sensitive, so the raw value is bound.
+    _optional_nonempty_str(claims, "claim_id")
+    _optional_nonempty_str(claims, "evidence_type")
+    _optional_nonempty_str(claims, "media_type")
+    # The digest filter is absent (null) or the strict 64 lowercase hex
+    # spelling; an uppercase or trimmed spelling is a different value and is
+    # never normalized.
+    digest = claims["digest_hex"]
+    if digest is not None and (
+        not isinstance(digest, str) or not _HEX64_LOWER.fullmatch(digest)
+    ):
+        raise InvalidCursorError("cursor digest_hex is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/evidence-bundles``.
+EVIDENCE_BUNDLES_CURSOR = CursorKind(
+    version=EVIDENCE_BUNDLES_CURSOR_VERSION,
+    claim_fields=(
+        "claim_id",
+        "evidence_type",
+        "media_type",
+        "digest_hex",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_evidence_bundles_claims,
 )
 
 
