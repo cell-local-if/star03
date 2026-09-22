@@ -43,6 +43,7 @@ EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
 EVENT_ATTESTATION_CREATED = "attestation.created"
 EVENT_ATTESTATION_REVOKED = "attestation.revoked"
 EVENT_ATTESTATION_ACCESS_GRANTED = "attestation.access_granted"
+EVENT_ATTESTATION_ACCESS_GRANT_REVOKED = "attestation.access_grant_revoked"
 EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
@@ -428,6 +429,73 @@ class AttestationAccessGrant(Base):
 
     attestation: Mapped[Attestation] = relationship()
     grantee_actor: Mapped[Actor] = relationship()
+
+
+class AttestationAccessGrantRevocation(Base):
+    """An immutable revocation of one existing read-only proof-access grant.
+
+    A revocation is an append-only statement by the attestation's signer that
+    a previously issued :class:`AttestationAccessGrant` no longer authorizes
+    its grantee to read the proof through the protected endpoint. It neither
+    mutates nor deletes the grant or the attestation: the original grant, its
+    ``attestation.access_granted`` audit relationship, and the attestation
+    itself are preserved. The signer retains their own read access, and other
+    unrevoked grants held by the same grantee are unaffected. Revocations are
+    append-only and immutable: there is deliberately no update or delete
+    path.
+
+    Only the signer of the grant's attestation may create a revocation. The
+    ``(grant_id, revoker_actor_id, reason)`` triple is unique, so a retried
+    submission for the same three fields returns the original record; a
+    different reason is an independent archival record. The record stores no
+    private key, raw signature, claim payload, content, or evidence bytes.
+    """
+
+    __tablename__ = "attestation_access_grant_revocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "grant_id",
+            "revoker_actor_id",
+            "reason",
+            name="uq_attestation_access_grant_revocations_identity",
+        ),
+        Index(
+            "ix_attestation_access_grant_revocations_grant_order",
+            "grant_id",
+            "created_at",
+            "seq",
+        ),
+        Index(
+            "ix_attestation_access_grant_revocations_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("agr_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    grant_id: Mapped[str] = mapped_column(
+        String(80),
+        ForeignKey("attestation_access_grants.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    #: The signer recording the revocation; must be the signer of the
+    #: attestation the grant concerns.
+    revoker_actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: Non-empty, human/audit rationale; stored verbatim (trimmed) text.
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    grant: Mapped[AttestationAccessGrant] = relationship()
+    revoker_actor: Mapped[Actor] = relationship()
 
 
 class AuthenticationKeyRotation(Base):

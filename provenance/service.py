@@ -34,6 +34,7 @@ from provenance.errors import (
 from provenance.models import (
     EVENT_ACTOR_CREATED,
     EVENT_ATTESTATION_ACCESS_GRANTED,
+    EVENT_ATTESTATION_ACCESS_GRANT_REVOKED,
     EVENT_ATTESTATION_CREATED,
     EVENT_ATTESTATION_REVOKED,
     EVENT_AUDIT_CHECKPOINT_IMPORTED,
@@ -48,6 +49,7 @@ from provenance.models import (
     Actor,
     Attestation,
     AttestationAccessGrant,
+    AttestationAccessGrantRevocation,
     AttestationRevocation,
     AuthenticationKeyRotation,
     AuditEvent,
@@ -62,6 +64,7 @@ from provenance.models import (
 from provenance.schemas import (
     ActorCreate,
     AttestationAccessGrantCreate,
+    AttestationAccessGrantRevocationCreate,
     AttestationCreate,
     AttestationRevocationCreate,
     AuditCheckpointImportCreate,
@@ -96,6 +99,10 @@ _ATTESTATION_REVOCATION_ORDER = (
 _ATTESTATION_ACCESS_GRANT_ORDER = (
     AttestationAccessGrant.created_at.asc(),
     AttestationAccessGrant.seq.asc(),
+)
+_ATTESTATION_ACCESS_GRANT_REVOCATION_ORDER = (
+    AttestationAccessGrantRevocation.created_at.asc(),
+    AttestationAccessGrantRevocation.seq.asc(),
 )
 _CONTENT_RELATION_ORDER = (
     ContentRelation.created_at.asc(),
@@ -1185,14 +1192,102 @@ def create_attestation_access_grant(
     return grant, True
 
 
+def create_attestation_access_grant_revocation(
+    session: Session,
+    payload: AttestationAccessGrantRevocationCreate,
+    caller_actor_id: str,
+) -> tuple[AttestationAccessGrantRevocation, bool]:
+    """Revoke an existing read-access grant, returning ``(record, created)``.
+
+    The authenticated caller must be the ``signer_actor_id`` of the
+    attestation the grant concerns; the grant must already exist. Every
+    rejected request -- an unknown grant or a caller who is not the signer --
+    is a ``422`` validation error and writes nothing. The grant and the
+    attestation are never mutated or deleted: only an append-only revocation
+    record is added.
+
+    A repeat submission for the same grant, revoking actor, and (trimmed)
+    reason returns the existing record with ``created=False`` and writes no
+    row or audit event; a different reason forms an independent, immutable
+    record. On first creation the revocation row and its
+    ``attestation.access_grant_revoked`` audit event commit in a single
+    transaction. No private key, raw signature, claim payload, content, or
+    evidence byte is ever stored.
+    """
+    grant = session.execute(
+        select(AttestationAccessGrant).where(
+            AttestationAccessGrant.id == payload.grant_id
+        )
+    ).scalar_one_or_none()
+    if grant is None:
+        raise ProtectedAccessValidationError("grant_not_found")
+
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == grant.attestation_id)
+    ).scalar_one_or_none()
+    # A stored grant always references a stored attestation; the guard
+    # preserves the 422 contract even against anomalous history.
+    if attestation is None:  # pragma: no cover - defensive
+        raise ProtectedAccessValidationError("grant_not_found")
+
+    if attestation.signer_actor_id != caller_actor_id:
+        raise ProtectedAccessValidationError("caller_not_signer")
+
+    existing = session.execute(
+        select(AttestationAccessGrantRevocation).where(
+            AttestationAccessGrantRevocation.grant_id == payload.grant_id,
+            AttestationAccessGrantRevocation.revoker_actor_id == caller_actor_id,
+            AttestationAccessGrantRevocation.reason == payload.reason,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    revocation = AttestationAccessGrantRevocation(
+        id=ids.attestation_access_grant_revocation_id(
+            payload.grant_id, caller_actor_id, payload.reason
+        ),
+        grant_id=payload.grant_id,
+        revoker_actor_id=caller_actor_id,
+        reason=payload.reason,
+    )
+    session.add(revocation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_ATTESTATION_ACCESS_GRANT_REVOKED,
+            resource_id=revocation.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical revocation won the race: return its record.
+        session.rollback()
+        raced = session.execute(
+            select(AttestationAccessGrantRevocation).where(
+                AttestationAccessGrantRevocation.grant_id == payload.grant_id,
+                AttestationAccessGrantRevocation.revoker_actor_id
+                == caller_actor_id,
+                AttestationAccessGrantRevocation.reason == payload.reason,
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(revocation)
+    return revocation, True
+
+
 def get_accessible_attestation(
     session: Session, attestation_id: str, actor_id: str
 ) -> Attestation | None:
     """Return the attestation iff ``actor_id`` may read it, else ``None``.
 
     The attestation's signer and any grantee holding an access grant for
-    this exact attestation may read it. The function is strictly read-only:
-    it performs no resource or audit writes.
+    this exact attestation that carries no revocation may read it. A grant
+    with any recorded revocation no longer authorizes its grantee, even
+    though the grant row is retained. The function is strictly read-only: it
+    performs no resource or audit writes.
     """
     attestation = session.execute(
         select(Attestation).where(Attestation.id == attestation_id)
@@ -1201,10 +1296,14 @@ def get_accessible_attestation(
         return None
     if attestation.signer_actor_id == actor_id:
         return attestation
+    revoked_grant = exists().where(
+        AttestationAccessGrantRevocation.grant_id == AttestationAccessGrant.id
+    )
     grant_exists = session.execute(
         select(AttestationAccessGrant.id).where(
             AttestationAccessGrant.attestation_id == attestation_id,
             AttestationAccessGrant.grantee_actor_id == actor_id,
+            ~revoked_grant,
         )
     ).first()
     return attestation if grant_exists is not None else None

@@ -31,6 +31,8 @@ from provenance.schemas import (
     ActorResponse,
     AttestationAccessGrantCreate,
     AttestationAccessGrantResponse,
+    AttestationAccessGrantRevocationCreate,
+    AttestationAccessGrantRevocationResponse,
     AttestationCreate,
     AttestationListResponse,
     AttestationResponse,
@@ -1615,6 +1617,35 @@ async def create_attestation_access_grant(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return AttestationAccessGrantResponse.model_validate(grant)
+
+
+@router.post(
+    "/attestation-access-grant-revocations",
+    response_model=AttestationAccessGrantRevocationResponse,
+)
+async def create_attestation_access_grant_revocation(
+    request: Request,
+    payload: AttestationAccessGrantRevocationCreate,
+    session: DbSession,
+    response: Response,
+) -> AttestationAccessGrantRevocationResponse:
+    # The signature covers the exact bytes on the wire; FastAPI's parsed
+    # model is built from the same cached body, so body_sha256 matches what
+    # the client signed.
+    raw_body = await request.body()
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    revocation, created = service.create_attestation_access_grant_revocation(
+        session, payload, caller
+    )
+    # First creation -> 201; a retried submission for the same grant,
+    # revoking signer, and reason -> 200 with the original record and no new
+    # audit event.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return AttestationAccessGrantRevocationResponse.model_validate(revocation)
 
 
 @router.get(
