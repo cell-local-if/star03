@@ -54,6 +54,7 @@ from provenance.schemas import (
     ClaimCreate,
     ClaimExportItem,
     ClaimListResponse,
+    ClaimPageResponse,
     ClaimResponse,
     ContentCreate,
     ContentExportResponse,
@@ -388,6 +389,151 @@ def create_claim(
 def get_claim(claim_id: str, session: DbSession) -> ClaimResponse:
     claim = service.get_claim(session, claim_id)
     return ClaimResponse.model_validate(claim)
+
+
+_CLAIMS_PARAMS = frozenset(
+    {
+        "content_id",
+        "actor_id",
+        "claim_type",
+        "payload_digest_hex",
+        "limit",
+        "cursor",
+    }
+)
+
+_HEX64_LOWER_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _parse_digest_hex_param(raw, field: str) -> str | None:
+    """Parse an optional strict 64-lowercase-hex digest filter, at most once."""
+    value = _parse_once(raw, field)
+    if value is None:
+        return None
+    if not value.strip():
+        raise _query_validation_error(
+            field, f"{field} must not be empty", "value_error"
+        )
+    if not _HEX64_LOWER_RE.fullmatch(value):
+        # Uppercase, whitespace-padded, wrong-length, or non-hex spellings
+        # are rejected rather than lowercased or trimmed.
+        raise _query_validation_error(
+            field,
+            f"{field} must be exactly 64 lowercase hexadecimal characters",
+            "value_error",
+        )
+    return value
+
+
+@router.get("/claims", response_model=ClaimPageResponse)
+def list_claims(
+    request: Request,
+    session: DbSession,
+    content_id: str | None = Query(default=None),
+    actor_id: str | None = Query(default=None),
+    claim_type: str | None = Query(default=None),
+    payload_digest_hex: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> ClaimPageResponse:
+    # Read-only reviewer search over existing immutable claims. Raw
+    # multi-values are inspected deliberately: a repeated scalar is rejected
+    # instead of silently taking the last value, undeclared parameters are
+    # rejected rather than ignored, and a blank filter/limit is never coerced
+    # to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _CLAIMS_PARAMS
+    if unknown:
+        # A typo (e.g. ``claim_types``) never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    content_id = _parse_nonempty_filter(raw, "content_id")
+    actor_id = _parse_nonempty_filter(raw, "actor_id")
+    claim_type = _parse_nonempty_filter(raw, "claim_type")
+    payload_digest_hex = _parse_digest_hex_param(raw, "payload_digest_hex")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CLAIMS_LIMIT,
+        service.MIN_CLAIMS_LIMIT,
+        service.MAX_CLAIMS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.claims_cursor_secret,
+                pagination.CLAIMS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter and the effective limit must match exactly.
+        expected = {
+            "content_id": content_id,
+            "actor_id": actor_id,
+            "claim_type": claim_type,
+            "payload_digest_hex": payload_digest_hex,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no resource, claim, or audit
+    # event. No filter value is resolved for existence, so no match is an
+    # empty collection rather than a 404.
+    items = service.list_claims(
+        session, content_id, actor_id, claim_type, payload_digest_hex
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.claims_cursor_secret,
+                pagination.CLAIMS_CURSOR,
+                {
+                    "content_id": content_id,
+                    "actor_id": actor_id,
+                    "claim_type": claim_type,
+                    "payload_digest_hex": payload_digest_hex,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the existing claim public view: associations, digest, and
+    # UTC timestamp. The raw payload is never stored and so can never be
+    # echoed.
+    return ClaimPageResponse(
+        items=[ClaimResponse.model_validate(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
 
 
 @router.get("/contents/{content_id}/claims", response_model=ClaimListResponse)

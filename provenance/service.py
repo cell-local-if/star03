@@ -282,6 +282,44 @@ def list_claims_for_content(session: Session, content_id: str) -> list[Claim]:
     return list(session.execute(stmt).scalars().all())
 
 
+# Reviewer claim search paging bounds.
+DEFAULT_CLAIMS_LIMIT = 50
+MIN_CLAIMS_LIMIT = 1
+MAX_CLAIMS_LIMIT = 100
+
+
+def list_claims(
+    session: Session,
+    content_id: str | None = None,
+    actor_id: str | None = None,
+    claim_type: str | None = None,
+    payload_digest_hex: str | None = None,
+) -> list[Claim]:
+    """Return existing immutable claims in stable creation order, filtered.
+
+    Every filter is an exact, case- and whitespace-sensitive string match
+    applied as logical AND; ``None`` means unfiltered.
+    ``payload_digest_hex`` is the strict 64-lowercase-hex spelling already
+    enforced at the boundary. Results follow the claims' stable creation
+    order (``created_at`` with the monotonic ``seq`` tiebreaker). The search
+    is strictly read-only: it writes no claim, resource, or audit event, and
+    no referenced content/actor existence is required, so a filter that
+    matches nothing is an empty result rather than a missing resource. The
+    raw payload is never stored and therefore never appears here.
+    """
+    stmt = select(Claim)
+    if content_id is not None:
+        stmt = stmt.where(Claim.content_id == content_id)
+    if actor_id is not None:
+        stmt = stmt.where(Claim.actor_id == actor_id)
+    if claim_type is not None:
+        stmt = stmt.where(Claim.claim_type == claim_type)
+    if payload_digest_hex is not None:
+        stmt = stmt.where(Claim.payload_digest_hex == payload_digest_hex)
+    stmt = stmt.order_by(*_CLAIM_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 def _evidence_bundle_identity(payload: EvidenceBundleCreate) -> tuple[str, str, str, str]:
     """The dedup identity of a bundle: claim, type, algorithm, and digest."""
     return (
