@@ -39,6 +39,8 @@ from provenance.schemas import (
     AttestationRevocationResponse,
     AuditCheckpointImportCreate,
     AuditCheckpointImportPageResponse,
+    AuditCheckpointImportReconciliationItem,
+    AuditCheckpointImportReconciliationPageResponse,
     AuditCheckpointImportReconciliationResponse,
     AuditCheckpointImportResponse,
     AuditCheckpointVerificationCreate,
@@ -1902,4 +1904,125 @@ def reconcile_audit_events_checkpoint_import(
         import_id=record.id,
         local_checkpoint=local_checkpoint,
         matches=matches,
+    )
+
+
+_CHECKPOINT_IMPORT_RECONCILIATIONS_PARAMS = frozenset({"limit", "cursor"})
+
+
+def _checkpoint_import_reconciliation_item(
+    record,
+    local_checkpoint: AuditEventCheckpointResponse,
+) -> AuditCheckpointImportReconciliationItem:
+    # The existing single-receipt public view, with the current local
+    # checkpoint and the match verdict added; the imported event array is
+    # never persisted, read, or echoed.
+    matches = (
+        record.checkpoint_version == local_checkpoint.checkpoint_version
+        and record.event_count == local_checkpoint.event_count
+        and record.events_digest_hex == local_checkpoint.events_digest_hex
+    )
+    return AuditCheckpointImportReconciliationItem(
+        id=record.id,
+        checkpoint_version=record.checkpoint_version,
+        events_digest_hex=record.events_digest_hex,
+        event_count=record.event_count,
+        received_at=record.created_at,
+        local_checkpoint=local_checkpoint,
+        matches=matches,
+    )
+
+
+@router.get(
+    "/audit-events/checkpoint-import-reconciliations",
+    response_model=AuditCheckpointImportReconciliationPageResponse,
+)
+def list_audit_events_checkpoint_import_reconciliations(
+    request: Request,
+    session: DbSession,
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> AuditCheckpointImportReconciliationPageResponse:
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank limit is
+    # never coerced to the default.
+    raw = request.query_params
+
+    unknown = set(raw) - _CHECKPOINT_IMPORT_RECONCILIATIONS_PARAMS
+    if unknown:
+        # The collection accepts only limit/cursor; a typo never silently
+        # changes the page.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CHECKPOINT_IMPORT_RECONCILIATIONS_LIMIT,
+        service.MIN_CHECKPOINT_IMPORT_RECONCILIATIONS_LIMIT,
+        service.MAX_CHECKPOINT_IMPORT_RECONCILIATIONS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.checkpoint_import_reconciliations_cursor_secret,
+                pagination.CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the collection is
+        # unfiltered, so the effective limit is the only bound claim.
+        if claims["limit"] != page_limit:
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the listing writes no resource, receipt, or audit
+    # event. Receipts follow stable creation order.
+    records = service.list_audit_checkpoint_import_reconciliations(session)
+    total = len(records)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = records[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.checkpoint_import_reconciliations_cursor_secret,
+                pagination.CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR,
+                {"limit": page_limit, "offset": next_offset},
+            )
+
+    # The local checkpoint is computed once over the current, unfiltered
+    # local audit-event sequence under the existing checkpoint rules; every
+    # receipt on the page is reconciled against exactly that read state. The
+    # imported event arrays are never read or echoed.
+    local_checkpoint = _local_audit_checkpoint(session)
+    items = [
+        _checkpoint_import_reconciliation_item(record, local_checkpoint)
+        for record in page
+    ]
+
+    return AuditCheckpointImportReconciliationPageResponse(
+        items=items,
+        count=total,
+        next_cursor=next_cursor,
     )

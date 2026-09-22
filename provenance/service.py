@@ -1340,6 +1340,28 @@ def list_audit_checkpoint_imports(
     return list(session.execute(stmt).scalars().all())
 
 
+# Checkpoint-import reconciliation listing paging bounds.
+DEFAULT_CHECKPOINT_IMPORT_RECONCILIATIONS_LIMIT = 50
+MIN_CHECKPOINT_IMPORT_RECONCILIATIONS_LIMIT = 1
+MAX_CHECKPOINT_IMPORT_RECONCILIATIONS_LIMIT = 100
+
+
+def list_audit_checkpoint_import_reconciliations(
+    session: Session,
+) -> list[CheckpointImportRecord]:
+    """Return every checkpoint-import receipt in stable creation order.
+
+    The reconciliation collection is unfiltered; each receipt's local
+    reconciliation is computed by the caller against the current,
+    unfiltered local audit-event checkpoint. Results follow the receipts'
+    stable creation order (``created_at`` with the monotonic ``seq``
+    tiebreaker). The function is strictly read-only: it writes no resource
+    and no audit event.
+    """
+    stmt = select(CheckpointImportRecord).order_by(*_CHECKPOINT_IMPORT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 # Exchange-import receipt search paging bounds.
 DEFAULT_EXCHANGE_IMPORTS_LIMIT = 50
 MIN_EXCHANGE_IMPORTS_LIMIT = 1

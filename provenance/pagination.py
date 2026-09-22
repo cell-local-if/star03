@@ -46,6 +46,9 @@ EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "ir1"
 #: Marker for cursors that page through checkpoint-import receipts.
 CHECKPOINT_IMPORTS_CURSOR_VERSION = "ci1"
 
+#: Marker for cursors that page through checkpoint-import reconciliations.
+CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "cr1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -283,6 +286,28 @@ CHECKPOINT_IMPORTS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_checkpoint_imports_claims,
+)
+
+
+def _validate_checkpoint_import_reconciliations_claims(
+    claims: dict[str, Any],
+) -> None:
+    # The collection takes no filters: the cursor binds only limit/offset.
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for
+#: ``GET /v1/audit-events/checkpoint-import-reconciliations``.
+CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR = CursorKind(
+    version=CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR_VERSION,
+    claim_fields=("limit", "offset"),
+    validate=_validate_checkpoint_import_reconciliations_claims,
 )
 
 
