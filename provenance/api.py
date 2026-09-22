@@ -39,6 +39,7 @@ from provenance.schemas import (
     AttestationRevocationResponse,
     AuditCheckpointImportCreate,
     AuditCheckpointImportPageResponse,
+    AuditCheckpointImportReconciliationResponse,
     AuditCheckpointImportResponse,
     AuditCheckpointVerificationCreate,
     AuditCheckpointVerificationResponse,
@@ -1852,3 +1853,50 @@ def get_audit_events_checkpoint_import(
     # event. An unknown id is an explicit, specific 404.
     record = service.get_audit_checkpoint_import(session, import_id)
     return _checkpoint_import_response(record)
+
+
+def _unfiltered_audit_checkpoint(session: Session) -> AuditEventCheckpointResponse:
+    """The current four-field checkpoint over the complete local audit sequence.
+
+    Exactly the ``GET /v1/audit-events/checkpoint`` computation with no
+    filter: every persisted event in stable creation order, rendered to the
+    same ``mode="json"`` wire view and digested under the same canonical
+    rules.
+    """
+    items = service.list_audit_events(session, None, None, None, None)
+    events = [
+        AuditEventItem.model_validate(item).model_dump(mode="json")
+        for item in items
+    ]
+    return _audit_checkpoint_response(events)
+
+
+@router.get(
+    "/audit-events/checkpoint-imports/{import_id}/reconciliation",
+    response_model=AuditCheckpointImportReconciliationResponse,
+)
+def reconcile_audit_events_checkpoint_import(
+    import_id: str, request: Request, session: DbSession
+) -> AuditCheckpointImportReconciliationResponse:
+    # Same boundary as the other checkpoint read routes: any (or repeated)
+    # query parameter is a 422 before the receipt lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only: the reconciliation writes no resource, receipt, or
+    # audit event. An unknown receipt id is the existing
+    # audit_checkpoint_import_not_found 404.
+    record = service.get_audit_checkpoint_import(session, import_id)
+    local_checkpoint = _unfiltered_audit_checkpoint(session)
+    # Only the receipt's three persisted identity fields participate, each
+    # compared for exact equality with the local checkpoint; the imported
+    # event array is never read back (it was never persisted) and no
+    # unpersisted material is consulted.
+    matches = (
+        record.checkpoint_version == local_checkpoint.checkpoint_version
+        and record.event_count == local_checkpoint.event_count
+        and record.events_digest_hex == local_checkpoint.events_digest_hex
+    )
+    return AuditCheckpointImportReconciliationResponse(
+        import_id=record.id,
+        local_checkpoint=local_checkpoint,
+        matches=matches,
+    )
