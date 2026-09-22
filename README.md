@@ -47,6 +47,16 @@ Claims attach a typed, digest-committed statement by an actor to a registered co
 
 The first claim creation and its `claim.created` audit event commit in a single transaction. Non-object payloads, blank claim types, and malformed JSON are `422 validation_error`; unknown contents and actors remain `404 content_not_found` / `unknown_actor`.
 
+## Immutable claim supersessions
+
+A supersession is an immutable, append-only correction of the source statement of one claim by another existing claim that asserts the **same content**. Neither endpoint is mutated or deleted: the original claims and their `claim.created` audit relationships are preserved. There is deliberately no update or delete path for a supersession.
+
+- `POST /v1/claim-supersessions` — body contains exactly the existing `superseded_claim_id` (the older claim), the existing `replacement_claim_id` (the newer claim), and a non-empty `reason` (surrounding whitespace is trimmed). Both endpoints must already exist, must assert the same content, and the two ids must differ; the new edge must not close a supersession cycle (edges point from the superseded claim to its replacement, so an edge is rejected whenever the superseded claim is already reachable from the replacement claim). The first creation returns `201` with the stable `csp_` id, both claim ids, the reason, and a UTC `created_at`. A repeat submission of the same superseded claim, replacement claim, and reason returns `200` with the existing record and adds no row or audit event; a different reason forms an independent record that is separately retained.
+- `GET /v1/claim-supersessions/{supersession_id}` — full public fields, or `404 claim_supersession_not_found` whose details carry the requested `supersession_id`.
+- `GET /v1/claims/{claim_id}/supersessions` — the supersession records in which the claim appears at either end, in stable creation order as `{"items", "count"}`; an unknown claim id is the existing `404 claim_not_found` (a missing claim is never an empty collection).
+
+The first supersession write and its `claim.superseded` audit event commit in a single transaction. An unknown claim at either end is `404 claim_not_found`. Blank or whitespace-only fields, missing or undeclared request fields, malformed JSON, two claims asserting different content, a self-supersession, and an edge that would close a cycle are all `422 validation_error` and write neither a record nor an audit event. Reads and failed requests write no resource or audit event; the body has no field capable of carrying a claim payload, signature, content, or evidence bytes, and the public view never echoes them.
+
 ## Verifiable evidence bundles
 
 Evidence bundles attach externally verifiable evidence to an existing claim by digest alone. The raw evidence bytes are never accepted, persisted, or logged — only the digest algorithm/value, media type, and a metadata object are stored. Bundles are immutable and append-only: there is no update or delete path.

@@ -57,6 +57,9 @@ from provenance.schemas import (
     ClaimListResponse,
     ClaimPageResponse,
     ClaimResponse,
+    ClaimSupersessionCreate,
+    ClaimSupersessionListResponse,
+    ClaimSupersessionResponse,
     ContentCreate,
     ContentExportResponse,
     ContentLineageItem,
@@ -542,6 +545,49 @@ def list_content_claims(content_id: str, session: DbSession) -> ClaimListRespons
     items = service.list_claims_for_content(session, content_id)
     return ClaimListResponse(
         items=[ClaimResponse.model_validate(item) for item in items],
+        count=len(items),
+    )
+
+
+@router.post(
+    "/claim-supersessions",
+    response_model=ClaimSupersessionResponse,
+)
+def create_claim_supersession(
+    payload: ClaimSupersessionCreate, session: DbSession, response: Response
+) -> ClaimSupersessionResponse:
+    record, created = service.create_claim_supersession(session, payload)
+    # First creation -> 201; an idempotent repeat submission of the same
+    # three fields -> 200, and the existing immutable record is returned
+    # unchanged.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return ClaimSupersessionResponse.model_validate(record)
+
+
+@router.get(
+    "/claim-supersessions/{supersession_id}",
+    response_model=ClaimSupersessionResponse,
+)
+def get_claim_supersession(
+    supersession_id: str, session: DbSession
+) -> ClaimSupersessionResponse:
+    # Strictly read-only: a read writes no resource and no audit event.
+    record = service.get_claim_supersession(session, supersession_id)
+    return ClaimSupersessionResponse.model_validate(record)
+
+
+@router.get(
+    "/claims/{claim_id}/supersessions",
+    response_model=ClaimSupersessionListResponse,
+)
+def list_claim_supersessions(
+    claim_id: str, session: DbSession
+) -> ClaimSupersessionListResponse:
+    items = service.list_supersessions_for_claim(session, claim_id)
+    return ClaimSupersessionListResponse(
+        items=[ClaimSupersessionResponse.model_validate(item) for item in items],
         count=len(items),
     )
 

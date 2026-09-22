@@ -184,6 +184,32 @@ class ContentRelationValidationError(DomainError):
         super().__init__(details={"reason": reason})
 
 
+class ClaimSupersessionNotFoundError(DomainError):
+    status_code = 404
+    code = "claim_supersession_not_found"
+    message = "The requested claim supersession does not exist."
+
+    def __init__(self, supersession_id: str):
+        super().__init__(details={"supersession_id": supersession_id})
+
+
+class ClaimSupersessionValidationError(DomainError):
+    """A structurally valid supersession request the graph rejects.
+
+    Self-supersessions, endpoints asserting different content, and edges
+    that would close a cycle render as the same ``validation_error`` code
+    as malformed payloads: both are client input the service refuses to
+    persist.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str):
+        super().__init__(details={"reason": reason})
+
+
 class AttestationVerificationError(DomainError):
     status_code = 422
     code = "attestation_verification_failed"

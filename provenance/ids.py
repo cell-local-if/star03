@@ -62,6 +62,29 @@ def evidence_bundle_id(
     return "evb_" + hashlib.sha256(material).hexdigest()
 
 
+def claim_supersession_id(
+    superseded_claim_id: str, replacement_claim_id: str, reason: str
+) -> str:
+    """Return a stable ``csp_``-prefixed id for a claim supersession.
+
+    The identity is exactly the idempotency key: the superseded claim, its
+    replacement claim, and the (trimmed) reason text. The material is a
+    canonical JSON array so fields containing separators cannot collide
+    with different field splits.
+    """
+    material = json.dumps(
+        [
+            "claim_supersession",
+            superseded_claim_id,
+            replacement_claim_id,
+            reason,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "csp_" + hashlib.sha256(material).hexdigest()
+
+
 def content_relation_id(
     content_id: str,
     parent_content_id: str,

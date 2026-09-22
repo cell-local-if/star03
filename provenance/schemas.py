@@ -239,6 +239,53 @@ class ClaimPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ClaimSupersessionCreate(BaseModel):
+    # A supersession carries exactly its three declared fields; undeclared
+    # fields are rejected rather than silently discarded. There is no field
+    # capable of carrying a claim payload, signature, content, or evidence.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The existing older claim being superseded.
+    superseded_claim_id: str = Field(..., min_length=1, max_length=80)
+    #: The existing newer claim that replaces it; must assert the same
+    #: content and must differ from the superseded claim.
+    replacement_claim_id: str = Field(..., min_length=1, max_length=80)
+    #: Non-empty rationale; surrounding whitespace is trimmed.
+    reason: str = Field(..., min_length=1, max_length=4096)
+
+    @field_validator("superseded_claim_id")
+    @classmethod
+    def _superseded_claim_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "superseded_claim_id")
+
+    @field_validator("replacement_claim_id")
+    @classmethod
+    def _replacement_claim_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "replacement_claim_id")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "reason")
+
+
+class ClaimSupersessionResponse(BaseModel):
+    """Public supersession view: both endpoint ids, the reason, and the time."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    superseded_claim_id: str
+    replacement_claim_id: str
+    reason: str
+    created_at: datetime
+
+
+class ClaimSupersessionListResponse(BaseModel):
+    items: list[ClaimSupersessionResponse]
+    count: int
+
+
 class EvidenceBundleCreate(BaseModel):
     # Evidence bytes must never reach the service: any field not declared
     # here (e.g. "data" or "evidence") is a client error, not silently

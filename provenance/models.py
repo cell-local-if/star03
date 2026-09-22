@@ -38,6 +38,7 @@ SUPPORTED_RELATION_TYPES = frozenset({RELATION_VERSION_OF, RELATION_DERIVED_FROM
 EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
 EVENT_CLAIM_CREATED = "claim.created"
+EVENT_CLAIM_SUPERSEDED = "claim.superseded"
 EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
 EVENT_ATTESTATION_CREATED = "attestation.created"
 EVENT_ATTESTATION_REVOKED = "attestation.revoked"
@@ -148,6 +149,68 @@ class Claim(Base):
 
     content: Mapped[Content] = relationship()
     actor: Mapped[Actor] = relationship()
+
+
+class ClaimSupersession(Base):
+    """An immutable correction: one claim superseded by another on the same content.
+
+    ``superseded_claim_id`` is the older claim whose source statement is
+    being corrected; ``replacement_claim_id`` is the newer claim that
+    replaces it. Both endpoints must be existing claims asserting the same
+    content, and the two ids must differ. Edges point from the superseded
+    claim to its replacement, so the graph must stay acyclic. Supersessions
+    are append-only; there is deliberately no update or delete path.
+    """
+
+    __tablename__ = "claim_supersessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "superseded_claim_id",
+            "replacement_claim_id",
+            "reason",
+            name="uq_claim_supersessions_identity",
+        ),
+        Index(
+            "ix_claim_supersessions_superseded_order",
+            "superseded_claim_id",
+            "created_at",
+            "seq",
+        ),
+        Index(
+            "ix_claim_supersessions_replacement_order",
+            "replacement_claim_id",
+            "created_at",
+            "seq",
+        ),
+        Index("ix_claim_supersessions_created_order", "created_at", "seq"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("csp_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The older claim being superseded (out-edge endpoint).
+    superseded_claim_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("claims.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The newer replacement claim (in-edge endpoint); same content as above.
+    replacement_claim_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("claims.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: Non-empty, human/audit rationale; stored verbatim (trimmed) text.
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    superseded_claim: Mapped[Claim] = relationship(
+        foreign_keys=[superseded_claim_id]
+    )
+    replacement_claim: Mapped[Claim] = relationship(
+        foreign_keys=[replacement_claim_id]
+    )
 
 
 class EvidenceBundle(Base):
