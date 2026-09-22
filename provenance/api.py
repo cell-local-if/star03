@@ -39,6 +39,7 @@ from provenance.schemas import (
     AttestationRevocationResponse,
     AuditCheckpointImportCreate,
     AuditCheckpointImportPageResponse,
+    AuditCheckpointImportReconciliationResponse,
     AuditCheckpointImportResponse,
     AuditCheckpointVerificationCreate,
     AuditCheckpointVerificationResponse,
@@ -1852,3 +1853,53 @@ def get_audit_events_checkpoint_import(
     # event. An unknown id is an explicit, specific 404.
     record = service.get_audit_checkpoint_import(session, import_id)
     return _checkpoint_import_response(record)
+
+
+def _local_audit_checkpoint(session: Session) -> AuditEventCheckpointResponse:
+    """Compute the current unfiltered local audit-event checkpoint.
+
+    Exactly the existing ``GET /v1/audit-events/checkpoint`` rules with no
+    filters: every local event is read once in stable creation order and
+    rendered through the same public wire view, so the fixed version,
+    digest algorithm, event count, canonical digest, and UTC representation
+    are identical to that route. Strictly read-only.
+    """
+    items = service.list_audit_events(session)
+    # mode="json" yields exactly the wire view the search serves (UTC
+    # datetimes as RFC 3339 strings), so the digest is reproducible by an
+    # external verifier from the audit-event listing alone.
+    events = [
+        AuditEventItem.model_validate(item).model_dump(mode="json")
+        for item in items
+    ]
+    return _audit_checkpoint_response(events)
+
+
+@router.get(
+    "/audit-events/checkpoint-imports/{import_id}/reconciliation",
+    response_model=AuditCheckpointImportReconciliationResponse,
+)
+def reconcile_audit_events_checkpoint_import(
+    import_id: str, request: Request, session: DbSession
+) -> AuditCheckpointImportReconciliationResponse:
+    # Same boundary as the other import read routes: any (or repeated)
+    # query parameter is a 422 before the receipt lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only: the reconciliation writes no resource, receipt, or
+    # audit event. An unknown receipt id is the existing
+    # audit_checkpoint_import_not_found 404.
+    record = service.get_audit_checkpoint_import(session, import_id)
+
+    # The current local sequence is always read unfiltered; the receipt's
+    # imported event array is not persisted and is never read or echoed.
+    local_checkpoint = _local_audit_checkpoint(session)
+    matches = (
+        record.checkpoint_version == local_checkpoint.checkpoint_version
+        and record.event_count == local_checkpoint.event_count
+        and record.events_digest_hex == local_checkpoint.events_digest_hex
+    )
+    return AuditCheckpointImportReconciliationResponse(
+        import_id=record.id,
+        local_checkpoint=local_checkpoint,
+        matches=matches,
+    )

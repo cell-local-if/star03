@@ -1091,6 +1091,24 @@ class AuditCheckpointImportPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class AuditCheckpointImportReconciliationResponse(BaseModel):
+    """A read-only reconciliation of one checkpoint-import receipt with local state.
+
+    Exactly three members: the receipt's ``import_id``, the four-field
+    checkpoint computed over the current, unfiltered local audit-event
+    sequence under the existing checkpoint rules
+    (``local_checkpoint``), and ``matches`` -- true only when the receipt's
+    ``checkpoint_version``, ``event_count``, and ``events_digest_hex`` all
+    equal the corresponding local checkpoint fields. The imported event
+    array is never read (it is not persisted) or echoed; no material beyond
+    the receipt identity participates in the verdict.
+    """
+
+    import_id: str
+    local_checkpoint: AuditEventCheckpointResponse
+    matches: bool
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 
