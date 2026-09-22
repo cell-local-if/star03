@@ -101,6 +101,17 @@ class AttestationRevocationNotFoundError(DomainError):
         super().__init__(details={"revocation_id": revocation_id})
 
 
+class AttestationAccessGrantRevocationNotFoundError(DomainError):
+    status_code = 404
+    code = "attestation_access_grant_revocation_not_found"
+    message = (
+        "The requested attestation access grant revocation does not exist."
+    )
+
+    def __init__(self, revocation_id: str):
+        super().__init__(details={"revocation_id": revocation_id})
+
+
 class EvidenceBundleExchangeImportNotFoundError(DomainError):
     status_code = 404
     code = "evidence_bundle_exchange_import_not_found"

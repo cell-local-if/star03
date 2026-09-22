@@ -1,7 +1,10 @@
 """Tests for immutable attestation access-grant revocations.
 
-Covers ``POST /v1/attestation-access-grant-revocations`` and its effect on
-``GET /v1/protected/attestations/{attestation_id}``, including:
+Covers ``POST /v1/attestation-access-grant-revocations``, its effect on
+``GET /v1/protected/attestations/{attestation_id}``, and the two reviewer
+read-only routes ``GET
+/v1/attestation-access-grant-revocations/{revocation_id}`` and ``GET
+/v1/attestation-access-grants/{grant_id}/revocations``, including:
 
 * the same ``X-PA``/``X-PT``/``X-PS`` signed-header contract as the other
   protected write route (compact UTF-8 array, RFC 3339 UTC timestamps, the
@@ -21,6 +24,13 @@ Covers ``POST /v1/attestation-access-grant-revocations`` and its effect on
   grant's grantee is denied with the same opaque 404, and other unrevoked
   grants -- another grantee on the same proof and the same grantee on
   another proof -- are unaffected;
+* the reviewer read boundary: the single-record view returns exactly the
+  public fields (or an explicit 404 for an unknown id), and the per-grant
+  collection returns that grant's records only (an unknown grant is 422
+  ``validation_error``, an existing unrevoked grant is an empty collection),
+  in stable creation order, isolated per grant, with any or repeated query
+  parameter rejected as 422 before the lookup, and zero writes on every
+  read, empty result, miss, and parameter failure;
 * the 422 boundary for credentials, blank/missing/extra fields, and
   malformed JSON, none of which write;
 * append-only immutability (no update or delete path), the absence of any
@@ -484,6 +494,333 @@ def test_protected_reads_after_revocation_write_nothing(client, db_session):
     ) == grants_before
 
 
+# --- Reviewer read routes --------------------------------------------------------
+
+
+def _get_revocation(client, revocation_id, *, query=""):
+    return client.get(f"{REVOCATIONS_PATH}/{revocation_id}{query}")
+
+
+def _list_revocations(client, grant_id, *, query=""):
+    return client.get(f"{GRANTS_PATH}/{grant_id}/revocations{query}")
+
+
+def _two_revoked_grants(client):
+    """Two grants on the same proof, each carrying its own revocation(s)."""
+    attestation = _world(client)
+    grant_to_org2 = _grant(client, attestation["id"], "org-2")
+    grant_to_org3 = _grant(client, attestation["id"], "org-3")
+    first_a = _post_revocation(
+        client, _revocation_body(grant_to_org2["id"], REASON_A)
+    ).json()
+    second_b = _post_revocation(
+        client, _revocation_body(grant_to_org2["id"], REASON_B)
+    ).json()
+    other = _post_revocation(
+        client, _revocation_body(grant_to_org3["id"], REASON_A)
+    ).json()
+    return attestation, grant_to_org2, grant_to_org3, first_a, second_b, other
+
+
+# --- Single-record detail view ---------------------------------------------------
+
+
+def test_get_revocation_returns_the_created_record_without_credentials(client):
+    # Reviewer access: no X-PA/X-PT/X-PS headers are required.
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    created = _post_revocation(client, _revocation_body(grant["id"])).json()
+    resp = _get_revocation(client, created["id"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == created
+
+
+def test_get_revocation_view_carries_exactly_the_public_fields(client):
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    created = _post_revocation(client, _revocation_body(grant["id"])).json()
+    body = _get_revocation(client, created["id"]).json()
+    assert set(body) == {
+        "id",
+        "grant_id",
+        "revoker_actor_id",
+        "reason",
+        "created_at",
+    }
+    assert body["id"] == created["id"]
+    assert body["grant_id"] == grant["id"]
+    assert body["revoker_actor_id"] == "org-1"
+    assert body["reason"] == REASON_A
+    created_at = datetime.fromisoformat(body["created_at"])
+    assert created_at.utcoffset().total_seconds() == 0
+    assert body["created_at"].endswith(("Z", "+00:00"))
+    # No private key, raw signature, authentication header, claim payload,
+    # content/evidence bytes, or internal surrogate is ever rendered.
+    for forbidden in (
+        "signature",
+        "public_key",
+        "signature_digest_hex",
+        "payload",
+        "content",
+        "evidence",
+        "headers",
+        "seq",
+        "attestation_id",
+    ):
+        assert forbidden not in body
+
+
+def test_get_revocation_id_is_never_reverse_looked_up_by_other_fields(client):
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    created = _post_revocation(client, _revocation_body(grant["id"])).json()
+    # The id of the grant itself and of its attestation are not revocation
+    # ids: each is a plain id lookup that misses, never a field-based search.
+    for foreign_id in (grant["id"], attestation["id"]):
+        resp = _get_revocation(client, foreign_id)
+        assert resp.status_code == 404, foreign_id
+
+
+def test_get_unknown_revocation_is_an_explicit_404(client):
+    _world(client)
+    for unknown_id in ("agr_ghost", "agr_" + "0" * 64):
+        resp = _get_revocation(client, unknown_id)
+        assert resp.status_code == 404, unknown_id
+        error = resp.json()["error"]
+        assert error["code"] == "attestation_access_grant_revocation_not_found"
+        assert error["details"]["revocation_id"] == unknown_id
+
+
+# --- Per-grant collection ---------------------------------------------------------
+
+
+def test_list_for_grant_returns_exactly_items_and_count_envelope(client):
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    _post_revocation(client, _revocation_body(grant["id"]))
+    body = _list_revocations(client, grant["id"]).json()
+    assert set(body) == {"items", "count"}
+    assert body["count"] == 1
+    assert set(body["items"][0]) == {
+        "id",
+        "grant_id",
+        "revoker_actor_id",
+        "reason",
+        "created_at",
+    }
+
+
+def test_list_for_grant_returns_its_records_in_stable_creation_order(client):
+    _att, grant, _other, first_a, second_b, _other_rev = _two_revoked_grants(
+        client
+    )
+    resp = _list_revocations(client, grant["id"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 2
+    assert [item["id"] for item in body["items"]] == [
+        first_a["id"],
+        second_b["id"],
+    ]
+    assert [item["reason"] for item in body["items"]] == [REASON_A, REASON_B]
+    for item in body["items"]:
+        assert item["grant_id"] == grant["id"]
+
+
+def test_listing_is_isolated_per_grant_even_with_shared_reason_text(client):
+    _att, grant_a, grant_b, first_a, second_b, other = _two_revoked_grants(
+        client
+    )
+    list_a = _list_revocations(client, grant_a["id"]).json()
+    list_b = _list_revocations(client, grant_b["id"]).json()
+    assert [i["id"] for i in list_a["items"]] == [
+        first_a["id"],
+        second_b["id"],
+    ]
+    assert list_a["count"] == 2
+    # The same reason text on a different grant never bleeds across.
+    assert [i["id"] for i in list_b["items"]] == [other["id"]]
+    assert list_b["items"][0]["reason"] == REASON_A
+    assert list_b["count"] == 1
+
+
+def test_listing_does_not_reverse_lookup_an_attestation_or_revocation_id(client):
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    created = _post_revocation(client, _revocation_body(grant["id"])).json()
+    # Only a grant id scopes the collection: an attestation id or the
+    # revocation's own id in the path is an unknown *grant*, not a hit.
+    for foreign_id in (attestation["id"], created["id"]):
+        resp = _list_revocations(client, foreign_id)
+        assert resp.status_code == 422, foreign_id
+        error = resp.json()["error"]
+        assert error["code"] == "validation_error"
+        assert error["details"]["reason"] == "grant_not_found"
+
+
+def test_existing_grant_without_revocations_is_empty_collection(client):
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    resp = _list_revocations(client, grant["id"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"items": [], "count": 0}
+
+
+def test_unknown_grant_is_422_validation_error_not_an_empty_collection(client):
+    _world(client)
+    resp = _list_revocations(client, "aag_ghost")
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["details"]["reason"] == "grant_not_found"
+
+
+def test_per_grant_collection_requires_no_credentials(client):
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    _post_revocation(client, _revocation_body(grant["id"]))
+    # A bare GET with no signed headers is a valid reviewer read.
+    resp = client.get(f"{GRANTS_PATH}/{grant['id']}/revocations")
+    assert resp.status_code == 200, resp.text
+
+
+# --- Query-parameter boundary and its priority over lookups -----------------------
+
+
+def test_get_revocation_rejects_any_or_repeated_query_parameter(client):
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    created = _post_revocation(client, _revocation_body(grant["id"])).json()
+    base = f"{REVOCATIONS_PATH}/{created['id']}"
+    # (query string, rejected parameter name -- the lexicographically first
+    # distinct name, which is all of them when only one is present).
+    cases = (
+        ("?a=1", "a"),
+        ("?unknown=", "unknown"),
+        ("?limit=1", "limit"),
+        ("?a=1&b=2", "a"),
+        ("?a=1&a=2", "a"),
+    )
+    for query, field in cases:
+        resp = client.get(base + query)
+        assert resp.status_code == 422, query
+        error = resp.json()["error"]
+        assert error["code"] == "validation_error"
+        issue = error["details"]["issues"][0]
+        assert issue["loc"] == ["query", field]
+        assert "unknown query parameter" in issue["msg"]
+
+
+def test_get_revocation_param_failure_precedes_the_404_lookup(client):
+    # With an unknown id the read would be 404; any parameter must instead
+    # produce 422 before the lookup runs.
+    resp = client.get(f"{REVOCATIONS_PATH}/agr_ghost?anything=1")
+    assert resp.status_code == 422, resp.text
+    issue = resp.json()["error"]["details"]["issues"][0]
+    assert issue["loc"] == ["query", "anything"]
+    # A repeated parameter is rejected the same way, not collapsed.
+    repeated = client.get(f"{REVOCATIONS_PATH}/agr_ghost?x=1&x=2")
+    assert repeated.status_code == 422
+    assert repeated.json()["error"]["details"]["issues"][0]["loc"] == [
+        "query",
+        "x",
+    ]
+
+
+def test_list_rejects_any_or_repeated_query_parameter_before_grant_lookup(client):
+    # An unknown grant is itself 422; distinguish parameter failure from
+    # grant_not_found by the issue-shaped details, proving params win.
+    resp = client.get(f"{GRANTS_PATH}/aag_ghost/revocations?anything=1")
+    assert resp.status_code == 422, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["details"]["issues"][0]["loc"] == ["query", "anything"]
+
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    _post_revocation(client, _revocation_body(grant["id"]))
+    base = f"{GRANTS_PATH}/{grant['id']}/revocations"
+    for query in ("?a=1", "?cursor=", "?a=1&b=2", "?a=1&a=2"):
+        rejected = client.get(base + query)
+        assert rejected.status_code == 422, query
+        assert rejected.json()["error"]["code"] == "validation_error"
+
+
+# --- Strictly read-only -------------------------------------------------------------
+
+
+def test_reviewer_reads_never_write_grants_revocations_or_audit(client, db_session):
+    attestation = _world(client)
+    grant = _grant(client, attestation["id"], "org-2")
+    created = _post_revocation(client, _revocation_body(grant["id"])).json()
+    unrevoked = _grant(client, attestation["id"], "org-3")
+
+    grants_before = len(
+        db_session.execute(select(AttestationAccessGrant)).scalars().all()
+    )
+    revocations_before = _revocation_count(db_session)
+    events_before = _audit_count(db_session)
+
+    responses = (
+        _get_revocation(client, created["id"]),                       # 200
+        _get_revocation(client, "agr_ghost"),                         # 404 miss
+        _list_revocations(client, grant["id"]),                       # 200
+        _list_revocations(client, unrevoked["id"]),                   # empty
+        _list_revocations(client, "aag_ghost"),                       # 422
+        client.get(f"{REVOCATIONS_PATH}/{created['id']}?bad=1"),      # 422
+        client.get(f"{GRANTS_PATH}/{grant['id']}/revocations?bad=1"),# 422
+    )
+    assert [r.status_code for r in responses] == [200, 404, 200, 200, 422, 422, 422]
+
+    # Repeat the successful reads; determinism plus still zero writes.
+    assert _get_revocation(client, created["id"]).json() == created
+    assert [
+        i["id"] for i in _list_revocations(client, grant["id"]).json()["items"]
+    ] == [created["id"]]
+
+    db_session.expire_all()
+    assert len(
+        db_session.execute(select(AttestationAccessGrant)).scalars().all()
+    ) == grants_before
+    assert _revocation_count(db_session) == revocations_before
+    assert _audit_count(db_session) == events_before
+    # The unrevoked grant is untouched and still authorizes its grantee.
+    assert (
+        _get_protected(client, attestation["id"], actor="org-3", seed=SEED_C).status_code
+        == 200
+    )
+    assert (
+        _get_protected(client, attestation["id"], actor="org-2", seed=SEED_B).status_code
+        == 404
+    )
+
+
+def test_reviewer_reads_persist_unchanged_across_a_restart(
+    tmp_db_url, file_client
+):
+    from fastapi.testclient import TestClient
+
+    from provenance.app import create_app
+    from provenance.config import Settings
+
+    attestation = _world(file_client)
+    grant = _grant(file_client, attestation["id"], "org-2")
+    first = _post_revocation(
+        file_client, _revocation_body(grant["id"], REASON_A)
+    ).json()
+    second = _post_revocation(
+        file_client, _revocation_body(grant["id"], REASON_B)
+    ).json()
+
+    restarted = create_app(Settings(database_url=tmp_db_url))
+    with TestClient(restarted) as client:
+        assert _get_revocation(client, first["id"]).json() == first
+        body = _list_revocations(client, grant["id"]).json()
+        assert body["count"] == 2
+        assert [i["id"] for i in body["items"]] == [first["id"], second["id"]]
+        assert _get_revocation(client, "agr_ghost").status_code == 404
+
+
 # --- Signed-header contract on the write route ---------------------------------
 
 
@@ -663,22 +1000,24 @@ def test_revocation_collection_rejects_non_post_methods(client):
         assert resp.json()["error"]["code"] == "method_not_allowed"
 
 
-def test_no_individual_revocation_resource_can_be_read_updated_or_deleted(client):
+def test_individual_revocation_resource_cannot_be_updated_or_deleted(client):
     attestation = _world(client)
     grant = _grant(client, attestation["id"], "org-2")
     created = _post_revocation(client, _revocation_body(grant["id"])).json()
     url = f"{REVOCATIONS_PATH}/{created['id']}"
-    # No sub-resource route exists at all: nothing can mutate or remove it.
+    # The individual resource has a read-only reviewer GET but no update or
+    # delete path: every mutation attempt is 405 method_not_allowed.
     for method, kwargs in (
-        ("get", {}),
         ("put", {"json": {"reason": "changed"}}),
         ("patch", {"json": {"reason": "changed"}}),
         ("delete", {}),
     ):
         resp = getattr(client, method)(url, **kwargs)
-        assert resp.status_code == 404, method
+        assert resp.status_code == 405, method
+        assert resp.json()["error"]["code"] == "method_not_allowed"
 
     # The record is unchanged and still governs the read boundary.
+    assert client.get(url).json() == created
     assert (
         _get_protected(client, attestation["id"], actor="org-2", seed=SEED_B).status_code
         == 404

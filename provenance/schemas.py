@@ -986,6 +986,13 @@ class AttestationAccessGrantRevocationResponse(BaseModel):
     created_at: datetime
 
 
+class AttestationAccessGrantRevocationListResponse(BaseModel):
+    """The revocation records of one existing access grant."""
+
+    items: list[AttestationAccessGrantRevocationResponse]
+    count: int
+
+
 class AuditEventItem(BaseModel):
     """Public audit-event view: type, resource, and UTC timestamp only."""
 

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from provenance import canonical, ed25519, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
+    AttestationAccessGrantRevocationNotFoundError,
     AuditCheckpointImportNotFoundError,
     AttestationNotFoundError,
     AttestationRevocationNotFoundError,
@@ -1276,6 +1277,51 @@ def create_attestation_access_grant_revocation(
         return raced, False
     session.refresh(revocation)
     return revocation, True
+
+
+def get_attestation_access_grant_revocation(
+    session: Session, revocation_id: str
+) -> AttestationAccessGrantRevocation:
+    """Return one grant revocation by id for a reviewer's public view.
+
+    Strictly read-only: it performs no resource or audit writes. An unknown
+    id raises :class:`AttestationAccessGrantRevocationNotFoundError` (a
+    ``404``); the record is never looked up by any field other than its id.
+    """
+    revocation = session.execute(
+        select(AttestationAccessGrantRevocation).where(
+            AttestationAccessGrantRevocation.id == revocation_id
+        )
+    ).scalar_one_or_none()
+    if revocation is None:
+        raise AttestationAccessGrantRevocationNotFoundError(revocation_id)
+    return revocation
+
+
+def list_revocations_for_grant(
+    session: Session, grant_id: str
+) -> list[AttestationAccessGrantRevocation]:
+    """Return one grant's revocation records in stable creation order.
+
+    The grant must exist; an unknown grant id is a client-input validation
+    error (``422 grant_not_found``), never an empty collection and never a
+    lookup by any other field. An existing grant without revocations is an
+    empty list. Strictly read-only: no resource, record, or audit event is
+    created or modified.
+    """
+    grant = session.execute(
+        select(AttestationAccessGrant.id).where(
+            AttestationAccessGrant.id == grant_id
+        )
+    ).scalar_one_or_none()
+    if grant is None:
+        raise ProtectedAccessValidationError("grant_not_found")
+    stmt = (
+        select(AttestationAccessGrantRevocation)
+        .where(AttestationAccessGrantRevocation.grant_id == grant_id)
+        .order_by(*_ATTESTATION_ACCESS_GRANT_REVOCATION_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
 
 
 def get_accessible_attestation(

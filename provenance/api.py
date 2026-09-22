@@ -32,6 +32,7 @@ from provenance.schemas import (
     AttestationAccessGrantCreate,
     AttestationAccessGrantResponse,
     AttestationAccessGrantRevocationCreate,
+    AttestationAccessGrantRevocationListResponse,
     AttestationAccessGrantRevocationResponse,
     AttestationCreate,
     AttestationListResponse,
@@ -1646,6 +1647,47 @@ async def create_attestation_access_grant_revocation(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return AttestationAccessGrantRevocationResponse.model_validate(revocation)
+
+
+@router.get(
+    "/attestation-access-grant-revocations/{revocation_id}",
+    response_model=AttestationAccessGrantRevocationResponse,
+)
+def get_attestation_access_grant_revocation(
+    revocation_id: str, request: Request, session: DbSession
+) -> AttestationAccessGrantRevocationResponse:
+    # Reviewer read: no credentials are required. Any (or repeated) query
+    # parameter is a 422 before the record is ever looked up.
+    _reject_any_query_param(request)
+    # Strictly read-only: an unknown id is an explicit 404 and no resource,
+    # record, or audit event is written.
+    revocation = service.get_attestation_access_grant_revocation(
+        session, revocation_id
+    )
+    return AttestationAccessGrantRevocationResponse.model_validate(revocation)
+
+
+@router.get(
+    "/attestation-access-grants/{grant_id}/revocations",
+    response_model=AttestationAccessGrantRevocationListResponse,
+)
+def list_attestation_access_grant_revocations(
+    grant_id: str, request: Request, session: DbSession
+) -> AttestationAccessGrantRevocationListResponse:
+    # Reviewer read: no credentials are required. Any (or repeated) query
+    # parameter is a 422 before the grant is ever looked up.
+    _reject_any_query_param(request)
+    # Strictly read-only: only this existing grant's records are returned;
+    # an unknown grant is 422 validation_error and an existing grant with no
+    # revocations is an empty collection. Nothing is written.
+    items = service.list_revocations_for_grant(session, grant_id)
+    return AttestationAccessGrantRevocationListResponse(
+        items=[
+            AttestationAccessGrantRevocationResponse.model_validate(item)
+            for item in items
+        ],
+        count=len(items),
+    )
 
 
 @router.get(
