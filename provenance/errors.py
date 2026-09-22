@@ -159,6 +159,31 @@ class AuditCheckpointImportValidationError(DomainError):
         super().__init__(details=merged)
 
 
+class ClaimSupersessionNotFoundError(DomainError):
+    status_code = 404
+    code = "claim_supersession_not_found"
+    message = "The requested claim supersession does not exist."
+
+    def __init__(self, supersession_id: str):
+        super().__init__(details={"supersession_id": supersession_id})
+
+
+class ClaimSupersessionValidationError(DomainError):
+    """A structurally valid supersession request that the graph rejects.
+
+    Endpoints belonging to different contents, self-supersession, and edges
+    that would close a cycle render as the same ``validation_error`` code as
+    malformed payloads: all are client input the service refuses to persist.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str):
+        super().__init__(details={"reason": reason})
+
+
 class ContentRelationNotFoundError(DomainError):
     status_code = 404
     code = "content_relation_not_found"

@@ -21,6 +21,8 @@ from provenance.errors import (
     AttestationRevocationNotFoundError,
     AttestationVerificationError,
     ClaimNotFoundError,
+    ClaimSupersessionNotFoundError,
+    ClaimSupersessionValidationError,
     ContentNotFoundError,
     ContentRelationNotFoundError,
     ContentRelationValidationError,
@@ -38,6 +40,7 @@ from provenance.models import (
     EVENT_AUTHENTICATION_KEY_RETIRED,
     EVENT_AUTHENTICATION_KEY_ROTATED,
     EVENT_CLAIM_CREATED,
+    EVENT_CLAIM_SUPERSEDED,
     EVENT_CONTENT_CREATED,
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
@@ -50,6 +53,7 @@ from provenance.models import (
     AuditEvent,
     CheckpointImportRecord,
     Claim,
+    ClaimSupersession,
     Content,
     ContentRelation,
     EvidenceBundle,
@@ -63,6 +67,7 @@ from provenance.schemas import (
     AuditCheckpointImportCreate,
     AuthenticationKeyRotationCreate,
     ClaimCreate,
+    ClaimSupersessionCreate,
     ContentCreate,
     ContentRelationCreate,
     EvidenceBundleExchangeImportCreate,
@@ -75,6 +80,10 @@ from provenance.time_utils import utc_now
 # deterministic tiebreaker.
 _CONTENT_ORDER = (Content.created_at.asc(), Content.seq.asc())
 _CLAIM_ORDER = (Claim.created_at.asc(), Claim.seq.asc())
+_CLAIM_SUPERSESSION_ORDER = (
+    ClaimSupersession.created_at.asc(),
+    ClaimSupersession.seq.asc(),
+)
 _EVIDENCE_BUNDLE_ORDER = (
     EvidenceBundle.created_at.asc(),
     EvidenceBundle.seq.asc(),
@@ -278,6 +287,162 @@ def list_claims_for_content(session: Session, content_id: str) -> list[Claim]:
         select(Claim)
         .where(Claim.content_id == content_id)
         .order_by(*_CLAIM_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
+
+
+def _supersession_identity_select(payload: ClaimSupersessionCreate):
+    return select(ClaimSupersession).where(
+        ClaimSupersession.superseded_claim_id
+        == payload.superseded_claim_id,
+        ClaimSupersession.replacement_claim_id
+        == payload.replacement_claim_id,
+        ClaimSupersession.reason == payload.reason,
+    )
+
+
+def _supersession_would_create_cycle(
+    session: Session,
+    superseded_claim_id: str,
+    replacement_claim_id: str,
+) -> bool:
+    """True if edge ``replacement -> superseded`` would close a cycle.
+
+    Edges point from a replacement to the claim it supersedes, so a cycle
+    forms exactly when ``replacement_claim_id`` is already reachable from
+    ``superseded_claim_id`` by following existing supersession edges.
+    """
+    visited: set[str] = set()
+    frontier = [superseded_claim_id]
+    while frontier:
+        current = frontier.pop()
+        if current == replacement_claim_id:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        older = session.execute(
+            select(ClaimSupersession.superseded_claim_id).where(
+                ClaimSupersession.replacement_claim_id == current
+            )
+        ).scalars().all()
+        frontier.extend(older)
+    return False
+
+
+def create_claim_supersession(
+    session: Session, payload: ClaimSupersessionCreate
+) -> tuple[ClaimSupersession, bool]:
+    """Create an immutable claim supersession, returning ``(record, created)``.
+
+    Both endpoints must be existing claims. A self-supersession, endpoints on
+    different contents, and an edge that would close a cycle are validation
+    errors and write nothing. A repeat submission of the same superseded
+    claim, replacement claim, and (trimmed) reason returns the existing
+    record with ``created=False`` and writes no row or audit event; a
+    different reason forms an independent record. On first creation the row
+    and its ``claim.superseded`` audit event commit in a single transaction.
+    """
+    # A self-supersession is invalid input, checked before any lookup.
+    if payload.superseded_claim_id == payload.replacement_claim_id:
+        raise ClaimSupersessionValidationError("self_supersession")
+
+    superseded = session.execute(
+        select(Claim).where(Claim.id == payload.superseded_claim_id)
+    ).scalar_one_or_none()
+    if superseded is None:
+        raise ClaimNotFoundError(payload.superseded_claim_id)
+    replacement = session.execute(
+        select(Claim).where(Claim.id == payload.replacement_claim_id)
+    ).scalar_one_or_none()
+    if replacement is None:
+        raise ClaimNotFoundError(payload.replacement_claim_id)
+
+    # The correction must concern one and the same content identity.
+    if superseded.content_id != replacement.content_id:
+        raise ClaimSupersessionValidationError("different_content")
+
+    # An existing record with this exact identity is returned unchanged; a
+    # repeat submission is idempotent and needs no row or audit event.
+    existing = session.execute(
+        _supersession_identity_select(payload)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    if _supersession_would_create_cycle(
+        session,
+        payload.superseded_claim_id,
+        payload.replacement_claim_id,
+    ):
+        raise ClaimSupersessionValidationError("supersession_cycle")
+
+    record = ClaimSupersession(
+        id=ids.claim_supersession_id(
+            payload.superseded_claim_id,
+            payload.replacement_claim_id,
+            payload.reason,
+        ),
+        superseded_claim_id=payload.superseded_claim_id,
+        replacement_claim_id=payload.replacement_claim_id,
+        reason=payload.reason,
+    )
+    session.add(record)
+    session.add(
+        AuditEvent(event_type=EVENT_CLAIM_SUPERSEDED, resource_id=record.id)
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical supersession won the race: return its record.
+        session.rollback()
+        raced = session.execute(
+            _supersession_identity_select(payload)
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(record)
+    return record, True
+
+
+def get_claim_supersession(
+    session: Session, supersession_id: str
+) -> ClaimSupersession:
+    """Return a supersession by id or raise
+    :class:`ClaimSupersessionNotFoundError`."""
+    record = session.execute(
+        select(ClaimSupersession).where(
+            ClaimSupersession.id == supersession_id
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        raise ClaimSupersessionNotFoundError(supersession_id)
+    return record
+
+
+def list_supersessions_for_claim(
+    session: Session, claim_id: str
+) -> list[ClaimSupersession]:
+    """Return supersessions where the claim is either endpoint, creation order.
+
+    The claim must exist; an unknown claim id is the existing
+    ``claim_not_found`` missing resource, not an empty collection.
+    """
+    claim = session.execute(
+        select(Claim).where(Claim.id == claim_id)
+    ).scalar_one_or_none()
+    if claim is None:
+        raise ClaimNotFoundError(claim_id)
+    stmt = (
+        select(ClaimSupersession)
+        .where(
+            or_(
+                ClaimSupersession.superseded_claim_id == claim_id,
+                ClaimSupersession.replacement_claim_id == claim_id,
+            )
+        )
+        .order_by(*_CLAIM_SUPERSESSION_ORDER)
     )
     return list(session.execute(stmt).scalars().all())
 

@@ -47,6 +47,16 @@ Claims attach a typed, digest-committed statement by an actor to a registered co
 
 The first claim creation and its `claim.created` audit event commit in a single transaction. Non-object payloads, blank claim types, and malformed JSON are `422 validation_error`; unknown contents and actors remain `404 content_not_found` / `unknown_actor`.
 
+## Immutable claim supersessions
+
+A supersession is an immutable statement that one existing claim supersedes another as a correction of the *same* content's provenance. Neither endpoint claim is mutated or deleted: the original claim and its `claim.created` audit relationship are preserved. Supersessions are append-only: there is no update or delete path.
+
+- `POST /v1/claim-supersessions` — body contains exactly `superseded_claim_id`, `replacement_claim_id`, and a non-empty `reason` (surrounding whitespace is trimmed); any undeclared field is rejected. Both endpoints must be existing claims about the same content, the two ids must differ, and the new edge must not close a supersession cycle. The first creation returns `201` with exactly `{id, superseded_claim_id, replacement_claim_id, reason, created_at}` — a stable `csp_` id and a UTC `created_at` — and commits together with the `claim.superseded` audit event in a single transaction. A retry of the same three fields returns `200` with the original record and writes no new row or audit event; a different reason forms an independently retained record.
+- `GET /v1/claim-supersessions/{supersession_id}` — full public fields, or `404 claim_supersession_not_found` whose details carry the requested `supersession_id`.
+- `GET /v1/claims/{claim_id}/supersessions` — the records where the claim is either endpoint, in stable creation order as `{"items", "count"}`; an unknown claim id is the existing `404 claim_not_found` (a missing claim is never an empty collection).
+
+An unknown claim on either side is `404 claim_not_found` (matched by the declared endpoint field). Blank or whitespace-only fields, missing fields, undeclared fields, wrong-typed values, malformed JSON, endpoints on different contents, self-supersession, and an edge that would close a cycle are all `422 validation_error` and write neither a record nor an audit event. Reads and failed requests write no resource and no audit event; the public views never echo claim payloads, signatures, content, or evidence bytes.
+
 ## Verifiable evidence bundles
 
 Evidence bundles attach externally verifiable evidence to an existing claim by digest alone. The raw evidence bytes are never accepted, persisted, or logged — only the digest algorithm/value, media type, and a metadata object are stored. Bundles are immutable and append-only: there is no update or delete path.

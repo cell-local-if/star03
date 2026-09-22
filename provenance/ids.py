@@ -81,6 +81,31 @@ def content_relation_id(
     return "rel_" + hashlib.sha256(material).hexdigest()
 
 
+def claim_supersession_id(
+    superseded_claim_id: str, replacement_claim_id: str, reason: str
+) -> str:
+    """Return a stable ``csp_``-prefixed id for a claim supersession.
+
+    The identity is exactly the idempotency key: the superseded claim, its
+    replacement, and the (trimmed) reason text. A retry of the same three
+    fields maps to the same record; a different reason is a distinct
+    archival record with its own id. The material is a canonical JSON array
+    so fields containing separators cannot collide with different field
+    splits.
+    """
+    material = json.dumps(
+        [
+            "claim_supersession",
+            superseded_claim_id,
+            replacement_claim_id,
+            reason,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "csp_" + hashlib.sha256(material).hexdigest()
+
+
 def attestation_id(
     target_type: str,
     target_id: str,

@@ -57,6 +57,9 @@ from provenance.schemas import (
     ClaimListResponse,
     ClaimPageResponse,
     ClaimResponse,
+    ClaimSupersessionCreate,
+    ClaimSupersessionListResponse,
+    ClaimSupersessionResponse,
     ContentCreate,
     ContentExportResponse,
     ContentLineageItem,
@@ -542,6 +545,57 @@ def list_content_claims(content_id: str, session: DbSession) -> ClaimListRespons
     items = service.list_claims_for_content(session, content_id)
     return ClaimListResponse(
         items=[ClaimResponse.model_validate(item) for item in items],
+        count=len(items),
+    )
+
+
+def _claim_supersession_response(record) -> ClaimSupersessionResponse:
+    return ClaimSupersessionResponse.model_validate(record)
+
+
+@router.post(
+    "/claim-supersessions", response_model=ClaimSupersessionResponse
+)
+def create_claim_supersession(
+    payload: ClaimSupersessionCreate, session: DbSession, response: Response
+) -> ClaimSupersessionResponse:
+    record, created = service.create_claim_supersession(session, payload)
+    # First creation -> 201; a retried submission of the same three fields
+    # -> 200 with the original record and no new audit event. A different
+    # reason is an independent record with its own 201.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _claim_supersession_response(record)
+
+
+@router.get(
+    "/claim-supersessions/{supersession_id}",
+    response_model=ClaimSupersessionResponse,
+)
+def get_claim_supersession(
+    supersession_id: str, session: DbSession
+) -> ClaimSupersessionResponse:
+    # Strictly read-only: the read writes no resource and no audit event. An
+    # unknown id is an explicit, specific 404 carrying the requested id.
+    record = service.get_claim_supersession(session, supersession_id)
+    return _claim_supersession_response(record)
+
+
+@router.get(
+    "/claims/{claim_id}/supersessions",
+    response_model=ClaimSupersessionListResponse,
+)
+def list_claim_supersessions(
+    claim_id: str, session: DbSession
+) -> ClaimSupersessionListResponse:
+    # Records where the claim is either endpoint, in stable creation order.
+    # An unknown claim is the existing claim_not_found 404, not an empty
+    # collection. The read is strictly read-only and never renders claim
+    # payloads, signatures, content, or evidence bytes.
+    items = service.list_supersessions_for_claim(session, claim_id)
+    return ClaimSupersessionListResponse(
+        items=[_claim_supersession_response(item) for item in items],
         count=len(items),
     )
 
