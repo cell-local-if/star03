@@ -1062,6 +1062,16 @@ class AuditCheckpointImportResponse(BaseModel):
     received_at: datetime
 
 
+class AuditCheckpointImportPageResponse(BaseModel):
+    """A cursor-paginated page of checkpoint-import receipt public views."""
+
+    items: list[AuditCheckpointImportResponse]
+    #: Total number of receipts after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 

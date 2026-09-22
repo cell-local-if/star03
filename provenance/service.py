@@ -1298,6 +1298,48 @@ def get_audit_checkpoint_import(
     return record
 
 
+# Checkpoint-import receipt search paging bounds.
+DEFAULT_CHECKPOINT_IMPORTS_LIMIT = 50
+MIN_CHECKPOINT_IMPORTS_LIMIT = 1
+MAX_CHECKPOINT_IMPORTS_LIMIT = 100
+
+_CHECKPOINT_IMPORT_ORDER = (
+    CheckpointImportRecord.created_at.asc(),
+    CheckpointImportRecord.seq.asc(),
+)
+
+
+def list_audit_checkpoint_imports(
+    session: Session,
+    checkpoint_version: str | None = None,
+    events_digest_hex: str | None = None,
+    event_count: int | None = None,
+) -> list[CheckpointImportRecord]:
+    """Return checkpoint-import receipts in stable creation order, optionally filtered.
+
+    ``checkpoint_version`` and ``events_digest_hex`` are exact, case- and
+    whitespace-sensitive string matches; ``event_count`` is an exact integer
+    match. The three filters combine as logical AND; an absent filter
+    imposes no restriction. Results follow the receipts' stable creation
+    order (``created_at`` with the monotonic ``seq`` tiebreaker). The
+    function is strictly read-only: it writes no resource and no audit
+    event.
+    """
+    stmt = select(CheckpointImportRecord)
+    if checkpoint_version is not None:
+        stmt = stmt.where(
+            CheckpointImportRecord.checkpoint_version == checkpoint_version
+        )
+    if events_digest_hex is not None:
+        stmt = stmt.where(
+            CheckpointImportRecord.events_digest_hex == events_digest_hex
+        )
+    if event_count is not None:
+        stmt = stmt.where(CheckpointImportRecord.event_count == event_count)
+    stmt = stmt.order_by(*_CHECKPOINT_IMPORT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 # Exchange-import receipt search paging bounds.
 DEFAULT_EXCHANGE_IMPORTS_LIMIT = 50
 MIN_EXCHANGE_IMPORTS_LIMIT = 1

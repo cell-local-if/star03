@@ -38,6 +38,7 @@ from provenance.schemas import (
     AttestationRevocationListResponse,
     AttestationRevocationResponse,
     AuditCheckpointImportCreate,
+    AuditCheckpointImportPageResponse,
     AuditCheckpointImportResponse,
     AuditCheckpointVerificationCreate,
     AuditCheckpointVerificationResponse,
@@ -1640,6 +1641,143 @@ async def import_audit_events_checkpoint(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return _checkpoint_import_response(record)
+
+
+_CHECKPOINT_IMPORTS_PARAMS = frozenset(
+    {
+        "checkpoint_version",
+        "events_digest_hex",
+        "event_count",
+        "limit",
+        "cursor",
+    }
+)
+
+_NONNEGATIVE_INTEGER_RE = re.compile(r"[0-9]+")
+
+
+def _parse_optional_nonnegative_int_param(raw, field: str) -> int | None:
+    """Parse an optional non-negative decimal integer query parameter.
+
+    The value must be a plain decimal string with no sign, whitespace, or
+    other decoration; blanks and any other spelling are a 422 rather than
+    silently normalized.
+    """
+    value = _parse_once(raw, field)
+    if value is None:
+        return None
+    if not _NONNEGATIVE_INTEGER_RE.fullmatch(value):
+        raise _query_validation_error(
+            field,
+            f"{field} must be a non-negative integer",
+            "value_error.integer",
+        )
+    return int(value)
+
+
+@router.get(
+    "/audit-events/checkpoint-imports",
+    response_model=AuditCheckpointImportPageResponse,
+)
+def list_audit_events_checkpoint_imports(
+    request: Request,
+    session: DbSession,
+    checkpoint_version: str | None = Query(default=None),
+    events_digest_hex: str | None = Query(default=None),
+    event_count: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> AuditCheckpointImportPageResponse:
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _CHECKPOINT_IMPORTS_PARAMS
+    if unknown:
+        # A typo (e.g. ``checkpoint_versions``) never silently changes the
+        # search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    checkpoint_version = _parse_nonempty_filter(raw, "checkpoint_version")
+    events_digest_hex = _parse_nonempty_filter(raw, "events_digest_hex")
+    event_count = _parse_optional_nonnegative_int_param(raw, "event_count")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CHECKPOINT_IMPORTS_LIMIT,
+        service.MIN_CHECKPOINT_IMPORTS_LIMIT,
+        service.MAX_CHECKPOINT_IMPORTS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.checkpoint_imports_cursor_secret,
+                pagination.CHECKPOINT_IMPORTS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter and the effective limit must match exactly.
+        expected = {
+            "checkpoint_version": checkpoint_version,
+            "events_digest_hex": events_digest_hex,
+            "event_count": event_count,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no resource and no audit event.
+    items = service.list_audit_checkpoint_imports(
+        session, checkpoint_version, events_digest_hex, event_count
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.checkpoint_imports_cursor_secret,
+                pagination.CHECKPOINT_IMPORTS_CURSOR,
+                {
+                    "checkpoint_version": checkpoint_version,
+                    "events_digest_hex": events_digest_hex,
+                    "event_count": event_count,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    return AuditCheckpointImportPageResponse(
+        items=[_checkpoint_import_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
 
 
 @router.get(
