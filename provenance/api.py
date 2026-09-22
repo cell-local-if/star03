@@ -42,6 +42,7 @@ from provenance.schemas import (
     AuditCheckpointImportResponse,
     AuditCheckpointVerificationCreate,
     AuditCheckpointVerificationResponse,
+    AuditEventCheckpointPackageResponse,
     AuditEventCheckpointResponse,
     AuditEventItem,
     AuditEventPageResponse,
@@ -1518,17 +1519,15 @@ def list_audit_events(request: Request, session: DbSession) -> AuditEventPageRes
 _AUDIT_CHECKPOINT_PARAMS = frozenset({"event_type", "resource_id", "from", "to"})
 
 
-@router.get(
-    "/audit-events/checkpoint",
-    response_model=AuditEventCheckpointResponse,
-)
-def get_audit_events_checkpoint(
-    request: Request, session: DbSession
-) -> AuditEventCheckpointResponse:
-    # Same parameter contract as the audit-event search, minus pagination:
-    # a repeated scalar is rejected instead of silently taking the last
-    # value, undeclared parameters (including limit/cursor) are rejected
-    # rather than ignored, and blank or malformed values are never coerced.
+def _audit_checkpoint_filters(request: Request):
+    """Parse and validate the checkpoint/package query filters.
+
+    The package route shares the checkpoint route's parameter contract
+    exactly: a repeated scalar is rejected instead of silently taking the
+    last value, undeclared parameters (including limit/cursor) are rejected
+    rather than ignored, and blank or malformed values are never coerced.
+    Returns ``(event_type, resource_id, from_dt, to_dt)``.
+    """
     raw = request.query_params
 
     unknown = set(raw) - _AUDIT_CHECKPOINT_PARAMS
@@ -1550,6 +1549,39 @@ def get_audit_events_checkpoint(
             "value_error.range",
         )
 
+    return event_type, resource_id, from_dt, to_dt
+
+
+def _audit_checkpoint_response(
+    events: list[dict],
+) -> AuditEventCheckpointResponse:
+    """Build the four-field checkpoint for an already-read canonical event array.
+
+    ``events`` must be the ``mode="json"`` wire view the audit-event search
+    serves (UTC datetimes as RFC 3339 strings), so the digest is reproducible
+    by an external verifier from the audit-event listing alone.
+    """
+    return AuditEventCheckpointResponse(
+        checkpoint_version=AUDIT_CHECKPOINT_VERSION,
+        digest_algorithm=AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
+        event_count=len(events),
+        events_digest_hex=canonical.audit_events_digest_hex(events),
+    )
+
+
+@router.get(
+    "/audit-events/checkpoint",
+    response_model=AuditEventCheckpointResponse,
+)
+def get_audit_events_checkpoint(
+    request: Request, session: DbSession
+) -> AuditEventCheckpointResponse:
+    # Same parameter contract as the audit-event search, minus pagination:
+    # a repeated scalar is rejected instead of silently taking the last
+    # value, undeclared parameters (including limit/cursor) are rejected
+    # rather than ignored, and blank or malformed values are never coerced.
+    event_type, resource_id, from_dt, to_dt = _audit_checkpoint_filters(request)
+
     # Strictly read-only: the checkpoint only re-reads the filtered events
     # in their stable creation order and hashes them; it writes no resource
     # and no audit event, and an empty match set still yields a digest.
@@ -1563,11 +1595,39 @@ def get_audit_events_checkpoint(
         AuditEventItem.model_validate(item).model_dump(mode="json")
         for item in items
     ]
-    return AuditEventCheckpointResponse(
-        checkpoint_version=AUDIT_CHECKPOINT_VERSION,
-        digest_algorithm=AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
-        event_count=len(events),
-        events_digest_hex=canonical.audit_events_digest_hex(events),
+    return _audit_checkpoint_response(events)
+
+
+@router.get(
+    "/audit-events/checkpoint/package",
+    response_model=AuditEventCheckpointPackageResponse,
+)
+def get_audit_events_checkpoint_package(
+    request: Request, session: DbSession
+) -> AuditEventCheckpointPackageResponse:
+    # Same parameter contract as the checkpoint route: only
+    # event_type/resource_id/from/to are accepted, so limit/cursor and every
+    # other undeclared, blank, repeated, or malformed parameter is a 422
+    # validation_error before any event is read.
+    event_type, resource_id, from_dt, to_dt = _audit_checkpoint_filters(request)
+
+    # Strictly read-only, and both halves come from the same read state: the
+    # filtered events are read exactly once in their stable creation order,
+    # the events member renders those existing public views, and the
+    # checkpoint digests exactly that same array under the existing
+    # checkpoint canonical rules, so the two can never disagree. No
+    # resource, record, or audit event is written; an empty match set yields
+    # "events": [] together with the digest of the empty array.
+    items = service.list_audit_events(
+        session, event_type, resource_id, from_dt, to_dt
+    )
+    event_views = [AuditEventItem.model_validate(item) for item in items]
+    # mode="json" yields exactly the wire view served in this response's
+    # events member, so the checkpoint binds to exactly those events.
+    events = [view.model_dump(mode="json") for view in event_views]
+    return AuditEventCheckpointPackageResponse(
+        checkpoint=_audit_checkpoint_response(events),
+        events=event_views,
     )
 
 
