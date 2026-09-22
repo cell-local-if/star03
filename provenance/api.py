@@ -32,6 +32,7 @@ from provenance.schemas import (
     AttestationAccessGrantCreate,
     AttestationAccessGrantResponse,
     AttestationAccessGrantRevocationCreate,
+    AttestationAccessGrantRevocationListResponse,
     AttestationAccessGrantRevocationResponse,
     AttestationCreate,
     AttestationListResponse,
@@ -1646,6 +1647,56 @@ async def create_attestation_access_grant_revocation(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return AttestationAccessGrantRevocationResponse.model_validate(revocation)
+
+
+@router.get(
+    "/attestation-access-grant-revocations/{revocation_id}",
+    response_model=AttestationAccessGrantRevocationResponse,
+)
+def get_attestation_access_grant_revocation(
+    revocation_id: str, request: Request, session: DbSession
+) -> AttestationAccessGrantRevocationResponse:
+    # The read takes no query parameters: any parameter at all (known or
+    # unknown, blank or repeated) is a 422 before the revocation lookup, so a
+    # malformed request never renders as a 404.
+    _reject_any_query_param(request)
+    # Strictly read-only: the read returns one existing revocation's public
+    # view and writes no revocation, grant, resource, or audit event. The id
+    # is the only lookup key (never a reverse lookup by other fields); an
+    # unknown id is an explicit, specific 404.
+    revocation = service.get_attestation_access_grant_revocation(
+        session, revocation_id
+    )
+    return AttestationAccessGrantRevocationResponse.model_validate(revocation)
+
+
+@router.get(
+    "/attestation-access-grants/{grant_id}/revocations",
+    response_model=AttestationAccessGrantRevocationListResponse,
+)
+def list_attestation_access_grant_revocations(
+    grant_id: str, request: Request, session: DbSession
+) -> AttestationAccessGrantRevocationListResponse:
+    # The read takes no query parameters: any parameter at all (known or
+    # unknown, blank or repeated) is a 422 before the grant lookup, so a
+    # malformed request never renders as an unknown-grant error or an empty
+    # collection.
+    _reject_any_query_param(request)
+    # Strictly read-only: only that existing grant's revocation records are
+    # returned in stable creation order; the grant id is the sole lookup key.
+    # An unknown grant is the same 422 validation_error (grant_not_found) as
+    # on the write route -- never an empty collection and never a reverse
+    # lookup. An existing grant without revocations returns an empty array
+    # and zero count. Nothing is created or modified and no audit event is
+    # written.
+    items = service.list_revocations_for_access_grant(session, grant_id)
+    return AttestationAccessGrantRevocationListResponse(
+        items=[
+            AttestationAccessGrantRevocationResponse.model_validate(item)
+            for item in items
+        ],
+        count=len(items),
+    )
 
 
 @router.get(

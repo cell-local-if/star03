@@ -17,6 +17,7 @@ from provenance import canonical, ed25519, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
     AuditCheckpointImportNotFoundError,
+    AttestationAccessGrantRevocationNotFoundError,
     AttestationNotFoundError,
     AttestationRevocationNotFoundError,
     AttestationVerificationError,
@@ -1276,6 +1277,56 @@ def create_attestation_access_grant_revocation(
         return raced, False
     session.refresh(revocation)
     return revocation, True
+
+
+def get_attestation_access_grant_revocation(
+    session: Session, revocation_id: str
+) -> AttestationAccessGrantRevocation:
+    """Return one existing grant revocation by its own stable id.
+
+    The revocation id is the only lookup key: the record is never resolved
+    by grant, revoker, or reason. An unknown id is an explicit, specific
+    404 carrying the requested id. The function is strictly read-only: it
+    writes no revocation, grant, resource, or audit event.
+    """
+    revocation = session.execute(
+        select(AttestationAccessGrantRevocation).where(
+            AttestationAccessGrantRevocation.id == revocation_id
+        )
+    ).scalar_one_or_none()
+    if revocation is None:
+        raise AttestationAccessGrantRevocationNotFoundError(revocation_id)
+    return revocation
+
+
+def list_revocations_for_access_grant(
+    session: Session, grant_id: str
+) -> list[AttestationAccessGrantRevocation]:
+    """Return one existing grant's revocation records in creation order.
+
+    The grant id is the only lookup key: records are selected by their
+    ``grant_id`` column alone, never by revoker, reason, or any attestation
+    field. The grant must already exist; an unknown grant id is a
+    ``422`` validation error (``grant_not_found``), the same boundary as the
+    revocation write route -- never an empty collection and never a reverse
+    lookup. An existing grant without revocations yields an empty list.
+    Results follow stable creation order (``created_at`` with the monotonic
+    ``seq`` tiebreaker). The function is strictly read-only: it writes no
+    revocation, grant, resource, or audit event.
+    """
+    grant = session.execute(
+        select(AttestationAccessGrant.id).where(
+            AttestationAccessGrant.id == grant_id
+        )
+    ).first()
+    if grant is None:
+        raise ProtectedAccessValidationError("grant_not_found")
+    stmt = (
+        select(AttestationAccessGrantRevocation)
+        .where(AttestationAccessGrantRevocation.grant_id == grant_id)
+        .order_by(*_ATTESTATION_ACCESS_GRANT_REVOCATION_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
 
 
 def get_accessible_attestation(

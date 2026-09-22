@@ -663,20 +663,23 @@ def test_revocation_collection_rejects_non_post_methods(client):
         assert resp.json()["error"]["code"] == "method_not_allowed"
 
 
-def test_no_individual_revocation_resource_can_be_read_updated_or_deleted(client):
+def test_no_individual_revocation_resource_can_be_updated_or_deleted(client):
     attestation = _world(client)
     grant = _grant(client, attestation["id"], "org-2")
     created = _post_revocation(client, _revocation_body(grant["id"])).json()
     url = f"{REVOCATIONS_PATH}/{created['id']}"
-    # No sub-resource route exists at all: nothing can mutate or remove it.
+    # The individual resource is readable (read-only reviewer tracking) but
+    # no mutation path exists: the record cannot be changed or removed.
+    fetched = client.get(url)
+    assert fetched.status_code == 200
+    assert fetched.json() == created
     for method, kwargs in (
-        ("get", {}),
         ("put", {"json": {"reason": "changed"}}),
         ("patch", {"json": {"reason": "changed"}}),
         ("delete", {}),
     ):
         resp = getattr(client, method)(url, **kwargs)
-        assert resp.status_code == 404, method
+        assert resp.status_code == 405, method
 
     # The record is unchanged and still governs the read boundary.
     assert (
