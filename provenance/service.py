@@ -963,6 +963,37 @@ def get_accessible_attestation(
     return attestation if grant_exists is not None else None
 
 
+DEFAULT_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 50
+MIN_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 1
+MAX_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 100
+
+_AUTHENTICATION_KEY_ROTATION_ORDER = (
+    AuthenticationKeyRotation.created_at.asc(),
+    AuthenticationKeyRotation.seq.asc(),
+)
+
+
+def list_authentication_key_rotations_for_actor(
+    session: Session, actor_id: str
+) -> list[AuthenticationKeyRotation]:
+    """Return one existing subject's rotations in stable creation order.
+
+    Results follow the rotations' stable creation order (``created_at`` with
+    the monotonic ``seq`` tiebreaker). The subject must exist; an unknown
+    actor is a missing resource (``unknown_actor`` 404), not an empty
+    collection. The function is strictly read-only: it writes no rotation,
+    resource, or audit event.
+    """
+    if session.get(Actor, actor_id) is None:
+        raise UnknownActorError(actor_id)
+    stmt = (
+        select(AuthenticationKeyRotation)
+        .where(AuthenticationKeyRotation.actor_id == actor_id)
+        .order_by(*_AUTHENTICATION_KEY_ROTATION_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
+
+
 def create_authentication_key_rotation(
     session: Session,
     payload: AuthenticationKeyRotationCreate,
