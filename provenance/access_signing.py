@@ -1,6 +1,7 @@
 """Authentication for protected proof access (the ``X-PA``/``X-PT``/``X-PS`` contract).
 
-Both ``POST /v1/attestation-access-grants`` and
+Both ``POST /v1/attestation-access-grants``,
+``POST /v1/attestation-access-grant-revocations``, and
 ``GET /v1/protected/attestations/{attestation_id}`` authenticate the caller
 with three headers:
 
@@ -33,7 +34,7 @@ Failures split into two categories:
   input errors (``422``) on both routes.
 * *Missing or unauthenticated* credentials (any header absent, or a
   well-formed signature no current non-revoked key of the actor verifies)
-  are unauthenticated requests. The write route rejects them as ``422``;
+  are unauthenticated requests. Each write route rejects them as ``422``;
   the read route answers with the same opaque ``404`` it uses for a missing
   target or an unauthorized actor, so existence is never revealed to a
   caller without access.

@@ -953,6 +953,39 @@ class AttestationAccessGrantResponse(BaseModel):
     created_at: datetime
 
 
+class AttestationAccessGrantRevocationCreate(BaseModel):
+    # A revocation carries exactly its declared fields; undeclared fields
+    # are rejected rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The existing read-only access grant being revoked.
+    grant_id: str = Field(..., min_length=1, max_length=80)
+    #: Non-empty rationale; surrounding whitespace is trimmed.
+    reason: str = Field(..., min_length=1, max_length=4096)
+
+    @field_validator("grant_id")
+    @classmethod
+    def _grant_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "grant_id")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "reason")
+
+
+class AttestationAccessGrantRevocationResponse(BaseModel):
+    """Public grant-revocation view: the grant, the revoker, reason, time."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    grant_id: str
+    revoker_actor_id: str
+    reason: str
+    created_at: datetime
+
+
 class AuditEventItem(BaseModel):
     """Public audit-event view: type, resource, and UTC timestamp only."""
 

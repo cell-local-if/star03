@@ -171,6 +171,33 @@ def attestation_revocation_id(
     return "rev_" + hashlib.sha256(material).hexdigest()
 
 
+def attestation_access_grant_revocation_id(
+    grant_id: str,
+    revoker_actor_id: str,
+    reason: str,
+) -> str:
+    """Return a stable ``agr_``-prefixed id for an access-grant revocation.
+
+    The identity is exactly the idempotency key: the revoked grant, the
+    revoking signing subject, and the (trimmed) reason text. A retry of the
+    same three fields maps to the same record; a different reason is a
+    distinct archival record with its own id. The material is a canonical
+    JSON array so fields containing separators cannot collide with
+    different field splits.
+    """
+    material = json.dumps(
+        [
+            "attestation_access_grant_revocation",
+            grant_id,
+            revoker_actor_id,
+            reason,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "agr_" + hashlib.sha256(material).hexdigest()
+
+
 def authentication_key_rotation_id(
     actor_id: str, public_key_hex: str
 ) -> str:
