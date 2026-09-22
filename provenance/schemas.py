@@ -926,6 +926,24 @@ class AuditEventCheckpointResponse(BaseModel):
     events_digest_hex: str
 
 
+class AuditEventCheckpointPackageResponse(BaseModel):
+    """One read returning a filtered audit sequence together with its checkpoint.
+
+    Exactly two members: ``events`` lists the existing audit events matching
+    the filter in their stable creation order, each reduced to the existing
+    three-field public view (``event_type``/``resource_id``/UTC
+    ``created_at``), and ``checkpoint`` is the existing four-field integrity
+    checkpoint. The checkpoint digest is computed over exactly the ``events``
+    array returned in this same response under the existing checkpoint
+    canonical rules; both derive from a single read-only state read, so the
+    package introduces no resource, record, or audit event, and an empty
+    match set yields an empty array with its still-valid checkpoint.
+    """
+
+    checkpoint: AuditEventCheckpointResponse
+    events: list[AuditEventItem]
+
+
 class AuditCheckpointVerificationEvent(BaseModel):
     """An event under checkpoint verification: exactly the three public fields.
 

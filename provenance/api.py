@@ -42,6 +42,7 @@ from provenance.schemas import (
     AuditCheckpointImportResponse,
     AuditCheckpointVerificationCreate,
     AuditCheckpointVerificationResponse,
+    AuditEventCheckpointPackageResponse,
     AuditEventCheckpointResponse,
     AuditEventItem,
     AuditEventPageResponse,
@@ -1518,17 +1519,15 @@ def list_audit_events(request: Request, session: DbSession) -> AuditEventPageRes
 _AUDIT_CHECKPOINT_PARAMS = frozenset({"event_type", "resource_id", "from", "to"})
 
 
-@router.get(
-    "/audit-events/checkpoint",
-    response_model=AuditEventCheckpointResponse,
-)
-def get_audit_events_checkpoint(
-    request: Request, session: DbSession
-) -> AuditEventCheckpointResponse:
-    # Same parameter contract as the audit-event search, minus pagination:
-    # a repeated scalar is rejected instead of silently taking the last
-    # value, undeclared parameters (including limit/cursor) are rejected
-    # rather than ignored, and blank or malformed values are never coerced.
+def _parse_audit_checkpoint_filters(request: Request):
+    """Parse the checkpoint filter contract from the raw query string.
+
+    Shared verbatim by the checkpoint and checkpoint-package reads so their
+    precise exact-match, strict RFC 3339 UTC, repeated-parameter, undeclared
+    (including ``limit``/``cursor``), blank-value, and range ``422
+    validation_error`` semantics can never diverge from one another or from
+    the audit-event search's filters-minus-pagination contract.
+    """
     raw = request.query_params
 
     unknown = set(raw) - _AUDIT_CHECKPOINT_PARAMS
@@ -1549,6 +1548,38 @@ def get_audit_events_checkpoint(
             "from must not be later than to",
             "value_error.range",
         )
+    return event_type, resource_id, from_dt, to_dt
+
+
+def _audit_checkpoint_response(events: list[dict]) -> AuditEventCheckpointResponse:
+    """Build the four-field checkpoint over an already-rendered event array.
+
+    ``events`` must be the ``mode="json"`` wire view of the public audit
+    events (UTC datetimes as RFC 3339 strings), so the digest is the same
+    canonical SHA-256 an external verifier computes from the served events.
+    """
+    return AuditEventCheckpointResponse(
+        checkpoint_version=AUDIT_CHECKPOINT_VERSION,
+        digest_algorithm=AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
+        event_count=len(events),
+        events_digest_hex=canonical.audit_events_digest_hex(events),
+    )
+
+
+@router.get(
+    "/audit-events/checkpoint",
+    response_model=AuditEventCheckpointResponse,
+)
+def get_audit_events_checkpoint(
+    request: Request, session: DbSession
+) -> AuditEventCheckpointResponse:
+    # Same parameter contract as the audit-event search, minus pagination:
+    # a repeated scalar is rejected instead of silently taking the last
+    # value, undeclared parameters (including limit/cursor) are rejected
+    # rather than ignored, and blank or malformed values are never coerced.
+    event_type, resource_id, from_dt, to_dt = _parse_audit_checkpoint_filters(
+        request
+    )
 
     # Strictly read-only: the checkpoint only re-reads the filtered events
     # in their stable creation order and hashes them; it writes no resource
@@ -1563,11 +1594,43 @@ def get_audit_events_checkpoint(
         AuditEventItem.model_validate(item).model_dump(mode="json")
         for item in items
     ]
-    return AuditEventCheckpointResponse(
-        checkpoint_version=AUDIT_CHECKPOINT_VERSION,
-        digest_algorithm=AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
-        event_count=len(events),
-        events_digest_hex=canonical.audit_events_digest_hex(events),
+    return _audit_checkpoint_response(events)
+
+
+@router.get(
+    "/audit-events/checkpoint/package",
+    response_model=AuditEventCheckpointPackageResponse,
+)
+def get_audit_events_checkpoint_package(
+    request: Request, session: DbSession
+) -> AuditEventCheckpointPackageResponse:
+    # Exactly the checkpoint read's parameter contract (only event_type,
+    # resource_id, from, to): limit/cursor and every other undeclared,
+    # repeated, blank, or malformed parameter is the same 422, raised before
+    # any state is read.
+    event_type, resource_id, from_dt, to_dt = _parse_audit_checkpoint_filters(
+        request
+    )
+
+    # Strictly read-only, and both halves come from the same read state:
+    # the filtered events are read exactly once in their stable creation
+    # order, the ``events`` member renders that sequence as the existing
+    # three-field audit-event public view, and the checkpoint is computed
+    # over exactly those rendered objects, so the two halves can never
+    # disagree. The package writes no resource, record, or audit event, and
+    # an empty match set still yields an empty array with a valid digest.
+    items = service.list_audit_events(
+        session, event_type, resource_id, from_dt, to_dt
+    )
+    event_items = [AuditEventItem.model_validate(item) for item in items]
+    # mode="json" yields exactly the wire view the search serves (UTC
+    # datetimes as RFC 3339 strings) -- the exact objects the ``events``
+    # member serializes to -- so the digest binds this response's events and
+    # is reproducible offline from the package body alone.
+    events = [item.model_dump(mode="json") for item in event_items]
+    return AuditEventCheckpointPackageResponse(
+        checkpoint=_audit_checkpoint_response(events),
+        events=event_items,
     )
 
 
