@@ -54,6 +54,7 @@ from provenance.schemas import (
     ClaimCreate,
     ClaimExportItem,
     ClaimListResponse,
+    ClaimPageResponse,
     ClaimResponse,
     ContentCreate,
     ContentExportResponse,
@@ -181,6 +182,10 @@ def _lineage_item(content, depth: int):
 
 
 _INTEGER_RE = re.compile(r"-?[0-9]+")
+
+#: Exactly 64 lowercase hexadecimal characters (the required spelling of a
+#: SHA-256 payload digest on the wire).
+_HEX64_LOWER_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _query_validation_error(field: str, msg: str, error_type: str):
@@ -396,6 +401,146 @@ def list_content_claims(content_id: str, session: DbSession) -> ClaimListRespons
     return ClaimListResponse(
         items=[ClaimResponse.model_validate(item) for item in items],
         count=len(items),
+    )
+
+
+_CLAIMS_SEARCH_PARAMS = frozenset(
+    {
+        "content_id",
+        "actor_id",
+        "claim_type",
+        "payload_digest_hex",
+        "limit",
+        "cursor",
+    }
+)
+
+
+def _parse_digest_hex_param(raw, field: str) -> str | None:
+    """Parse an optional exact 64-char lowercase hexadecimal digest filter."""
+    value = _parse_once(raw, field)
+    if value is None:
+        return None
+    if not value.strip():
+        raise _query_validation_error(
+            field, f"{field} must not be empty", "value_error"
+        )
+    if not _HEX64_LOWER_RE.fullmatch(value):
+        # Uppercase spelling, wrong length, non-hex characters, and any
+        # surrounding whitespace are rejected rather than normalized: the
+        # filter matches only an exact, canonical lowercase digest.
+        raise _query_validation_error(
+            field,
+            f"{field} must be exactly 64 lowercase hexadecimal characters",
+            "value_error",
+        )
+    return value
+
+
+@router.get("/claims", response_model=ClaimPageResponse)
+def list_claims(
+    request: Request,
+    session: DbSession,
+    content_id: str | None = Query(default=None),
+    actor_id: str | None = Query(default=None),
+    claim_type: str | None = Query(default=None),
+    payload_digest_hex: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> ClaimPageResponse:
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _CLAIMS_SEARCH_PARAMS
+    if unknown:
+        # A typo (e.g. ``claim_types``) never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    content_id = _parse_nonempty_filter(raw, "content_id")
+    actor_id = _parse_nonempty_filter(raw, "actor_id")
+    claim_type = _parse_nonempty_filter(raw, "claim_type")
+    payload_digest_hex = _parse_digest_hex_param(raw, "payload_digest_hex")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CLAIMS_LIMIT,
+        service.MIN_CLAIMS_LIMIT,
+        service.MAX_CLAIMS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.claims_cursor_secret,
+                pagination.CLAIMS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter and the effective limit must match exactly.
+        expected = {
+            "content_id": content_id,
+            "actor_id": actor_id,
+            "claim_type": claim_type,
+            "payload_digest_hex": payload_digest_hex,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no resource, claim, or audit
+    # event. A filter that matches nothing is an empty collection, not a 404
+    # (no filter value is resolved against a resource's existence).
+    items = service.list_claims(
+        session, content_id, actor_id, claim_type, payload_digest_hex
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.claims_cursor_secret,
+                pagination.CLAIMS_CURSOR,
+                {
+                    "content_id": content_id,
+                    "actor_id": actor_id,
+                    "claim_type": claim_type,
+                    "payload_digest_hex": payload_digest_hex,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    return ClaimPageResponse(
+        items=[ClaimResponse.model_validate(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
     )
 
 

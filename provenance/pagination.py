@@ -21,10 +21,14 @@ import binascii
 import hashlib
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from provenance.time_utils import parse_rfc3339_utc
+
+#: Exactly 64 lowercase hexadecimal characters (a SHA-256 digest spelling).
+_HEX64_LOWER = re.compile(r"[0-9a-f]{64}")
 
 #: Legacy lineage cursor format generation. Bump only when the lineage claim
 #: set/encoding changes; cursors carrying any other marker are rejected as
@@ -48,6 +52,9 @@ CHECKPOINT_IMPORTS_CURSOR_VERSION = "ci1"
 
 #: Marker for cursors that page through checkpoint-import reconciliations.
 CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "cr1"
+
+#: Marker for cursors that page through the claim search.
+CLAIMS_CURSOR_VERSION = "cl1"
 
 
 class InvalidCursorError(ValueError):
@@ -308,6 +315,41 @@ CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR = CursorKind(
     version=CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR_VERSION,
     claim_fields=("limit", "offset"),
     validate=_validate_checkpoint_import_reconciliations_claims,
+)
+
+
+def _validate_claims_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null) or non-empty strings;
+    # matching is case- and whitespace-sensitive, so the raw value is bound.
+    _optional_nonempty_str(claims, "content_id")
+    _optional_nonempty_str(claims, "actor_id")
+    _optional_nonempty_str(claims, "claim_type")
+    digest = claims["payload_digest_hex"]
+    if digest is not None and (
+        not isinstance(digest, str) or not _HEX64_LOWER.fullmatch(digest)
+    ):
+        raise InvalidCursorError("cursor payload_digest_hex is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/claims``.
+CLAIMS_CURSOR = CursorKind(
+    version=CLAIMS_CURSOR_VERSION,
+    claim_fields=(
+        "content_id",
+        "actor_id",
+        "claim_type",
+        "payload_digest_hex",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_claims_claims,
 )
 
 

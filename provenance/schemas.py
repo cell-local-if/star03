@@ -229,6 +229,16 @@ class ClaimListResponse(BaseModel):
     count: int
 
 
+class ClaimPageResponse(BaseModel):
+    """A cursor-paginated page of claim public views (never the payload)."""
+
+    items: list[ClaimResponse]
+    #: Total number of claims after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class EvidenceBundleCreate(BaseModel):
     # Evidence bytes must never reach the service: any field not declared
     # here (e.g. "data" or "evidence") is a client error, not silently
