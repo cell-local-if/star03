@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from provenance import canonical, ed25519, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
+    AuditCheckpointImportNotFoundError,
     AttestationNotFoundError,
     AttestationRevocationNotFoundError,
     AttestationVerificationError,
@@ -33,6 +34,7 @@ from provenance.models import (
     EVENT_ATTESTATION_ACCESS_GRANTED,
     EVENT_ATTESTATION_CREATED,
     EVENT_ATTESTATION_REVOKED,
+    EVENT_AUDIT_CHECKPOINT_IMPORTED,
     EVENT_AUTHENTICATION_KEY_RETIRED,
     EVENT_AUTHENTICATION_KEY_ROTATED,
     EVENT_CLAIM_CREATED,
@@ -46,6 +48,7 @@ from provenance.models import (
     AttestationRevocation,
     AuthenticationKeyRotation,
     AuditEvent,
+    CheckpointImportRecord,
     Claim,
     Content,
     ContentRelation,
@@ -57,6 +60,7 @@ from provenance.schemas import (
     AttestationAccessGrantCreate,
     AttestationCreate,
     AttestationRevocationCreate,
+    AuditCheckpointImportCreate,
     AuthenticationKeyRotationCreate,
     ClaimCreate,
     ContentCreate,
@@ -1199,6 +1203,98 @@ def get_evidence_bundle_exchange_import(
     ).scalar_one_or_none()
     if record is None:
         raise EvidenceBundleExchangeImportNotFoundError(import_id)
+    return record
+
+
+def _checkpoint_import_identity_select(
+    checkpoint_version: str, event_count: int, events_digest_hex: str
+):
+    return select(CheckpointImportRecord).where(
+        CheckpointImportRecord.checkpoint_version == checkpoint_version,
+        CheckpointImportRecord.event_count == event_count,
+        CheckpointImportRecord.events_digest_hex == events_digest_hex,
+    )
+
+
+def create_audit_checkpoint_import(
+    session: Session,
+    payload: AuditCheckpointImportCreate,
+) -> tuple[CheckpointImportRecord, bool]:
+    """Register one offline-verified audit checkpoint, returning ``(record, created)``.
+
+    The caller has already verified the checkpoint: the request parses under
+    the existing checkpoint structure, its event count matches the array,
+    and the events digest matches the canonical SHA-256 of the received
+    event array exactly as received. This function performs no such
+    verification and no local-event lookup: the described events are never
+    queried, created, or modified, so whether they exist locally never
+    changes the outcome.
+
+    The receiving identity is ``(checkpoint_version, event_count,
+    events_digest_hex)``; the event array itself is never stored. A first
+    submission writes the receipt row and its
+    ``audit.checkpoint_imported`` audit event in a single transaction. A
+    retried submission for the same identity returns the existing record
+    with ``created=False`` and writes nothing -- no second row and no
+    second audit event.
+    """
+    checkpoint = payload.checkpoint
+    checkpoint_version = checkpoint.checkpoint_version
+    event_count = checkpoint.event_count
+    events_digest_hex = checkpoint.events_digest_hex
+
+    existing = session.execute(
+        _checkpoint_import_identity_select(
+            checkpoint_version, event_count, events_digest_hex
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    while True:
+        record = CheckpointImportRecord(
+            id=ids.checkpoint_import_id(
+                checkpoint_version, event_count, events_digest_hex
+            ),
+            checkpoint_version=checkpoint_version,
+            event_count=event_count,
+            events_digest_hex=events_digest_hex,
+        )
+        session.add(record)
+        session.add(
+            AuditEvent(
+                event_type=EVENT_AUDIT_CHECKPOINT_IMPORTED,
+                resource_id=record.id,
+            )
+        )
+        try:
+            session.commit()
+        except IntegrityError:
+            # A concurrent import registered this identity first: roll back
+            # and return that record instead of duplicating it or writing a
+            # second audit event.
+            session.rollback()
+            raced = session.execute(
+                _checkpoint_import_identity_select(
+                    checkpoint_version, event_count, events_digest_hex
+                )
+            ).scalar_one_or_none()
+            if raced is None:  # pragma: no cover - defensive
+                raise
+            return raced, False
+        session.refresh(record)
+        return record, True
+
+
+def get_audit_checkpoint_import(
+    session: Session, import_id: str
+) -> CheckpointImportRecord:
+    """Return a checkpoint-import receipt by id or raise the 404 domain error."""
+    record = session.execute(
+        select(CheckpointImportRecord).where(CheckpointImportRecord.id == import_id)
+    ).scalar_one_or_none()
+    if record is None:
+        raise AuditCheckpointImportNotFoundError(import_id)
     return record
 
 

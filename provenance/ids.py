@@ -190,3 +190,31 @@ def exchange_import_id(
         ensure_ascii=False,
     ).encode("utf-8")
     return "eir_" + hashlib.sha256(material).hexdigest()
+
+
+def checkpoint_import_id(
+    checkpoint_version: str,
+    event_count: int,
+    events_digest_hex: str,
+) -> str:
+    """Return a stable ``aci_``-prefixed receipt id for a checkpoint import.
+
+    The identity is exactly the receiving identity: the fixed checkpoint
+    version, the claimed event count, and the events SHA-256 digest. The
+    event array itself never enters the material -- only its verified
+    digest -- so the same offline-verified checkpoint always maps to the
+    same receipt id even though no event data is persisted. The material is
+    a canonical JSON array so fields containing separators cannot collide
+    with different field splits.
+    """
+    material = json.dumps(
+        [
+            "audit_checkpoint_import",
+            checkpoint_version,
+            event_count,
+            events_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "aci_" + hashlib.sha256(material).hexdigest()

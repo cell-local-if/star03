@@ -1027,6 +1027,41 @@ class AuditCheckpointVerificationResponse(BaseModel):
     computed_digest_hex: str | None = None
 
 
+class AuditCheckpointImportCreate(AuditCheckpointVerificationCreate):
+    """A controlled import of one offline-verified audit checkpoint.
+
+    Exactly the existing two-member verification structure: ``checkpoint``
+    carries the claimed four-field audit checkpoint and ``events`` carries
+    the event sequence it commits to, with exactly
+    ``checkpoint.event_count`` elements. The digest match itself is
+    enforced at the route, over the raw received JSON so array order and
+    datetime spellings participate exactly as on the stateless
+    verification route; a mismatch is a 422 and writes nothing.
+
+    Registration is a pure function of the request body that never
+    resolves any event or resource id against local state: the described
+    events are not created, modified, or queried, and they need not exist
+    locally.
+    """
+
+
+class AuditCheckpointImportResponse(BaseModel):
+    """The public immutable receipt for one registered checkpoint import.
+
+    Exactly the stable ``aci_`` receipt id, the three receiving-identity
+    fields (checkpoint version, events digest, event count), and the UTC
+    ``received_at`` instant. The event array itself is deliberately not
+    part of the receipt: it is neither copied into the record nor echoed
+    here.
+    """
+
+    id: str
+    checkpoint_version: str
+    events_digest_hex: str
+    event_count: int
+    received_at: datetime
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 
