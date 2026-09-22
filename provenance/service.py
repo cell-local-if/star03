@@ -447,6 +447,93 @@ def list_supersessions_for_claim(
     return list(session.execute(stmt).scalars().all())
 
 
+# Supersession lineage traversal directions.
+SUPERSESSION_LINEAGE_NEWER = "newer"
+SUPERSESSION_LINEAGE_OLDER = "older"
+SUPERSESSION_LINEAGE_DIRECTIONS = frozenset(
+    {SUPERSESSION_LINEAGE_NEWER, SUPERSESSION_LINEAGE_OLDER}
+)
+
+DEFAULT_SUPERSESSION_LINEAGE_MAX_DEPTH = 8
+MIN_SUPERSESSION_LINEAGE_MAX_DEPTH = 1
+MAX_SUPERSESSION_LINEAGE_MAX_DEPTH = 32
+
+
+def get_claim_supersession_lineage(
+    session: Session,
+    claim_id: str,
+    direction: str,
+    max_depth: int = DEFAULT_SUPERSESSION_LINEAGE_MAX_DEPTH,
+) -> list[tuple[Claim, int]]:
+    """Return reachable claims as ``(claim, depth)`` pairs.
+
+    Newer traversal follows a superseded claim to its
+    ``replacement_claim_id``; older traversal follows a replacement back to
+    its ``superseded_claim_id``. The origin claim is never included. Only
+    claims reachable within ``max_depth`` supersession edges are returned;
+    each claim appears once at its shortest depth. Pairs are ordered by
+    depth ascending; within one depth, claims are ordered by the stable
+    creation order of the supersession through which they were first
+    reached.
+
+    The traversal is read-only and tracks a visited set, so even anomalous
+    history containing a cycle terminates and the walk is bounded by
+    ``max_depth``. The origin claim must exist or :class:`ClaimNotFoundError`
+    is raised. Neither a successful read nor a failed one writes a resource
+    or audit row.
+    """
+    # A missing origin is a missing resource, checked before any traversal.
+    get_claim(session, claim_id)
+
+    if direction == SUPERSESSION_LINEAGE_NEWER:
+        source_col = ClaimSupersession.superseded_claim_id
+        neighbor_col = ClaimSupersession.replacement_claim_id
+    else:
+        source_col = ClaimSupersession.replacement_claim_id
+        neighbor_col = ClaimSupersession.superseded_claim_id
+
+    visited: set[str] = {claim_id}
+    frontier: list[str] = [claim_id]
+    # id -> shortest depth; discovery order is the dictionary insertion
+    # order itself.
+    reached: dict[str, int] = {}
+    for depth in range(1, max_depth + 1):
+        if not frontier:
+            break
+        # Ordering every edge leaving the current frontier by its stable
+        # creation order fixes each level's first-discovery order, including
+        # converging paths whose discovering edges differ.
+        rows = session.execute(
+            select(neighbor_col)
+            .where(source_col.in_(frontier))
+            .order_by(*_CLAIM_SUPERSESSION_ORDER)
+        ).scalars().all()
+        next_frontier: list[str] = []
+        for neighbor_id in rows:
+            if neighbor_id in visited:
+                # Already reached at an equal or shorter depth; also what
+                # makes an anomalous cycle terminate.
+                continue
+            visited.add(neighbor_id)
+            next_frontier.append(neighbor_id)
+            reached[neighbor_id] = depth
+        frontier = next_frontier
+
+    if not reached:
+        return []
+
+    claims = (
+        session.execute(select(Claim).where(Claim.id.in_(list(reached))))
+        .scalars()
+        .all()
+    )
+    by_id = {claim.id: claim for claim in claims}
+    return [
+        (by_id[reached_id], reached_depth)
+        for reached_id, reached_depth in reached.items()
+    ]
+
+
 # Reviewer claim search paging bounds.
 DEFAULT_CLAIMS_LIMIT = 50
 MIN_CLAIMS_LIMIT = 1
