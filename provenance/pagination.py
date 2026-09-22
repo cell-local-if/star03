@@ -43,6 +43,9 @@ EXCHANGE_IMPORTS_CURSOR_VERSION = "ei1"
 #: Marker for cursors that page through exchange-import reconciliations.
 EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "ir1"
 
+#: Marker for cursors that page through checkpoint-import receipts.
+CHECKPOINT_IMPORTS_CURSOR_VERSION = "ci1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -245,6 +248,41 @@ EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR = CursorKind(
     version=EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR_VERSION,
     claim_fields=("limit", "offset"),
     validate=_validate_exchange_import_reconciliations_claims,
+)
+
+
+def _validate_checkpoint_imports_claims(claims: dict[str, Any]) -> None:
+    # The exact-match string filters are either absent (null) or non-empty
+    # strings; matching is case- and whitespace-sensitive, so the raw value
+    # is bound. The event-count filter is absent (null) or a non-negative
+    # integer.
+    _optional_nonempty_str(claims, "checkpoint_version")
+    _optional_nonempty_str(claims, "events_digest_hex")
+    event_count = claims["event_count"]
+    if event_count is not None and (
+        not _is_int(event_count) or event_count < 0
+    ):
+        raise InvalidCursorError("cursor event_count is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/audit-events/checkpoint-imports``.
+CHECKPOINT_IMPORTS_CURSOR = CursorKind(
+    version=CHECKPOINT_IMPORTS_CURSOR_VERSION,
+    claim_fields=(
+        "checkpoint_version",
+        "events_digest_hex",
+        "event_count",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_checkpoint_imports_claims,
 )
 
 
