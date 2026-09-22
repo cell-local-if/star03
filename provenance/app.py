@@ -62,6 +62,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         secrets.token_bytes(32)
     )
     app.state.claims_cursor_secret = secrets.token_bytes(32)
+    app.state.evidence_bundles_cursor_secret = secrets.token_bytes(32)
 
     register_exception_handlers(app)
     app.include_router(v1_router)
