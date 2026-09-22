@@ -284,6 +284,22 @@ class ClaimSupersessionListResponse(BaseModel):
     count: int
 
 
+class ClaimSupersessionLineageItem(ClaimResponse):
+    """A claim reached by supersession traversal: the full public view plus depth.
+
+    ``depth`` is the shortest number of supersession edges from the
+    traversal origin; the origin claim itself is never included. The raw
+    payload is never stored and so is never part of this view.
+    """
+
+    depth: int
+
+
+class ClaimSupersessionLineageResponse(BaseModel):
+    items: list[ClaimSupersessionLineageItem]
+    count: int
+
+
 class EvidenceBundleCreate(BaseModel):
     # Evidence bytes must never reach the service: any field not declared
     # here (e.g. "data" or "evidence") is a client error, not silently

@@ -60,6 +60,8 @@ from provenance.schemas import (
     ClaimSupersessionCreate,
     ClaimSupersessionListResponse,
     ClaimSupersessionResponse,
+    ClaimSupersessionLineageItem,
+    ClaimSupersessionLineageResponse,
     ContentCreate,
     ContentExportResponse,
     ContentLineageItem,
@@ -597,6 +599,68 @@ def list_claim_supersessions(
     return ClaimSupersessionListResponse(
         items=[_claim_supersession_response(item) for item in items],
         count=len(items),
+    )
+
+
+def _claim_supersession_lineage_item(
+    claim, depth: int
+) -> ClaimSupersessionLineageItem:
+    # The full public claim view, with the traversal depth added.
+    fields = ClaimResponse.model_validate(claim).model_dump()
+    return ClaimSupersessionLineageItem(**fields, depth=depth)
+
+
+@router.get(
+    "/claims/{claim_id}/supersession-lineage",
+    response_model=ClaimSupersessionLineageResponse,
+)
+def get_claim_supersession_lineage(
+    claim_id: str,
+    request: Request,
+    session: DbSession,
+    direction: str | None = Query(default=None),
+    max_depth: str | None = Query(default=None),
+) -> ClaimSupersessionLineageResponse:
+    # Read-only reviewer multi-hop traversal over the immutable supersession
+    # graph. Raw multi-values are inspected deliberately: FastAPI otherwise
+    # keeps only the last value of a repeated scalar parameter and Pydantic
+    # coerces "8.0" to 8, both of which must be rejected rather than silently
+    # defaulted or normalized.
+    raw = request.query_params
+
+    direction = _parse_once(raw, "direction")
+    if direction is None:
+        raise _query_validation_error(
+            "direction", "Field required", "value_error.missing"
+        )
+    if direction not in service.SUPERSESSION_LINEAGE_DIRECTIONS:
+        # Covers missing values, whitespace/blank strings, and any value
+        # other than the two literal traversal directions.
+        raise _query_validation_error(
+            "direction",
+            "direction must be 'newer' or 'older'",
+            "value_error",
+        )
+
+    depth = _parse_int_param(
+        raw,
+        "max_depth",
+        service.DEFAULT_SUPERSESSION_LINEAGE_MAX_DEPTH,
+        service.MIN_SUPERSESSION_LINEAGE_MAX_DEPTH,
+        service.MAX_SUPERSESSION_LINEAGE_MAX_DEPTH,
+    )
+
+    # Parameters are validated first; a structurally valid request for an
+    # unknown origin claim is the existing claim_not_found 404, not an empty
+    # collection. The traversal is read-only, dedups at shortest depth, and
+    # terminates over anomalous cyclic history; it renders only existing
+    # claim public views plus depth, never the payload.
+    rows = service.get_claim_supersession_lineage(
+        session, claim_id, direction, depth
+    )
+    return ClaimSupersessionLineageResponse(
+        items=[_claim_supersession_lineage_item(claim, d) for claim, d in rows],
+        count=len(rows),
     )
 
 
