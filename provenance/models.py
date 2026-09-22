@@ -46,6 +46,7 @@ EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
 EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
+EVENT_AUDIT_CHECKPOINT_IMPORTED = "audit.checkpoint_imported"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -542,6 +543,60 @@ class ExchangeImportRecord(Base):
     evidence_bundle_id: Mapped[str] = mapped_column(String(80), nullable=False)
     #: The SHA-256 manifest digest the received snapshot was verified against.
     manifest_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+
+class CheckpointImportRecord(Base):
+    """An immutable receipt for one offline-verified audit-checkpoint import.
+
+    The record is the controlled-import counterpart of the stateless
+    checkpoint verification route: a checkpoint whose fixed version and
+    digest algorithm are supported, whose claimed event count matches the
+    received array, and whose claimed digest matches the canonical
+    SHA-256 of the events exactly as received is registered exactly once.
+    The receipt stores only the receiving identity -- the checkpoint
+    version, the number of events, and the events digest -- never the
+    event array itself and never any event resource id, type, or timestamp
+    beyond the verified digest; the full events must be re-presented on a
+    retry. Verification never depends on, and never resolves against, the
+    locally stored audit events, so there are no foreign keys and no local
+    audit-event lookup in the decision.
+
+    Records are append-only and immutable; there is deliberately no update
+    or delete path. The identity triple is unique, so a retried submission
+    for the same checkpoint returns the original record without another
+    audit event.
+    """
+
+    __tablename__ = "audit_checkpoint_imports"
+    __table_args__ = (
+        UniqueConstraint(
+            "checkpoint_version",
+            "event_count",
+            "events_digest_hex",
+            name="uq_checkpoint_imports_identity",
+        ),
+        Index(
+            "ix_checkpoint_imports_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable receipt identifier ("aci_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: Fixed checkpoint format version committed to by the import.
+    checkpoint_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The number of events the received checkpoint covers.
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The SHA-256 events digest the received array was verified against.
+    events_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, nullable=False, default=utc_now
     )
