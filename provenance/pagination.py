@@ -59,6 +59,10 @@ CLAIMS_CURSOR_VERSION = "cl1"
 #: Marker for cursors that page through the reviewer evidence-bundle search.
 EVIDENCE_BUNDLES_CURSOR_VERSION = "eb1"
 
+#: Marker for cursors that page through one subject's authentication-key
+#: rotation records.
+AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION = "ak1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -394,6 +398,29 @@ EVIDENCE_BUNDLES_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_evidence_bundles_claims,
+)
+
+
+def _validate_authentication_key_rotations_claims(claims: dict[str, Any]) -> None:
+    # The collection is scoped to one existing subject; the cursor binds the
+    # exact actor id, which must be a non-empty string.
+    if not isinstance(claims["actor_id"], str) or not claims["actor_id"]:
+        raise InvalidCursorError("cursor actor_id is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for
+#: ``GET /v1/actors/{actor_id}/authentication-key-rotations``.
+AUTHENTICATION_KEY_ROTATIONS_CURSOR = CursorKind(
+    version=AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION,
+    claim_fields=("actor_id", "limit", "offset"),
+    validate=_validate_authentication_key_rotations_claims,
 )
 
 

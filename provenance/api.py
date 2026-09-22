@@ -50,6 +50,7 @@ from provenance.schemas import (
     AuditEventItem,
     AuditEventPageResponse,
     AuthenticationKeyRotationCreate,
+    AuthenticationKeyRotationPageResponse,
     AuthenticationKeyRotationResponse,
     ClaimCreate,
     ClaimExportItem,
@@ -1584,6 +1585,109 @@ async def retire_authentication_key_rotation(
         session, rotation_id, caller
     )
     return _rotation_response(rotation)
+
+
+_AUTHENTICATION_KEY_ROTATIONS_PARAMS = frozenset({"limit", "cursor"})
+
+
+@router.get(
+    "/actors/{actor_id}/authentication-key-rotations",
+    response_model=AuthenticationKeyRotationPageResponse,
+)
+def list_authentication_key_rotations(
+    actor_id: str,
+    request: Request,
+    session: DbSession,
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> AuthenticationKeyRotationPageResponse:
+    # Read-only reviewer retrieval of one existing subject's rotation
+    # history. Raw multi-values are inspected deliberately: a repeated
+    # scalar is rejected instead of silently taking the last value,
+    # undeclared parameters are rejected rather than ignored, and a blank
+    # limit is never coerced to its default.
+    raw = request.query_params
+
+    unknown = set(raw) - _AUTHENTICATION_KEY_ROTATIONS_PARAMS
+    if unknown:
+        # The collection accepts only limit/cursor; a typo never silently
+        # changes the page.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_AUTHENTICATION_KEY_ROTATIONS_LIMIT,
+        service.MIN_AUTHENTICATION_KEY_ROTATIONS_LIMIT,
+        service.MAX_AUTHENTICATION_KEY_ROTATIONS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.authentication_key_rotations_cursor_secret,
+                pagination.AUTHENTICATION_KEY_ROTATIONS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the bound
+        # subject and the effective limit must match exactly.
+        if claims["actor_id"] != actor_id or claims["limit"] != page_limit:
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Parameters and cursor are validated first; a malformed request is a
+    # 422 regardless of the subject. A structurally valid request for an
+    # unknown subject is the existing unknown_actor 404, not an empty
+    # collection. Strictly read-only: the listing writes no rotation,
+    # resource, or audit event.
+    items = service.list_authentication_key_rotations_for_actor(
+        session, actor_id
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.authentication_key_rotations_cursor_secret,
+                pagination.AUTHENTICATION_KEY_ROTATIONS_CURSOR,
+                {
+                    "actor_id": actor_id,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the existing rotation public view: the 32 public-key
+    # bytes (Base64), lifecycle flag, and UTC timestamps. The internal seq
+    # is never rendered, and no private key, raw signature, or
+    # authentication header is stored or echoed.
+    return AuthenticationKeyRotationPageResponse(
+        items=[_rotation_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
 
 
 @router.get(

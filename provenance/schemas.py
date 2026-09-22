@@ -1205,3 +1205,13 @@ class AuthenticationKeyRotationResponse(BaseModel):
     created_at: datetime
     #: UTC retirement time, or null while the key is active.
     retired_at: datetime | None
+
+
+class AuthenticationKeyRotationPageResponse(BaseModel):
+    """A cursor-paginated page of one subject's public rotation views."""
+
+    items: list[AuthenticationKeyRotationResponse]
+    #: Total number of the subject's rotations, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None

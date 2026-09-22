@@ -93,6 +93,10 @@ _CONTENT_RELATION_ORDER = (
     ContentRelation.seq.asc(),
 )
 _AUDIT_EVENT_ORDER = (AuditEvent.created_at.asc(), AuditEvent.seq.asc())
+_AUTHENTICATION_KEY_ROTATION_ORDER = (
+    AuthenticationKeyRotation.created_at.asc(),
+    AuthenticationKeyRotation.seq.asc(),
+)
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -1094,6 +1098,36 @@ def retire_authentication_key_rotation(
     # onto the identity-map object before returning it.
     session.refresh(rotation)
     return rotation
+
+
+# Reviewer authentication-key rotation listing paging bounds.
+DEFAULT_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 50
+MIN_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 1
+MAX_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 100
+
+
+def list_authentication_key_rotations_for_actor(
+    session: Session, actor_id: str
+) -> list[AuthenticationKeyRotation]:
+    """Return one existing subject's key rotations in stable creation order.
+
+    The subject must exist; an unknown actor id is a missing resource
+    (:class:`UnknownActorError`), not an empty collection. A subject with no
+    rotations returns an empty list. Results follow the rotations' stable
+    creation order (``created_at`` with the monotonic ``seq`` tiebreaker).
+    The read is strictly read-only: it writes no rotation, resource, or
+    audit event. Only public-key material is ever present; there is no
+    private key or raw signature column to render.
+    """
+    actor = session.get(Actor, actor_id)
+    if actor is None:
+        raise UnknownActorError(actor_id)
+    stmt = (
+        select(AuthenticationKeyRotation)
+        .where(AuthenticationKeyRotation.actor_id == actor_id)
+        .order_by(*_AUTHENTICATION_KEY_ROTATION_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
 
 
 def get_content_export(
