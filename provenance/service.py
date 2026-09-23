@@ -1360,6 +1360,52 @@ def get_accessible_attestation(
     return attestation if grant_exists is not None else None
 
 
+DEFAULT_ATTESTATION_ACCESS_GRANTS_LIMIT = 50
+MIN_ATTESTATION_ACCESS_GRANTS_LIMIT = 1
+MAX_ATTESTATION_ACCESS_GRANTS_LIMIT = 100
+
+
+def list_access_grants_for_attestation(
+    session: Session, attestation_id: str
+) -> list[AttestationAccessGrant]:
+    """Return one proof's access-grant records in stable creation order.
+
+    Records are selected by their ``attestation_id`` column alone -- never by
+    grantee or any other field. An existing attestation without any grants
+    yields an empty list. The function performs no existence or
+    authorization check: the protected route decides the opaque-404
+    boundary, and a missing proof is indistinguishable from an unauthorized
+    caller. The function is strictly read-only: it writes no grant,
+    attestation, resource, or audit event.
+    """
+    stmt = (
+        select(AttestationAccessGrant)
+        .where(AttestationAccessGrant.attestation_id == attestation_id)
+        .order_by(*_ATTESTATION_ACCESS_GRANT_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
+
+
+def get_attestation_if_signer(
+    session: Session, attestation_id: str, actor_id: str
+) -> Attestation | None:
+    """Return the attestation iff ``actor_id`` is its signer, else ``None``.
+
+    Unlike :func:`get_accessible_attestation`, an access-grant grantee is not
+    enough here: only the proof's ``signer_actor_id`` may enumerate its
+    grants. A missing proof and a non-signer caller are indistinguishable --
+    both return ``None`` so the protected route answers with one opaque 404
+    and existence is never revealed. The function is strictly read-only: it
+    performs no resource or audit writes.
+    """
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == attestation_id)
+    ).scalar_one_or_none()
+    if attestation is None:
+        return None
+    return attestation if attestation.signer_actor_id == actor_id else None
+
+
 DEFAULT_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 50
 MIN_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 1
 MAX_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 100

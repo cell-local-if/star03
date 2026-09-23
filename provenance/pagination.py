@@ -63,6 +63,9 @@ EVIDENCE_BUNDLES_CURSOR_VERSION = "eb1"
 #: rotations.
 AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION = "ak1"
 
+#: Marker for cursors that page through one attestation's access grants.
+ATTESTATION_ACCESS_GRANTS_CURSOR_VERSION = "ag1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -422,6 +425,36 @@ AUTHENTICATION_KEY_ROTATIONS_CURSOR = CursorKind(
     version=AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION,
     claim_fields=("actor_id", "limit", "offset"),
     validate=_validate_authentication_key_rotations_claims,
+)
+
+
+def _validate_attestation_access_grants_claims(claims: dict[str, Any]) -> None:
+    # The collection belongs to exactly one proof and one authenticated
+    # caller: both are non-empty strings bound as claims. Matching is case-
+    # and whitespace-sensitive, so the raw path/header values are bound.
+    if not isinstance(claims["attestation_id"], str) or not claims[
+        "attestation_id"
+    ]:
+        raise InvalidCursorError("cursor attestation_id is invalid")
+    if not isinstance(claims["caller_actor_id"], str) or not claims[
+        "caller_actor_id"
+    ]:
+        raise InvalidCursorError("cursor caller_actor_id is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for
+#: ``GET /v1/attestations/{attestation_id}/access-grants``.
+ATTESTATION_ACCESS_GRANTS_CURSOR = CursorKind(
+    version=ATTESTATION_ACCESS_GRANTS_CURSOR_VERSION,
+    claim_fields=("attestation_id", "caller_actor_id", "limit", "offset"),
+    validate=_validate_attestation_access_grants_claims,
 )
 
 

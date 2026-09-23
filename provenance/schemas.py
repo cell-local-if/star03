@@ -953,6 +953,16 @@ class AttestationAccessGrantResponse(BaseModel):
     created_at: datetime
 
 
+class AttestationAccessGrantPageResponse(BaseModel):
+    """A cursor-paginated page of grant public views for one proof."""
+
+    items: list[AttestationAccessGrantResponse]
+    #: Total number of grants on the proof, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class AttestationAccessGrantRevocationCreate(BaseModel):
     # A grant revocation carries exactly its declared fields; undeclared
     # fields are rejected rather than silently discarded.

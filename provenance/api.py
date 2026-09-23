@@ -30,6 +30,7 @@ from provenance.schemas import (
     ActorCreate,
     ActorResponse,
     AttestationAccessGrantCreate,
+    AttestationAccessGrantPageResponse,
     AttestationAccessGrantResponse,
     AttestationAccessGrantRevocationCreate,
     AttestationAccessGrantRevocationListResponse,
@@ -1720,6 +1721,138 @@ async def get_protected_attestation(
     if attestation is None:
         raise ProtectedResourceNotFoundError()
     return _attestation_response(attestation)
+
+
+_ATTESTATION_ACCESS_GRANTS_PARAMS = frozenset({"limit", "cursor"})
+
+
+@router.get(
+    "/attestations/{attestation_id}/access-grants",
+    response_model=AttestationAccessGrantPageResponse,
+)
+async def list_attestation_access_grants(
+    attestation_id: str,
+    request: Request,
+    session: DbSession,
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> AttestationAccessGrantPageResponse:
+    # Read-only, signer-only enumeration of one proof's access grants.
+    #
+    # Query validation happens first, deliberately: raw multi-values are
+    # inspected so a repeated scalar is rejected instead of silently taking
+    # the last value, any parameter other than limit/cursor is rejected
+    # rather than ignored, and a blank or non-integer limit is never coerced
+    # to the default. Every such failure is a 422, so a malformed request
+    # never collapses into the opaque 404 below.
+    raw = request.query_params
+
+    unknown = set(raw) - _ATTESTATION_ACCESS_GRANTS_PARAMS
+    if unknown:
+        # The collection accepts only limit/cursor; a typo never silently
+        # changes the page.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_ATTESTATION_ACCESS_GRANTS_LIMIT,
+        service.MIN_ATTESTATION_ACCESS_GRANTS_LIMIT,
+        service.MAX_ATTESTATION_ACCESS_GRANTS_LIMIT,
+    )
+
+    cursor_token = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor_token is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.attestation_access_grants_cursor_secret,
+                pagination.ATTESTATION_ACCESS_GRANTS_CURSOR,
+                cursor_token,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+
+    # A GET carries no body; the signed body_sha256 is therefore the digest
+    # of zero bytes. As on the single-proof protected read, only malformed
+    # credentials are a 422 here; missing or unverifiable credentials
+    # collapse into the same opaque 404 as a missing target or a non-signer.
+    raw_body = await request.body()
+    actor = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+
+    if cursor_token is not None:
+        # The cursor only resumes the query that issued it: the origin proof,
+        # the authenticated caller, and the effective limit must all match
+        # exactly. A cursor from another proof or caller, another endpoint's
+        # family, or a different limit is a client validation error rather
+        # than a new query -- decided before the proof lookup, as on the
+        # other paginated collections.
+        if (
+            claims["attestation_id"] != attestation_id
+            or claims["caller_actor_id"] != actor
+            or claims["limit"] != page_limit
+        ):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # A missing target and a non-signer caller are indistinguishable: both
+    # are the same opaque 404. A grantee may read the proof itself but may
+    # not enumerate who else holds grants.
+    attestation = service.get_attestation_if_signer(
+        session, attestation_id, actor
+    )
+    if attestation is None:
+        raise ProtectedResourceNotFoundError()
+
+    items = service.list_access_grants_for_attestation(
+        session, attestation_id
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.attestation_access_grants_cursor_secret,
+                pagination.ATTESTATION_ACCESS_GRANTS_CURSOR,
+                {
+                    "attestation_id": attestation_id,
+                    "caller_actor_id": actor,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the existing four-field grant public view. Revocation
+    # records, private keys, raw signatures, authentication headers,
+    # payloads, and request bytes are never part of that view and so can
+    # never be echoed; the read writes no resource and no audit event.
+    return AttestationAccessGrantPageResponse(
+        items=[
+            AttestationAccessGrantResponse.model_validate(item) for item in page
+        ],
+        count=total,
+        next_cursor=next_cursor,
+    )
 
 
 def _rotation_response(rotation) -> AuthenticationKeyRotationResponse:

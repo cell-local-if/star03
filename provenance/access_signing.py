@@ -1,8 +1,9 @@
 """Authentication for protected proof access (the ``X-PA``/``X-PT``/``X-PS`` contract).
 
-Both ``POST /v1/attestation-access-grants`` and
-``GET /v1/protected/attestations/{attestation_id}`` authenticate the caller
-with three headers:
+``POST /v1/attestation-access-grants``,
+``GET /v1/protected/attestations/{attestation_id}``, and
+``GET /v1/attestations/{attestation_id}/access-grants`` all authenticate the
+caller with three headers:
 
 ``X-PA``
     The calling actor id.
