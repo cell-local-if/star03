@@ -268,3 +268,19 @@ def checkpoint_import_id(
         ensure_ascii=False,
     ).encode("utf-8")
     return "aci_" + hashlib.sha256(material).hexdigest()
+
+
+def content_export_job_id(content_id: str, request_id: str) -> str:
+    """Return a stable ``cej_``-prefixed identifier for an export job.
+
+    The identity is exactly the idempotency key: the referenced content id
+    and the client-supplied request id. A retried submission of the same pair
+    maps to the same job. The material is a canonical JSON array so fields
+    containing separators cannot collide with different field splits.
+    """
+    material = json.dumps(
+        ["content_export_job", content_id, request_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "cej_" + hashlib.sha256(material).hexdigest()

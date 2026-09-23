@@ -65,6 +65,46 @@ class ContentNotFoundError(DomainError):
         super().__init__(details={"content_id": content_id})
 
 
+class ContentExportRequestConflictError(DomainError):
+    """The supplied ``request_id`` already names a job for other content.
+
+    An idempotency key is bound to exactly one content: reusing a request id
+    with a different content id is a 409 that writes no job or audit event.
+    """
+
+    status_code = 409
+    code = "content_export_request_conflict"
+    message = "The request_id is already associated with a different content."
+
+    def __init__(self, request_id: str):
+        super().__init__(details={"request_id": request_id})
+
+
+class ContentExportJobNotFoundError(DomainError):
+    status_code = 404
+    code = "content_export_job_not_found"
+    message = "The requested content export job does not exist."
+
+    def __init__(self, job_id: str):
+        super().__init__(details={"job_id": job_id})
+
+
+class ContentExportJobConflictError(DomainError):
+    """A run was requested for a job that is not pending.
+
+    Only a pending job can be claimed; a running, succeeded, or failed job
+    (including one a concurrent request just claimed first) rejects a repeat
+    run with 409 and performs no state change or audit write.
+    """
+
+    status_code = 409
+    code = "content_export_job_conflict"
+    message = "The content export job is not pending and cannot be run."
+
+    def __init__(self, job_id: str):
+        super().__init__(details={"job_id": job_id})
+
+
 class ClaimNotFoundError(DomainError):
     status_code = 404
     code = "claim_not_found"

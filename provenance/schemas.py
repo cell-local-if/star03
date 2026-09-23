@@ -435,6 +435,53 @@ class ContentExportResponse(BaseModel):
     claims: list[ClaimExportItem]
 
 
+class ContentExportJobCreate(BaseModel):
+    """A request to create (or idempotently reuse) one content export job.
+
+    Exactly two members: the existing content to export and a non-empty
+    client-supplied ``request_id`` idempotency key. Undeclared members are
+    rejected rather than silently discarded.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content_id: str = Field(..., min_length=1, max_length=80)
+    #: Client-supplied idempotency key; non-empty and bound to this content.
+    request_id: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("content_id")
+    @classmethod
+    def _content_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "content_id")
+
+    @field_validator("request_id")
+    @classmethod
+    def _request_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "request_id")
+
+
+class ContentExportJobResponse(BaseModel):
+    """Public view of one asynchronous content export job.
+
+    Carries the stable ``cej_`` id, the content and idempotency key, the
+    lifecycle ``status``, and three UTC timestamps (``created_at`` always;
+    ``started_at``/``finished_at`` null until their lifecycle points).
+    ``result`` is the existing read-only content export once the job has
+    succeeded and is null before; ``error`` is the fixed
+    ``content_export_failed`` code once the job has failed and null otherwise.
+    """
+
+    id: str
+    content_id: str
+    request_id: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    result: ContentExportResponse | None
+    error: str | None
+
+
 class EvidenceBundleExchangeResponse(BaseModel):
     """An interoperability snapshot of one evidence bundle for external verifiers.
 

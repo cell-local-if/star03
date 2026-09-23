@@ -67,6 +67,8 @@ from provenance.schemas import (
     ClaimSupersessionLineageItem,
     ClaimSupersessionLineageResponse,
     ContentCreate,
+    ContentExportJobCreate,
+    ContentExportJobResponse,
     ContentExportResponse,
     ContentLineageItem,
     ContentLineageResponse,
@@ -1433,6 +1435,88 @@ def get_content_export(
             for claim in claims
         ],
     )
+
+
+def _export_job_response(job) -> ContentExportJobResponse:
+    """Render one export job ORM row as its public view.
+
+    The stored JSON ``result`` (null until success) is re-validated through
+    the existing content export response schema; the ORM attribute is named
+    ``result_`` only to stay clear of the declarative reserved name.
+    """
+    return ContentExportJobResponse(
+        id=job.id,
+        content_id=job.content_id,
+        request_id=job.request_id,
+        status=job.status,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        result=(
+            ContentExportResponse.model_validate(job.result_)
+            if job.result_ is not None
+            else None
+        ),
+        error=job.error,
+    )
+
+
+@router.post(
+    "/content-export-jobs",
+    response_model=ContentExportJobResponse,
+)
+def create_content_export_job(
+    payload: ContentExportJobCreate,
+    request: Request,
+    session: DbSession,
+    response: Response,
+) -> ContentExportJobResponse:
+    # The create takes no query parameters: any parameter at all is a 422
+    # before the content/key lookup, so a malformed request never renders as
+    # a missing content or a key conflict.
+    _reject_any_query_param(request)
+    job, created = service.create_content_export_job(session, payload)
+    # First creation of this (content, request_id) pair -> 201; a retried
+    # submission of the same pair -> 200 with the original job and no new
+    # audit event. A request_id reused for different content is a 409.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _export_job_response(job)
+
+
+@router.get(
+    "/content-export-jobs/{job_id}",
+    response_model=ContentExportJobResponse,
+)
+def get_content_export_job(
+    job_id: str, request: Request, session: DbSession
+) -> ContentExportJobResponse:
+    # The read takes no query parameters: any parameter at all is a 422
+    # before the job lookup, so a malformed request never renders as a 404.
+    _reject_any_query_param(request)
+    # Strictly read-only: the read returns one job's public view and writes
+    # no job, result, or audit event. An unknown id is an explicit, specific
+    # 404 carrying the requested id.
+    job = service.get_content_export_job(session, job_id)
+    return _export_job_response(job)
+
+
+@router.post(
+    "/content-export-jobs/{job_id}/run",
+    response_model=ContentExportJobResponse,
+)
+def run_content_export_job(
+    job_id: str, request: Request, session: DbSession
+) -> ContentExportJobResponse:
+    # The run takes no query parameters: any parameter at all is a 422
+    # before the job lookup.
+    _reject_any_query_param(request)
+    # The pending claim is atomic: exactly one run can move the job out of
+    # pending. The response is always 200 for the winning run; a non-pending
+    # (or concurrently claimed) job is a 409, and an unknown id is a 404.
+    job = service.run_content_export_job(session, job_id)
+    return _export_job_response(job)
 
 
 def _parse_nonempty_filter(raw, field: str) -> str | None:

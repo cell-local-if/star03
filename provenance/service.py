@@ -24,6 +24,9 @@ from provenance.errors import (
     ClaimNotFoundError,
     ClaimSupersessionNotFoundError,
     ClaimSupersessionValidationError,
+    ContentExportJobConflictError,
+    ContentExportJobNotFoundError,
+    ContentExportRequestConflictError,
     ContentNotFoundError,
     ContentRelationNotFoundError,
     ContentRelationValidationError,
@@ -44,9 +47,16 @@ from provenance.models import (
     EVENT_CLAIM_CREATED,
     EVENT_CLAIM_SUPERSEDED,
     EVENT_CONTENT_CREATED,
+    EVENT_CONTENT_EXPORT_JOB_CREATED,
+    EVENT_CONTENT_EXPORT_JOB_RUN,
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
+    EXPORT_JOB_ERROR_FAILED,
+    EXPORT_JOB_FAILED,
+    EXPORT_JOB_PENDING,
+    EXPORT_JOB_RUNNING,
+    EXPORT_JOB_SUCCEEDED,
     Actor,
     Attestation,
     AttestationAccessGrant,
@@ -58,6 +68,7 @@ from provenance.models import (
     Claim,
     ClaimSupersession,
     Content,
+    ContentExportJob,
     ContentRelation,
     EvidenceBundle,
     ExchangeImportRecord,
@@ -71,12 +82,18 @@ from provenance.schemas import (
     AuditCheckpointImportCreate,
     AuthenticationKeyRotationCreate,
     ClaimCreate,
+    ClaimExportItem,
+    ClaimResponse,
     ClaimSupersessionCreate,
     ContentCreate,
+    ContentExportJobCreate,
+    ContentExportResponse,
     ContentRelationCreate,
-    EvidenceBundleExchangeImportCreate,
+    ContentResponse,
     EvidenceBundleCreate,
+    EvidenceBundleExchangeImportCreate,
     EvidenceBundleImportCreate,
+    EvidenceBundleResponse,
 )
 from provenance.time_utils import utc_now
 
@@ -1600,6 +1617,211 @@ def get_content_export(
         for bundle in bundles:
             bundles_by_claim[bundle.claim_id].append(bundle)
     return content, claims, bundles_by_claim
+
+
+def _content_export_result_dict(
+    session: Session, content_id: str
+) -> dict:
+    """Build the JSON-stored result payload for one content export job.
+
+    The value is exactly the existing read-only content export public view
+    (``content`` plus its directly-asserting ``claims`` each with its
+    ``evidence_bundles``), rendered to JSON-safe data so it can be persisted
+    in the job's JSON ``result`` column and later re-validated through the
+    existing :class:`ContentExportResponse` schema.
+    """
+    content, claims, bundles_by_claim = get_content_export(session, content_id)
+    return ContentExportResponse(
+        content=ContentResponse.model_validate(content),
+        claims=[
+            ClaimExportItem(
+                **ClaimResponse.model_validate(claim).model_dump(),
+                evidence_bundles=[
+                    EvidenceBundleResponse(
+                        id=bundle.id,
+                        claim_id=bundle.claim_id,
+                        evidence_type=bundle.evidence_type,
+                        digest_algorithm=bundle.digest_algorithm,
+                        digest_hex=bundle.digest_hex,
+                        media_type=bundle.media_type,
+                        metadata=bundle.metadata_,
+                        created_at=bundle.created_at,
+                    )
+                    for bundle in bundles_by_claim[claim.id]
+                ],
+            )
+            for claim in claims
+        ],
+    ).model_dump(mode="json")
+
+
+def create_content_export_job(
+    session: Session, payload: ContentExportJobCreate
+) -> tuple[ContentExportJob, bool]:
+    """Create a pending content export job, returning ``(job, created)``.
+
+    The referenced content must exist; an unknown content is a
+    :class:`ContentNotFoundError` 404 before any write. The client-supplied
+    ``request_id`` is the idempotency key: a retried submission of the same
+    ``(content_id, request_id)`` pair returns the existing job with
+    ``created=False`` and writes no row or audit event. Reusing a
+    ``request_id`` that already names a job for different content is a
+    :class:`ContentExportRequestConflictError` 409 and writes nothing. On
+    first creation the pending job row and its
+    ``content_export_job.created`` audit event commit in a single
+    transaction.
+    """
+    # Validate the referenced content before any idempotency lookup: an
+    # unknown content is a missing resource, distinct from a key conflict.
+    _require_content(session, payload.content_id)
+
+    existing = session.execute(
+        select(ContentExportJob).where(
+            ContentExportJob.request_id == payload.request_id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.content_id != payload.content_id:
+            raise ContentExportRequestConflictError(payload.request_id)
+        return existing, False
+
+    job = ContentExportJob(
+        id=ids.content_export_job_id(payload.content_id, payload.request_id),
+        content_id=payload.content_id,
+        request_id=payload.request_id,
+        status=EXPORT_JOB_PENDING,
+        started_at=None,
+        finished_at=None,
+        result_=None,
+        error=None,
+    )
+    session.add(job)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_CONTENT_EXPORT_JOB_CREATED, resource_id=job.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent creation committed a job with this request_id (or the
+        # same pair) first: roll back and resolve the outcome rather than
+        # duplicating the row or writing a second audit event.
+        session.rollback()
+        raced = session.execute(
+            select(ContentExportJob).where(
+                ContentExportJob.request_id == payload.request_id
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if raced.content_id != payload.content_id:
+            raise ContentExportRequestConflictError(payload.request_id) from None
+        return raced, False
+    session.refresh(job)
+    return job, True
+
+
+def get_content_export_job(session: Session, job_id: str) -> ContentExportJob:
+    """Return an export job by id or raise :class:`ContentExportJobNotFoundError`.
+
+    Strictly read-only: it writes no job and no audit event.
+    """
+    job = session.execute(
+        select(ContentExportJob).where(ContentExportJob.id == job_id)
+    ).scalar_one_or_none()
+    if job is None:
+        raise ContentExportJobNotFoundError(job_id)
+    return job
+
+
+def run_content_export_job(session: Session, job_id: str) -> ContentExportJob:
+    """Atomically claim a pending job and run its export to completion.
+
+    The pending-to-running claim is one conditional UPDATE (matched on
+    ``status == 'pending'``), so exactly one of any concurrent run requests
+    can claim the job: a job that is running, succeeded, or failed -- or a
+    pending job a concurrent request claimed first -- rejects the repeat run
+    with :class:`ContentExportJobConflictError` 409 and performs no state
+    change or audit write. An unknown job id is the
+    :class:`ContentExportJobNotFoundError` 404.
+
+    On the winning claim the export runs inline. Success finalizes the job
+    ``succeeded`` with a UTC ``finished_at`` and the existing content export
+    stored as ``result``; any production failure finalizes it ``failed`` with
+    a UTC ``finished_at``, ``result`` left null, and ``error`` set to the
+    fixed ``content_export_failed`` code. Either terminal transition and its
+    ``content_export_job.run`` audit event commit in the same transaction as
+    the original claim, so the lifecycle never commits a half-applied run.
+    """
+    job = session.execute(
+        select(ContentExportJob).where(ContentExportJob.id == job_id)
+    ).scalar_one_or_none()
+    if job is None:
+        raise ContentExportJobNotFoundError(job_id)
+
+    started_at = utc_now()
+    claimed = session.execute(
+        sa_update(ContentExportJob)
+        .where(
+            ContentExportJob.id == job_id,
+            ContentExportJob.status == EXPORT_JOB_PENDING,
+        )
+        .values(status=EXPORT_JOB_RUNNING, started_at=started_at)
+    )
+    if claimed.rowcount != 1:
+        # The row existed but was not pending, or a concurrent transaction
+        # claimed it first: this request performs no transition and writes no
+        # audit event.
+        session.rollback()
+        raise ContentExportJobConflictError(job_id)
+
+    finished_at = utc_now()
+    try:
+        result = _content_export_result_dict(session, job.content_id)
+    except Exception:
+        # The export could not be produced: record the terminal failure (but
+        # not its internals) in the same transaction as the claim and run
+        # audit event. result stays null; error is the fixed failure code.
+        session.execute(
+            sa_update(ContentExportJob)
+            .where(ContentExportJob.id == job_id)
+            .values(
+                {
+                    ContentExportJob.status: EXPORT_JOB_FAILED,
+                    ContentExportJob.finished_at: finished_at,
+                    ContentExportJob.result_: None,
+                    ContentExportJob.error: EXPORT_JOB_ERROR_FAILED,
+                }
+            )
+        )
+        session.add(
+            AuditEvent(
+                event_type=EVENT_CONTENT_EXPORT_JOB_RUN, resource_id=job_id
+            )
+        )
+        session.commit()
+        session.refresh(job)
+        return job
+
+    session.execute(
+        sa_update(ContentExportJob)
+        .where(ContentExportJob.id == job_id)
+        .values(
+            {
+                ContentExportJob.status: EXPORT_JOB_SUCCEEDED,
+                ContentExportJob.finished_at: finished_at,
+                ContentExportJob.result_: result,
+                ContentExportJob.error: None,
+            }
+        )
+    )
+    session.add(
+        AuditEvent(event_type=EVENT_CONTENT_EXPORT_JOB_RUN, resource_id=job_id)
+    )
+    session.commit()
+    session.refresh(job)
+    return job
 
 
 def get_evidence_bundle_exchange(

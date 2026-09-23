@@ -34,6 +34,14 @@ RELATION_VERSION_OF = "version_of"
 RELATION_DERIVED_FROM = "derived_from"
 SUPPORTED_RELATION_TYPES = frozenset({RELATION_VERSION_OF, RELATION_DERIVED_FROM})
 
+# Content export job lifecycle states.
+EXPORT_JOB_PENDING = "pending"
+EXPORT_JOB_RUNNING = "running"
+EXPORT_JOB_SUCCEEDED = "succeeded"
+EXPORT_JOB_FAILED = "failed"
+# The single error code carried by a terminally failed export job.
+EXPORT_JOB_ERROR_FAILED = "content_export_failed"
+
 # Audit event types.
 EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
@@ -49,6 +57,8 @@ EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
 EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 EVENT_AUDIT_CHECKPOINT_IMPORTED = "audit.checkpoint_imported"
+EVENT_CONTENT_EXPORT_JOB_CREATED = "content_export_job.created"
+EVENT_CONTENT_EXPORT_JOB_RUN = "content_export_job.run"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -734,3 +744,76 @@ class CheckpointImportRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, nullable=False, default=utc_now
     )
+
+
+class ContentExportJob(Base):
+    """An asynchronous, idempotent job that produces one content export.
+
+    A job is created pending and never runs until explicitly triggered. The
+    client supplies a ``request_id`` idempotency key: resubmitting the same
+    ``(content_id, request_id)`` pair returns the original job, while reusing
+    a ``request_id`` for different content is a conflict and writes nothing.
+
+    Lifecycle: ``pending`` -> ``running`` -> ``succeeded`` | ``failed``. The
+    pending-to-running claim is a single atomic conditional update, so two
+    concurrent runs cannot both start. On success the existing read-only
+    content export (the content and its directly-asserting claims with their
+    evidence bundles) is stored as the JSON ``result``; on failure ``result``
+    stays null and ``error`` records the fixed failure code. Every state
+    transition is committed in the same transaction as its audit event.
+
+    Timestamps are UTC: ``created_at`` at creation; ``started_at`` when the
+    run is claimed; ``finished_at`` when a terminal state is reached. All
+    three are null until their lifecycle point.
+    """
+
+    __tablename__ = "content_export_jobs"
+    __table_args__ = (
+        # The idempotency key as a pair: a retry of the same pair returns the
+        # original job.
+        UniqueConstraint(
+            "content_id",
+            "request_id",
+            name="uq_content_export_jobs_content_request",
+        ),
+        # A request_id names exactly one job globally: reusing it for a
+        # different content is a conflict. Global uniqueness implies the pair
+        # constraint above, but both are declared so the idempotency key and
+        # the cross-content conflict are independently documented and enforced.
+        UniqueConstraint(
+            "request_id", name="uq_content_export_jobs_request_id"
+        ),
+        Index("ix_content_export_jobs_created_order", "created_at", "seq"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable job identifier ("cej_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    content_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("contents.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: Client-supplied idempotency key; non-empty.
+    request_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: pending | running | succeeded | failed.
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+    #: Set atomically when the pending job is claimed for a run; null before.
+    started_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+    #: Set when the run reaches succeeded or failed; null before.
+    finished_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+    #: The content export snapshot on success; null while pending/running or
+    #: once failed.
+    result_: Mapped[dict | None] = mapped_column("result", JSON, nullable=True)
+    #: The fixed content_export_failed code on failure; null otherwise.
+    error: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    content: Mapped[Content] = relationship()
