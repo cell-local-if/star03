@@ -67,6 +67,8 @@ from provenance.schemas import (
     ClaimSupersessionLineageItem,
     ClaimSupersessionLineageResponse,
     ContentCreate,
+    ContentExportJobCreate,
+    ContentExportJobResponse,
     ContentExportResponse,
     ContentLineageItem,
     ContentLineageResponse,
@@ -1433,6 +1435,97 @@ def get_content_export(
             for claim in claims
         ],
     )
+
+
+def _content_export_snapshot(session: Session, content_id: str) -> ContentExportResponse:
+    """Read-only content export snapshot, built exactly as the export route."""
+    content, claims, bundles_by_claim = service.get_content_export(
+        session, content_id
+    )
+    return ContentExportResponse(
+        content=ContentResponse.model_validate(content),
+        claims=[
+            ClaimExportItem(
+                **ClaimResponse.model_validate(claim).model_dump(),
+                evidence_bundles=[
+                    _bundle_response(bundle)
+                    for bundle in bundles_by_claim[claim.id]
+                ],
+            )
+            for claim in claims
+        ],
+    )
+
+
+def _content_export_result_payload(session: Session, content_id: str) -> dict:
+    """Wire-shaped ``{"content", "claims"}`` snapshot persisted as a job result.
+
+    ``model_dump(mode="json")`` yields exactly the body served by
+    ``GET /v1/contents/{content_id}/export`` (UTC datetimes as RFC 3339
+    strings), so a successful job's result is byte-for-byte that export.
+    """
+    return _content_export_snapshot(session, content_id).model_dump(mode="json")
+
+
+def _export_job_response(job) -> ContentExportJobResponse:
+    return ContentExportJobResponse(
+        id=job.id,
+        content_id=job.content_id,
+        request_id=job.request_id,
+        status=job.status,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        result=job.result,
+        error=job.error,
+    )
+
+
+@router.post(
+    "/content-export-jobs", response_model=ContentExportJobResponse
+)
+def create_content_export_job(
+    payload: ContentExportJobCreate, session: DbSession, response: Response
+) -> ContentExportJobResponse:
+    job, created = service.create_content_export_job(session, payload)
+    # First registration -> 201; a retried submission for the same
+    # (request_id, content_id) -> 200 with the original job and no new audit
+    # event. The same request_id for a different content is a 409.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _export_job_response(job)
+
+
+@router.get(
+    "/content-export-jobs/{job_id}",
+    response_model=ContentExportJobResponse,
+)
+def get_content_export_job(
+    job_id: str, session: DbSession
+) -> ContentExportJobResponse:
+    # Strictly read-only: the read returns one job's public view and writes
+    # no job and no audit event. An unknown id is an explicit, specific 404.
+    job = service.get_content_export_job(session, job_id)
+    return _export_job_response(job)
+
+
+@router.post(
+    "/content-export-jobs/{job_id}/run",
+    response_model=ContentExportJobResponse,
+)
+def run_content_export_job(
+    job_id: str, session: DbSession
+) -> ContentExportJobResponse:
+    # Atomically claim the pending job (running + UTC started_at), then build
+    # the existing read-only export and settle it as succeeded (result + UTC
+    # finished_at) or failed (null result, content_export_failed) in one
+    # transaction with the run audit event. A job that is not pending is a
+    # 409 conflict; an unknown id is a 404 content_export_job_not_found.
+    job = service.run_content_export_job(
+        session, job_id, _content_export_result_payload
+    )
+    return _export_job_response(job)
 
 
 def _parse_nonempty_filter(raw, field: str) -> str | None:

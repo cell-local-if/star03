@@ -8,6 +8,7 @@ adds no audit event.
 from __future__ import annotations
 
 import hashlib
+from typing import Callable
 
 from sqlalchemy import exists, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
@@ -24,6 +25,9 @@ from provenance.errors import (
     ClaimNotFoundError,
     ClaimSupersessionNotFoundError,
     ClaimSupersessionValidationError,
+    ContentExportJobConflictError,
+    ContentExportJobNotFoundError,
+    ContentExportRequestConflictError,
     ContentNotFoundError,
     ContentRelationNotFoundError,
     ContentRelationValidationError,
@@ -33,6 +37,11 @@ from provenance.errors import (
     UnknownActorError,
 )
 from provenance.models import (
+    CONTENT_EXPORT_JOB_FAILED,
+    CONTENT_EXPORT_JOB_FAILED_ERROR,
+    CONTENT_EXPORT_JOB_PENDING,
+    CONTENT_EXPORT_JOB_RUNNING,
+    CONTENT_EXPORT_JOB_SUCCEEDED,
     EVENT_ACTOR_CREATED,
     EVENT_ATTESTATION_ACCESS_GRANTED,
     EVENT_ATTESTATION_ACCESS_GRANT_REVOKED,
@@ -44,6 +53,8 @@ from provenance.models import (
     EVENT_CLAIM_CREATED,
     EVENT_CLAIM_SUPERSEDED,
     EVENT_CONTENT_CREATED,
+    EVENT_CONTENT_EXPORT_JOB_CREATED,
+    EVENT_CONTENT_EXPORT_JOB_RUN,
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
@@ -58,6 +69,7 @@ from provenance.models import (
     Claim,
     ClaimSupersession,
     Content,
+    ContentExportJob,
     ContentRelation,
     EvidenceBundle,
     ExchangeImportRecord,
@@ -73,6 +85,7 @@ from provenance.schemas import (
     ClaimCreate,
     ClaimSupersessionCreate,
     ContentCreate,
+    ContentExportJobCreate,
     ContentRelationCreate,
     EvidenceBundleExchangeImportCreate,
     EvidenceBundleCreate,
@@ -1600,6 +1613,195 @@ def get_content_export(
         for bundle in bundles:
             bundles_by_claim[bundle.claim_id].append(bundle)
     return content, claims, bundles_by_claim
+
+
+#: Builds the stored export result for one content: the wire-shaped
+#: ``{"content", "claims"}`` snapshot served by the read-only export route.
+#: Injected by the API layer so the service stays free of response schemas
+#: and the failure path remains independently exercisable in tests.
+ExportResultBuilder = Callable[[Session, str], dict]
+
+
+def create_content_export_job(
+    session: Session, payload: ContentExportJobCreate
+) -> tuple[ContentExportJob, bool]:
+    """Register one asynchronous content export job, returning ``(job, created)``.
+
+    The referenced content must exist; an unknown content is a missing
+    resource. ``request_id`` is the client idempotency key and is unique. A
+    repeat submission for the same ``request_id`` and ``content_id`` returns
+    the existing job with ``created=False`` and writes no row or audit
+    event, regardless of the job's current lifecycle state. The same
+    ``request_id`` reused for a *different* ``content_id`` is a
+    :class:`ContentExportRequestConflictError` and writes nothing.
+
+    A first submission creates the job ``pending`` with null
+    ``started_at``/``finished_at``/``result``/``error``; the job row and its
+    ``content_export_job.created`` audit event commit in a single
+    transaction.
+    """
+    content = session.execute(
+        select(Content).where(Content.id == payload.content_id)
+    ).scalar_one_or_none()
+    if content is None:
+        raise ContentNotFoundError(payload.content_id)
+
+    existing = session.execute(
+        select(ContentExportJob).where(
+            ContentExportJob.request_id == payload.request_id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.content_id != payload.content_id:
+            raise ContentExportRequestConflictError(payload.request_id)
+        return existing, False
+
+    job = ContentExportJob(
+        id=ids.content_export_job_id(payload.content_id, payload.request_id),
+        content_id=payload.content_id,
+        request_id=payload.request_id,
+        status=CONTENT_EXPORT_JOB_PENDING,
+    )
+    session.add(job)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_CONTENT_EXPORT_JOB_CREATED, resource_id=job.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent request registered this request_id first: roll back
+        # and reconcile against that job instead of duplicating it or
+        # writing a second audit event.
+        session.rollback()
+        raced = session.execute(
+            select(ContentExportJob).where(
+                ContentExportJob.request_id == payload.request_id
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if raced.content_id != payload.content_id:
+            raise ContentExportRequestConflictError(
+                payload.request_id
+            ) from None
+        return raced, False
+    session.refresh(job)
+    return job, True
+
+
+def get_content_export_job(session: Session, job_id: str) -> ContentExportJob:
+    """Return a content export job by id or raise the 404 domain error.
+
+    Strictly read-only: the read writes no job and no audit event.
+    """
+    job = session.execute(
+        select(ContentExportJob).where(ContentExportJob.id == job_id)
+    ).scalar_one_or_none()
+    if job is None:
+        raise ContentExportJobNotFoundError(job_id)
+    return job
+
+
+def run_content_export_job(
+    session: Session,
+    job_id: str,
+    build_result: ExportResultBuilder,
+) -> ContentExportJob:
+    """Atomically claim a pending export job and run it to completion.
+
+    The job must exist or :class:`ContentExportJobNotFoundError` is raised.
+    Only a ``pending`` job can be claimed: the pending-to-running transition
+    is a single conditional ``UPDATE ... WHERE status = 'pending'``, so
+    exactly one concurrent run wins and any other request -- including a
+    repeat run after the job has settled -- observes zero updated rows and
+    raises :class:`ContentExportJobConflictError` without writing a state
+    change or audit event.
+
+    The winning run stamps UTC ``started_at`` while claiming, builds the
+    existing read-only content export, and settles the job in the SAME
+    transaction: on success it stamps UTC ``finished_at`` and stores the
+    ``{"content", "claims"}`` snapshot as ``result`` with status
+    ``succeeded``; if the export raises, it stamps UTC ``finished_at``,
+    leaves ``result`` null, records the stable ``content_export_failed``
+    error, and sets status ``failed``. Either settlement writes the
+    ``content_export_job.run`` audit event in that same transaction.
+    """
+    job = session.execute(
+        select(ContentExportJob).where(ContentExportJob.id == job_id)
+    ).scalar_one_or_none()
+    if job is None:
+        raise ContentExportJobNotFoundError(job_id)
+
+    # Atomic claim: the status predicate makes the pending->running flip a
+    # compare-and-set. Row locking serializes concurrent writers; the loser
+    # (the row is no longer pending) updates zero rows.
+    started_at = utc_now()
+    claimed = session.execute(
+        sa_update(ContentExportJob)
+        .where(
+            ContentExportJob.id == job_id,
+            ContentExportJob.status == CONTENT_EXPORT_JOB_PENDING,
+        )
+        .values(status=CONTENT_EXPORT_JOB_RUNNING, started_at=started_at)
+    )
+    if claimed.rowcount != 1:
+        # A concurrent run claimed it first, or it already settled: this
+        # request is a conflict, not an execution, so it writes no state and
+        # no audit event. Reload to report the job's current status.
+        session.rollback()
+        current = session.execute(
+            select(ContentExportJob).where(ContentExportJob.id == job_id)
+        ).scalar_one_or_none()
+        current_status = (
+            current.status if current is not None else CONTENT_EXPORT_JOB_PENDING
+        )
+        raise ContentExportJobConflictError(job_id, current_status)
+
+    try:
+        result = build_result(session, job.content_id)
+    except Exception:
+        # The export failed: settle as failed in the SAME transaction that
+        # holds the claim, so the job is never left stuck in ``running``.
+        finished_at = utc_now()
+        session.execute(
+            sa_update(ContentExportJob)
+            .where(ContentExportJob.id == job_id)
+            .values(
+                status=CONTENT_EXPORT_JOB_FAILED,
+                finished_at=finished_at,
+                result=None,
+                error=CONTENT_EXPORT_JOB_FAILED_ERROR,
+            )
+        )
+        session.add(
+            AuditEvent(
+                event_type=EVENT_CONTENT_EXPORT_JOB_RUN, resource_id=job.id
+            )
+        )
+        session.commit()
+        session.refresh(job)
+        return job
+
+    finished_at = utc_now()
+    session.execute(
+        sa_update(ContentExportJob)
+        .where(ContentExportJob.id == job_id)
+        .values(
+            status=CONTENT_EXPORT_JOB_SUCCEEDED,
+            finished_at=finished_at,
+            result=result,
+        )
+    )
+    session.add(
+        AuditEvent(event_type=EVENT_CONTENT_EXPORT_JOB_RUN, resource_id=job.id)
+    )
+    session.commit()
+    # The Core UPDATEs bypassed the ORM unit of work; reload the final state
+    # onto the identity-map object before returning it.
+    session.refresh(job)
+    return job
 
 
 def get_evidence_bundle_exchange(

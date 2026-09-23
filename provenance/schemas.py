@@ -435,6 +435,54 @@ class ContentExportResponse(BaseModel):
     claims: list[ClaimExportItem]
 
 
+class ContentExportJobCreate(BaseModel):
+    """A request to register one asynchronous content export job.
+
+    Exactly two members: an existing ``content_id`` and a non-empty
+    client-supplied ``request_id`` idempotency key. Undeclared fields are
+    rejected rather than silently discarded.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content_id: str = Field(..., min_length=1, max_length=80)
+    request_id: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("content_id")
+    @classmethod
+    def _content_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "content_id")
+
+    @field_validator("request_id")
+    @classmethod
+    def _request_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "request_id")
+
+
+class ContentExportJobResponse(BaseModel):
+    """Public view of one content export job and its lifecycle state.
+
+    Exactly the stable ``cxj_`` id, the content/request association, the
+    current status, the UTC lifecycle timestamps, and the settled outcome:
+    ``result`` is the existing content export snapshot on success (otherwise
+    null) and ``error`` is the stable failure code on a failed run
+    (otherwise null). A freshly created job is ``pending`` with
+    ``started_at``/``finished_at``/``result``/``error`` all null.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    content_id: str
+    request_id: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    result: ContentExportResponse | None
+    error: str | None
+
+
 class EvidenceBundleExchangeResponse(BaseModel):
     """An interoperability snapshot of one evidence bundle for external verifiers.
 
