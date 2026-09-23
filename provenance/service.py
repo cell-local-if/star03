@@ -1360,6 +1360,43 @@ def get_accessible_attestation(
     return attestation if grant_exists is not None else None
 
 
+DEFAULT_ATTESTATION_ACCESS_GRANTS_LIMIT = 50
+MIN_ATTESTATION_ACCESS_GRANTS_LIMIT = 1
+MAX_ATTESTATION_ACCESS_GRANTS_LIMIT = 100
+
+
+def list_access_grants_for_attestation(
+    session: Session, attestation_id: str, actor_id: str
+) -> list[AttestationAccessGrant] | None:
+    """Return one attestation's access grants for its signer, in creation order.
+
+    The caller must be the authenticated ``signer_actor_id`` of an existing
+    attestation; a missing attestation and a caller who is not its signer are
+    indistinguishable to the caller and both return ``None``, so the route
+    renders one opaque 404 and never reveals existence. On success every
+    grant row of the attestation is returned -- grants are append-only and
+    retained even after a revocation -- in stable creation order
+    (``created_at`` with the monotonic ``seq`` tiebreaker). An attestation
+    without grants yields an empty list. The function is strictly read-only:
+    it writes no grant, revocation, resource, or audit event.
+    """
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == attestation_id)
+    ).scalar_one_or_none()
+    if attestation is None or attestation.signer_actor_id != actor_id:
+        # A missing proof and a caller who is not its signer are
+        # indistinguishable to the caller: both collapse into the route's
+        # single opaque 404.
+        return None
+
+    stmt = (
+        select(AttestationAccessGrant)
+        .where(AttestationAccessGrant.attestation_id == attestation_id)
+        .order_by(*_ATTESTATION_ACCESS_GRANT_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
+
+
 DEFAULT_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 50
 MIN_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 1
 MAX_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 100
