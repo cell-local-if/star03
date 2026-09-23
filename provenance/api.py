@@ -1201,7 +1201,9 @@ def reconcile_evidence_bundle_exchange_import(
     )
 
 
-_EXCHANGE_IMPORT_RECONCILIATIONS_PARAMS = frozenset({"limit", "cursor"})
+_EXCHANGE_IMPORT_RECONCILIATIONS_PARAMS = frozenset(
+    {"local_available", "matches", "limit", "cursor"}
+)
 
 
 def _exchange_import_reconciliation_item(
@@ -1231,23 +1233,29 @@ def _exchange_import_reconciliation_item(
 def list_evidence_bundle_exchange_import_reconciliations(
     request: Request,
     session: DbSession,
+    local_available: str | None = Query(default=None),
+    matches: str | None = Query(default=None),
     limit: str | None = Query(default=None),
     cursor: str | None = Query(default=None),
 ) -> EvidenceBundleExchangeImportReconciliationPageResponse:
     # Raw multi-values are inspected deliberately: a repeated scalar is
     # rejected instead of silently taking the last value, undeclared
-    # parameters are rejected rather than ignored, and a blank limit is
-    # never coerced to the default.
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to the default. All parameter and cursor validation
+    # happens before any receipt is read.
     raw = request.query_params
 
     unknown = set(raw) - _EXCHANGE_IMPORT_RECONCILIATIONS_PARAMS
     if unknown:
-        # The collection accepts only limit/cursor; a typo never silently
-        # changes the page.
+        # The collection accepts only the two reconciliation filters plus
+        # limit/cursor; a typo never silently changes the page.
         field = sorted(unknown)[0]
         raise _query_validation_error(
             field, f"unknown query parameter: {field}", "value_error.unknown"
         )
+
+    local_available = _parse_bool_filter(raw, "local_available")
+    matches = _parse_bool_filter(raw, "matches")
 
     page_limit = _parse_int_param(
         raw,
@@ -1272,9 +1280,15 @@ def list_evidence_bundle_exchange_import_reconciliations(
                 "cursor is malformed, expired, or invalid",
                 "value_error.cursor",
             ) from exc
-        # The cursor only resumes the query that issued it: the collection is
-        # unfiltered, so the effective limit is the only bound claim.
-        if claims["limit"] != page_limit:
+        # The cursor only resumes the query that issued it: both effective
+        # reconciliation filters (null when absent) and the effective limit
+        # are bound claims and must match exactly.
+        expected = {
+            "local_available": local_available,
+            "matches": matches,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
             raise _query_validation_error(
                 "cursor",
                 "cursor does not match the query parameters",
@@ -1287,35 +1301,53 @@ def list_evidence_bundle_exchange_import_reconciliations(
     records = service.list_evidence_bundle_exchange_import_reconciliations(
         session
     )
-    total = len(records)
+
+    # Every receipt is reconciled independently at this read, using only its
+    # own evidence_bundle_id; one unavailable receipt never affects another.
+    # The reconciliation filters apply to these freshly computed results —
+    # never via any reverse digest or receipt lookup — and preserve the
+    # receipts' stable creation order.
+    reconciled = []
+    for record in records:
+        available, local_digest_hex, reconciled_matches = (
+            _reconcile_exchange_import_record(session, record)
+        )
+        if local_available is not None and available != local_available:
+            continue
+        if matches is not None and reconciled_matches != matches:
+            continue
+        reconciled.append(
+            (record, available, local_digest_hex, reconciled_matches)
+        )
+
+    total = len(reconciled)
 
     next_cursor: str | None = None
     if offset >= total:
-        # At or past the end of the (stable) result set: the page is empty
-        # and no further cursor can be issued.
+        # At or past the end of the (stable) filtered result set: the page is
+        # empty and no further cursor can be issued.
         page = []
     else:
-        page = records[offset : offset + page_limit]
+        page = reconciled[offset : offset + page_limit]
         next_offset = offset + len(page)
         if next_offset < total:
             next_cursor = pagination.encode_typed_cursor(
                 request.app.state.exchange_import_reconciliations_cursor_secret,
                 pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
-                {"limit": page_limit, "offset": next_offset},
+                {
+                    "local_available": local_available,
+                    "matches": matches,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
             )
 
-    # Each receipt is reconciled independently against its own
-    # evidence_bundle_id; one unavailable receipt never affects another.
-    items = []
-    for record in page:
-        local_available, local_digest_hex, matches = (
-            _reconcile_exchange_import_record(session, record)
+    items = [
+        _exchange_import_reconciliation_item(
+            record, available, local_digest_hex, reconciled_matches
         )
-        items.append(
-            _exchange_import_reconciliation_item(
-                record, local_available, local_digest_hex, matches
-            )
-        )
+        for record, available, local_digest_hex, reconciled_matches in page
+    ]
 
     return EvidenceBundleExchangeImportReconciliationPageResponse(
         items=items,
@@ -1379,6 +1411,25 @@ def _parse_nonempty_filter(raw, field: str) -> str | None:
             field, f"{field} must not be empty", "value_error"
         )
     return value
+
+
+def _parse_bool_filter(raw, field: str) -> bool | None:
+    """Parse an optional boolean filter provided at most once.
+
+    Only the exact lowercase literals ``true`` and ``false`` are accepted:
+    absent means unfiltered, while blank, capitalized, or any other spelling
+    is a 422 rather than being coerced or defaulted.
+    """
+    value = _parse_once(raw, field)
+    if value is None:
+        return None
+    if value not in ("true", "false"):
+        raise _query_validation_error(
+            field,
+            f"{field} must be 'true' or 'false'",
+            "value_error",
+        )
+    return value == "true"
 
 
 @router.get(

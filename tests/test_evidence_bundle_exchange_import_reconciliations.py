@@ -365,7 +365,12 @@ def test_cursor_past_end_returns_empty_page_with_total_count(client, app):
     token = pagination.encode_typed_cursor(
         app.state.exchange_import_reconciliations_cursor_secret,
         pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
-        {"limit": 50, "offset": 99},
+        {
+            "local_available": None,
+            "matches": None,
+            "limit": 50,
+            "offset": 99,
+        },
     )
     body = _list(client, cursor=token).json()
     assert body == {"items": [], "count": 5, "next_cursor": None}
@@ -393,7 +398,7 @@ def test_tampered_or_malformed_cursors_are_validation_errors(client):
     foreign = pagination.encode_typed_cursor(
         secrets.token_bytes(32),
         pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
-        {"limit": 1, "offset": 1},
+        {"local_available": None, "matches": None, "limit": 1, "offset": 1},
     )
     for token in (
         "",
@@ -535,8 +540,9 @@ def test_undeclared_parameters_are_validation_errors(client):
         "manifest_version=" + MANIFEST_VERSION,
         "evidence_bundle_id=evb_x",
         "manifest_digest_hex=" + "0" * 64,
-        "local_available=true",
-        "matches=true",
+        "available=true",
+        "match=true",
+        "local_avail=true",
         "limit=1&offset=2",
         "CURSOR=x",
     ):

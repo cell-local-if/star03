@@ -522,7 +522,12 @@ def test_cursor_from_other_families_is_rejected(client):
     exchange_recon_cursor = pagination.encode_typed_cursor(
         secrets.token_bytes(32),
         pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
-        {"limit": 1, "offset": 1},
+        {
+            "local_available": None,
+            "matches": None,
+            "limit": 1,
+            "offset": 1,
+        },
     )
     for token in (
         checkpoint_imports_cursor,
