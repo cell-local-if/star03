@@ -252,7 +252,12 @@ EXCHANGE_IMPORTS_CURSOR = CursorKind(
 def _validate_exchange_import_reconciliations_claims(
     claims: dict[str, Any],
 ) -> None:
-    # The collection takes no filters: the cursor binds only limit/offset.
+    # The two read-time reconciliation filters are either absent (null,
+    # meaning unfiltered) or strict JSON booleans bound from the request's
+    # lowercase ``true``/``false`` literals.
+    for field in ("local_available", "matches"):
+        if claims[field] is not None and not isinstance(claims[field], bool):
+            raise InvalidCursorError(f"cursor {field} is invalid")
     for field in ("limit", "offset"):
         if not _is_int(claims[field]):
             raise InvalidCursorError(f"cursor {field} must be an integer")
@@ -266,7 +271,7 @@ def _validate_exchange_import_reconciliations_claims(
 #: ``GET /v1/evidence-bundle-exchange-import-reconciliations``.
 EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR = CursorKind(
     version=EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR_VERSION,
-    claim_fields=("limit", "offset"),
+    claim_fields=("local_available", "matches", "limit", "offset"),
     validate=_validate_exchange_import_reconciliations_claims,
 )
 

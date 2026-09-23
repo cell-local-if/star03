@@ -414,6 +414,27 @@ _CLAIMS_PARAMS = frozenset(
 
 _HEX64_LOWER_RE = re.compile(r"[0-9a-f]{64}")
 
+_BOOL_LITERALS = {"true": True, "false": False}
+
+
+def _parse_bool_literal_param(raw, field: str) -> bool | None:
+    """Parse an optional filter accepting only lowercase ``true``/``false``.
+
+    Provided at most once; an absent parameter is ``None`` (unfiltered).
+    Blank, whitespace-padded, capitalized (``True``/``FALSE``), numeric
+    (``1``/``0``), or any other spelling is a 422 rather than coerced.
+    """
+    value = _parse_once(raw, field)
+    if value is None:
+        return None
+    if value not in _BOOL_LITERALS:
+        raise _query_validation_error(
+            field,
+            f"{field} must be exactly 'true' or 'false'",
+            "value_error",
+        )
+    return _BOOL_LITERALS[value]
+
 
 def _parse_digest_hex_param(raw, field: str) -> str | None:
     """Parse an optional strict 64-lowercase-hex digest filter, at most once."""
@@ -1201,7 +1222,9 @@ def reconcile_evidence_bundle_exchange_import(
     )
 
 
-_EXCHANGE_IMPORT_RECONCILIATIONS_PARAMS = frozenset({"limit", "cursor"})
+_EXCHANGE_IMPORT_RECONCILIATIONS_PARAMS = frozenset(
+    {"local_available", "matches", "limit", "cursor"}
+)
 
 
 def _exchange_import_reconciliation_item(
@@ -1231,23 +1254,30 @@ def _exchange_import_reconciliation_item(
 def list_evidence_bundle_exchange_import_reconciliations(
     request: Request,
     session: DbSession,
+    local_available: str | None = Query(default=None),
+    matches: str | None = Query(default=None),
     limit: str | None = Query(default=None),
     cursor: str | None = Query(default=None),
 ) -> EvidenceBundleExchangeImportReconciliationPageResponse:
     # Raw multi-values are inspected deliberately: a repeated scalar is
     # rejected instead of silently taking the last value, undeclared
-    # parameters are rejected rather than ignored, and a blank limit is
-    # never coerced to the default.
+    # parameters are rejected rather than ignored, a blank filter or limit
+    # is never coerced to a default, and the two boolean filters accept only
+    # the lowercase literals ``true``/``false``. Every parameter and the
+    # cursor is validated before any receipt (or local bundle) is read.
     raw = request.query_params
 
     unknown = set(raw) - _EXCHANGE_IMPORT_RECONCILIATIONS_PARAMS
     if unknown:
-        # The collection accepts only limit/cursor; a typo never silently
-        # changes the page.
+        # The collection accepts only the two filters plus limit/cursor; a
+        # typo never silently changes the page.
         field = sorted(unknown)[0]
         raise _query_validation_error(
             field, f"unknown query parameter: {field}", "value_error.unknown"
         )
+
+    local_available = _parse_bool_literal_param(raw, "local_available")
+    matches = _parse_bool_literal_param(raw, "matches")
 
     page_limit = _parse_int_param(
         raw,
@@ -1272,9 +1302,14 @@ def list_evidence_bundle_exchange_import_reconciliations(
                 "cursor is malformed, expired, or invalid",
                 "value_error.cursor",
             ) from exc
-        # The cursor only resumes the query that issued it: the collection is
-        # unfiltered, so the effective limit is the only bound claim.
-        if claims["limit"] != page_limit:
+        # The cursor only resumes the query that issued it: both effective
+        # filters (null when unfiltered) and the effective limit are bound.
+        expected = {
+            "local_available": local_available,
+            "matches": matches,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
             raise _query_validation_error(
                 "cursor",
                 "cursor does not match the query parameters",
@@ -1282,40 +1317,73 @@ def list_evidence_bundle_exchange_import_reconciliations(
             )
         offset = claims["offset"]
 
+    def _encode_cursor(next_offset: int) -> str:
+        return pagination.encode_typed_cursor(
+            request.app.state.exchange_import_reconciliations_cursor_secret,
+            pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
+            {
+                "local_available": local_available,
+                "matches": matches,
+                "limit": page_limit,
+                "offset": next_offset,
+            },
+        )
+
     # Strictly read-only: the listing writes no resource, receipt, or audit
     # event. Receipts follow stable creation order.
     records = service.list_evidence_bundle_exchange_import_reconciliations(
         session
     )
-    total = len(records)
 
     next_cursor: str | None = None
-    if offset >= total:
-        # At or past the end of the (stable) result set: the page is empty
-        # and no further cursor can be issued.
-        page = []
+    items: list[EvidenceBundleExchangeImportReconciliationItem] = []
+    if local_available is None and matches is None:
+        # Unfiltered request: preserve the existing behavior exactly -- page
+        # the receipts first and reconcile only the page's own receipts.
+        total = len(records)
+        if offset < total:
+            page = records[offset : offset + page_limit]
+            next_offset = offset + len(page)
+            if next_offset < total:
+                next_cursor = _encode_cursor(next_offset)
+            for record in page:
+                available, local_digest_hex, record_matches = (
+                    _reconcile_exchange_import_record(session, record)
+                )
+                items.append(
+                    _exchange_import_reconciliation_item(
+                        record, available, local_digest_hex, record_matches
+                    )
+                )
     else:
-        page = records[offset : offset + page_limit]
-        next_offset = offset + len(page)
-        if next_offset < total:
-            next_cursor = pagination.encode_typed_cursor(
-                request.app.state.exchange_import_reconciliations_cursor_secret,
-                pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
-                {"limit": page_limit, "offset": next_offset},
+        # A filter is active: each receipt is reconciled at this read using
+        # only its own evidence_bundle_id, and the filters apply to those
+        # read-time results (logical AND). There is no reverse lookup by
+        # digest or any other resource.
+        reconciled = []
+        for record in records:
+            available, local_digest_hex, record_matches = (
+                _reconcile_exchange_import_record(session, record)
             )
-
-    # Each receipt is reconciled independently against its own
-    # evidence_bundle_id; one unavailable receipt never affects another.
-    items = []
-    for record in page:
-        local_available, local_digest_hex, matches = (
-            _reconcile_exchange_import_record(session, record)
-        )
-        items.append(
-            _exchange_import_reconciliation_item(
-                record, local_available, local_digest_hex, matches
+            if local_available is not None and available != local_available:
+                continue
+            if matches is not None and record_matches != matches:
+                continue
+            reconciled.append(
+                (record, available, local_digest_hex, record_matches)
             )
-        )
+        total = len(reconciled)
+        if offset < total:
+            page = reconciled[offset : offset + page_limit]
+            for record, available, local_digest_hex, record_matches in page:
+                items.append(
+                    _exchange_import_reconciliation_item(
+                        record, available, local_digest_hex, record_matches
+                    )
+                )
+            next_offset = offset + len(page)
+            if next_offset < total:
+                next_cursor = _encode_cursor(next_offset)
 
     return EvidenceBundleExchangeImportReconciliationPageResponse(
         items=items,

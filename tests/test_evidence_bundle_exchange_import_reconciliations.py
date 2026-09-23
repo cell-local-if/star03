@@ -11,13 +11,17 @@ reconciled using only its own ``evidence_bundle_id``: with no local bundle
 the triple is ``false``/``null``/``false``; with a local bundle the current
 digest is computed under the existing exchange manifest rules and matches
 only character for character. ``limit`` is 1..100 defaulting to 50; the
-opaque HMAC cursor binds the limit so pages concatenate without gaps or
-duplicates and the final cursor is null. Any other, repeated, blank, or
-illegal parameter and any malformed/tampered/foreign/mismatching cursor is
-422 validation_error; no receipts is an empty collection. The route is
-strictly read-only — no resource, receipt, or audit row is written — and no
-snapshot or raw material is echoed. All fixtures are deterministic and
-offline.
+opaque HMAC cursor binds the effective filters and limit so pages
+concatenate without gaps or duplicates and the final cursor is null. Any
+other, repeated, blank, or illegal parameter and any
+malformed/tampered/foreign/mismatching cursor is 422 validation_error; no
+receipts is an empty collection. The optional ``local_available`` and
+``matches`` filters (lowercase ``true``/``false`` only) are covered by
+``test_evidence_bundle_exchange_import_reconciliation_filters``; with
+neither filter present every behavior below is exactly the original
+unfiltered contract. The route is strictly read-only — no resource,
+receipt, or audit row is written — and no snapshot or raw material is
+echoed. All fixtures are deterministic and offline.
 """
 
 from __future__ import annotations
@@ -365,7 +369,12 @@ def test_cursor_past_end_returns_empty_page_with_total_count(client, app):
     token = pagination.encode_typed_cursor(
         app.state.exchange_import_reconciliations_cursor_secret,
         pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
-        {"limit": 50, "offset": 99},
+        {
+            "local_available": None,
+            "matches": None,
+            "limit": 50,
+            "offset": 99,
+        },
     )
     body = _list(client, cursor=token).json()
     assert body == {"items": [], "count": 5, "next_cursor": None}
@@ -393,7 +402,12 @@ def test_tampered_or_malformed_cursors_are_validation_errors(client):
     foreign = pagination.encode_typed_cursor(
         secrets.token_bytes(32),
         pagination.EXCHANGE_IMPORT_RECONCILIATIONS_CURSOR,
-        {"limit": 1, "offset": 1},
+        {
+            "local_available": None,
+            "matches": None,
+            "limit": 1,
+            "offset": 1,
+        },
     )
     for token in (
         "",
@@ -535,8 +549,6 @@ def test_undeclared_parameters_are_validation_errors(client):
         "manifest_version=" + MANIFEST_VERSION,
         "evidence_bundle_id=evb_x",
         "manifest_digest_hex=" + "0" * 64,
-        "local_available=true",
-        "matches=true",
         "limit=1&offset=2",
         "CURSOR=x",
     ):
