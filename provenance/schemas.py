@@ -1387,3 +1387,41 @@ class AuthenticationKeyRotationPageResponse(BaseModel):
     count: int
     #: Opaque server cursor for the next page, or null on the final page.
     next_cursor: str | None = None
+
+
+class TrustPolicyCreate(BaseModel):
+    """A subject trust-policy registration: exactly subject and threshold.
+
+    There is deliberately no field capable of carrying key material, a raw
+    signature, a payload, or bytes: undeclared fields are rejected rather
+    than silently dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The subject the policy belongs to. The authenticated caller must be
+    #: this same actor.
+    actor_id: str = Field(..., min_length=1, max_length=255)
+    #: Required number of distinct qualified signing actors, 1..100. A
+    #: strict integer: booleans, floats, and numeric strings are rejected.
+    threshold: StrictInt = Field(..., ge=1, le=100)
+
+    @field_validator("actor_id")
+    @classmethod
+    def _actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "actor_id")
+
+
+class TrustPolicyResponse(BaseModel):
+    """Public trust-policy view: id, subject, threshold, status, and time."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    #: The subject the policy belongs to.
+    actor_id: str
+    #: Required number of distinct qualified signing actors (1..100).
+    threshold: int
+    #: Always true: policies are never deactivated, updated, or deleted.
+    active: bool
+    created_at: datetime

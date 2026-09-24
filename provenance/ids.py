@@ -286,3 +286,20 @@ def content_export_job_id(content_id: str, request_id: str) -> str:
         ensure_ascii=False,
     ).encode("utf-8")
     return "cxj_" + hashlib.sha256(material).hexdigest()
+
+
+def actor_trust_policy_id(actor_id: str) -> str:
+    """Return a stable ``atp_``-prefixed id for a subject's trust policy.
+
+    A subject has at most one trust policy, so the subject alone is the
+    identity: a retried registration maps to the same record, and a
+    different threshold for the same subject is a conflict rather than a
+    new id. The material is a canonical JSON array so fields containing
+    separators cannot collide with different field splits.
+    """
+    material = json.dumps(
+        ["actor_trust_policy", actor_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "atp_" + hashlib.sha256(material).hexdigest()

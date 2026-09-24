@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from provenance import canonical, ed25519, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
+    ActorTrustPolicyConflictError,
     AuditCheckpointImportNotFoundError,
     AttestationAccessGrantRevocationNotFoundError,
     AttestationNotFoundError,
@@ -34,6 +35,7 @@ from provenance.errors import (
     EvidenceBundleExchangeImportNotFoundError,
     EvidenceBundleNotFoundError,
     ProtectedAccessValidationError,
+    ProtectedResourceNotFoundError,
     UnknownActorError,
 )
 from provenance.models import (
@@ -43,6 +45,7 @@ from provenance.models import (
     CONTENT_EXPORT_JOB_RUNNING,
     CONTENT_EXPORT_JOB_SUCCEEDED,
     EVENT_ACTOR_CREATED,
+    EVENT_ACTOR_TRUST_POLICY_CREATED,
     EVENT_ATTESTATION_ACCESS_GRANTED,
     EVENT_ATTESTATION_ACCESS_GRANT_REVOKED,
     EVENT_ATTESTATION_CREATED,
@@ -59,6 +62,7 @@ from provenance.models import (
     EVENT_EVIDENCE_BUNDLE_CREATED,
     EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
     Actor,
+    ActorTrustPolicy,
     Attestation,
     AttestationAccessGrant,
     AttestationAccessGrantRevocation,
@@ -90,6 +94,7 @@ from provenance.schemas import (
     EvidenceBundleExchangeImportCreate,
     EvidenceBundleCreate,
     EvidenceBundleImportCreate,
+    TrustPolicyCreate,
 )
 from provenance.time_utils import utc_now
 
@@ -2284,6 +2289,165 @@ def evaluate_trust(
         "decision": (
             TRUST_DECISION_TRUSTED
             if qualified >= min_signers
+            else TRUST_DECISION_UNTRUSTED
+        ),
+    }
+
+
+# --- Subject trust policies and authorization decisions -----------------------
+
+#: The decision reason reported when the subject has no registered policy.
+TRUST_DECISION_REASON_POLICY_MISSING = "policy_missing"
+
+
+def create_actor_trust_policy(
+    session: Session,
+    payload: TrustPolicyCreate,
+    caller_actor_id: str,
+) -> tuple[ActorTrustPolicy, bool]:
+    """Register a subject's trust policy, returning ``(policy, created)``.
+
+    The authenticated caller is the subject: a request naming any other
+    subject is an unauthorized request and collapses into the same opaque
+    ``404 not_found`` as an unauthenticated one -- never a 422. A subject
+    has at most one policy: a retried registration of the same subject and
+    threshold returns the original record with ``created=False`` and writes
+    no row or audit event, while a different threshold for the same subject
+    is a ``409 actor_trust_policy_conflict`` and writes nothing. On first
+    registration the policy row and its ``actor_trust_policy.created``
+    audit event commit in a single transaction. Policies are append-only:
+    there is no update, delete, or deactivate path.
+    """
+    if payload.actor_id != caller_actor_id:
+        # A validly authenticated caller submitting another subject is an
+        # unauthorized request: the same opaque 404 as every other
+        # unauthenticated/unauthorized failure on these routes.
+        raise ProtectedResourceNotFoundError()
+
+    existing = session.execute(
+        select(ActorTrustPolicy).where(
+            ActorTrustPolicy.actor_id == payload.actor_id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.threshold == payload.threshold:
+            return existing, False
+        raise ActorTrustPolicyConflictError(payload.actor_id)
+
+    policy = ActorTrustPolicy(
+        id=ids.actor_trust_policy_id(payload.actor_id),
+        actor_id=payload.actor_id,
+        threshold=payload.threshold,
+        active=True,
+    )
+    session.add(policy)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_ACTOR_TRUST_POLICY_CREATED,
+            resource_id=policy.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent registration for the same subject won the race:
+        # return its record when the threshold matches, else conflict.
+        session.rollback()
+        raced = session.execute(
+            select(ActorTrustPolicy).where(
+                ActorTrustPolicy.actor_id == payload.actor_id
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if raced.threshold == payload.threshold:
+            return raced, False
+        raise ActorTrustPolicyConflictError(payload.actor_id)
+    session.refresh(policy)
+    return policy, True
+
+
+def _qualified_signer_count(
+    session: Session, target_type: str, target_id: str
+) -> int:
+    """Count distinct non-revoked attestation signers of the exact target.
+
+    Exactly the trust-evaluation semantics: every stored attestation is a
+    verified one, an attestation carrying any revocation record no longer
+    qualifies, and several attestations by the same signing actor qualify
+    once.
+    """
+    revoked = exists().where(
+        AttestationRevocation.attestation_id == Attestation.id
+    )
+    signer_ids = session.execute(
+        select(Attestation.signer_actor_id)
+        .where(
+            Attestation.target_type == target_type,
+            Attestation.target_id == target_id,
+            ~revoked,
+        )
+        .distinct()
+    ).scalars().all()
+    return len(set(signer_ids))
+
+
+def get_trust_decision(
+    session: Session,
+    actor_id: str,
+    target_type: str,
+    target_id: str,
+) -> dict:
+    """Evaluate the caller-subject's policy against one existing target.
+
+    The policy gate comes first: a subject with no registered policy yields
+    the ``policy_missing`` decision (``untrusted``, empty policy id, zero
+    qualified signers) without any target lookup, so a missing target in
+    that case is still the same 200 result and never a 404. With a policy,
+    the target must exist -- an unknown claim or evidence bundle is the
+    matching 404 and no partial result is produced. The qualified signer
+    count follows the trust-evaluation semantics (verified, non-revoked
+    attestations of the exact target, deduplicated by signing actor), and
+    the decision is ``trusted`` exactly when the count reaches the policy's
+    current threshold. The result is computed live from current policy and
+    revocation state on every request; the function is strictly read-only
+    and writes no resource and no audit event.
+    """
+    policy = session.execute(
+        select(ActorTrustPolicy).where(ActorTrustPolicy.actor_id == actor_id)
+    ).scalar_one_or_none()
+    if policy is None:
+        # No policy: the target is never resolved, so an unknown target id
+        # renders the same 200 policy_missing result as a known one.
+        return {
+            "policy_id": None,
+            "threshold": None,
+            "qualified_signer_count": 0,
+            "decision": TRUST_DECISION_UNTRUSTED,
+            "reason": TRUST_DECISION_REASON_POLICY_MISSING,
+        }
+
+    if target_type == signing.TARGET_CLAIM:
+        target = session.execute(
+            select(Claim).where(Claim.id == target_id)
+        ).scalar_one_or_none()
+        if target is None:
+            raise ClaimNotFoundError(target_id)
+    else:
+        target = session.execute(
+            select(EvidenceBundle).where(EvidenceBundle.id == target_id)
+        ).scalar_one_or_none()
+        if target is None:
+            raise EvidenceBundleNotFoundError(target_id)
+
+    qualified = _qualified_signer_count(session, target_type, target_id)
+    return {
+        "policy_id": policy.id,
+        "threshold": policy.threshold,
+        "qualified_signer_count": qualified,
+        "decision": (
+            TRUST_DECISION_TRUSTED
+            if qualified >= policy.threshold
             else TRUST_DECISION_UNTRUSTED
         ),
     }

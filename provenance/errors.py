@@ -298,6 +298,22 @@ class ProtectedResourceNotFoundError(DomainError):
         super().__init__()
 
 
+class ActorTrustPolicyConflictError(DomainError):
+    """A trust-policy registration whose subject already has a policy.
+
+    A subject has at most one trust policy: re-registering the same subject
+    with a different threshold is a conflict and writes nothing (a retry
+    with the same threshold returns the existing record instead).
+    """
+
+    status_code = 409
+    code = "actor_trust_policy_conflict"
+    message = "The actor already has a trust policy with a different threshold."
+
+    def __init__(self, actor_id: str):
+        super().__init__(details={"actor_id": actor_id})
+
+
 class LineageValidationError(DomainError):
     """A malformed lineage query (``direction`` / ``max_depth``).
 

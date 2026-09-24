@@ -101,6 +101,8 @@ from provenance.schemas import (
     ExchangeManifestVerificationCreate,
     ExchangeManifestVerificationResponse,
     TrustEvaluationResponse,
+    TrustPolicyCreate,
+    TrustPolicyResponse,
 )
 
 router = APIRouter(prefix="/v1")
@@ -2414,6 +2416,124 @@ def evaluate_trust(
         session, target_type, target_id, threshold
     )
     return TrustEvaluationResponse(**result)
+
+
+@router.post("/trust-policies", response_model=TrustPolicyResponse)
+async def create_trust_policy(
+    request: Request,
+    payload: TrustPolicyCreate,
+    session: DbSession,
+    response: Response,
+) -> TrustPolicyResponse:
+    # The signature covers the exact bytes on the wire; FastAPI's parsed
+    # model is built from the same cached body, so body_sha256 matches what
+    # the client signed. These routes use the read-style credential
+    # boundary: malformed credentials (an unparseable/out-of-window
+    # timestamp or a non-canonical signature encoding) are 422, while
+    # missing or unverifiable credentials -- and a validly authenticated
+    # caller submitting another subject -- collapse into the opaque 404.
+    raw_body = await request.body()
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+    policy, created = service.create_actor_trust_policy(
+        session, payload, caller
+    )
+    # First registration -> 201; a retried submission for the same subject
+    # and threshold -> 200 with the original record and no new audit event.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return TrustPolicyResponse.model_validate(policy)
+
+
+_TRUST_DECISION_PARAMS = frozenset({"actor_id", "target_type", "target_id"})
+
+
+@router.get("/trust-decisions")
+async def get_trust_decision(request: Request, session: DbSession) -> Response:
+    # Read-only authorization decision for one subject against one existing
+    # claim or evidence bundle. Raw multi-values are inspected deliberately:
+    # a repeated scalar is rejected instead of silently taking the last
+    # value, undeclared parameters are rejected rather than ignored, and
+    # blank values are never coerced. Every parameter is validated before
+    # the credentials, the policy, or the target is read.
+    raw = request.query_params
+
+    unknown = set(raw) - _TRUST_DECISION_PARAMS
+    if unknown:
+        # A typo (e.g. ``actor``) never silently changes the decision.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    actor_id = _parse_once(raw, "actor_id")
+    if actor_id is None:
+        raise _query_validation_error(
+            "actor_id", "Field required", "value_error.missing"
+        )
+    if not actor_id.strip():
+        raise _query_validation_error(
+            "actor_id", "actor_id must not be empty", "value_error"
+        )
+
+    target_type = _parse_once(raw, "target_type")
+    if target_type is None:
+        raise _query_validation_error(
+            "target_type", "Field required", "value_error.missing"
+        )
+    if target_type not in ATTESTATION_TARGET_TYPES:
+        # Covers missing values, whitespace/blank strings, casing variants,
+        # and anything other than the two literal target types.
+        raise _query_validation_error(
+            "target_type",
+            "target_type must be 'claim' or 'evidence_bundle'",
+            "value_error",
+        )
+
+    target_id = _parse_once(raw, "target_id")
+    if target_id is None:
+        raise _query_validation_error(
+            "target_id", "Field required", "value_error.missing"
+        )
+    if not target_id.strip():
+        raise _query_validation_error(
+            "target_id", "target_id must not be empty", "value_error"
+        )
+
+    # A GET carries no body; the signed body_sha256 is therefore the digest
+    # of zero bytes, exactly as on the other protected read routes. Missing
+    # or unauthenticated credentials -- and a caller who is not the queried
+    # subject -- collapse into the same opaque 404; malformed credentials
+    # stay 422.
+    raw_body = await request.body()
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+    if actor_id != caller:
+        raise ProtectedResourceNotFoundError()
+
+    # Strictly read-only: success, failure, and the empty-policy branch all
+    # write no resource and no audit event. The policy gate comes first: a
+    # subject without a policy yields the 200 policy_missing result without
+    # any target lookup; with a policy an unknown target is the matching
+    # 404 and no partial result is produced.
+    result = service.get_trust_decision(
+        session, actor_id, target_type, target_id
+    )
+    # Compact UTF-8 JSON, null rendered as such, integral numbers only,
+    # terminated by exactly one newline.
+    body = (
+        json.dumps(
+            result,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 _AUDIT_EVENTS_PARAMS = frozenset(
