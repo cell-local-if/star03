@@ -297,7 +297,12 @@ class ClaimSupersessionLineageItem(ClaimResponse):
 
 class ClaimSupersessionLineageResponse(BaseModel):
     items: list[ClaimSupersessionLineageItem]
+    #: Total number of items after the minimum-depth filter, independent of
+    #: pagination; not merely the size of the returned page.
     count: int
+    #: Opaque server cursor for the next page, or null when the final page
+    #: has been returned.
+    next_cursor: str | None = None
 
 
 class EvidenceBundleCreate(BaseModel):

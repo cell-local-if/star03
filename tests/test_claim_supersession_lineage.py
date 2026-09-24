@@ -2,9 +2,11 @@
 
 Covers GET /v1/claims/{claim_id}/supersession-lineage: bidirectional
 traversal (newer/older), convergence/deduplication at shortest depth, depth
-truncation, depth-then-creation ordering, bounded termination over anomalous
-cyclic history, parameter validation, the missing-origin 404, and the
-read-only/zero-write guarantee. All fixtures are deterministic and offline.
+truncation, the minimum-depth floor, depth-then-creation ordering, stable
+limit/cursor pagination (including cursor binding, tampering, and foreign
+families), bounded termination over anomalous cyclic history, parameter
+validation, the missing-origin 404, and the read-only/zero-write guarantee.
+All fixtures are deterministic and offline.
 """
 
 from __future__ import annotations
@@ -86,8 +88,9 @@ def test_newer_walks_superseded_to_replacement_excluding_origin(client):
     resp = _lineage(client, claims["a"]["id"], "newer")
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {"items", "count"}
+    assert set(body) == {"items", "count", "next_cursor"}
     assert body["count"] == 2
+    assert body["next_cursor"] is None
     assert [item["id"] for item in body["items"]] == [
         claims["b"]["id"],
         claims["c"]["id"],
@@ -148,7 +151,11 @@ def test_empty_traversal_returns_empty_set_not_404(client):
     ):
         resp = _lineage(client, origin, direction)
         assert resp.status_code == 200
-        assert resp.json() == {"items": [], "count": 0}
+        assert resp.json() == {
+            "items": [],
+            "count": 0,
+            "next_cursor": None,
+        }
 
 
 def test_unknown_origin_is_claim_not_found(client):
