@@ -123,6 +123,10 @@ _CONTENT_RELATION_ORDER = (
     ContentRelation.seq.asc(),
 )
 _AUDIT_EVENT_ORDER = (AuditEvent.created_at.asc(), AuditEvent.seq.asc())
+_CONTENT_EXPORT_JOB_ORDER = (
+    ContentExportJob.created_at.asc(),
+    ContentExportJob.seq.asc(),
+)
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -1802,6 +1806,47 @@ def run_content_export_job(
     # onto the identity-map object before returning it.
     session.refresh(job)
     return job
+
+
+# Reviewer content export job search paging bounds.
+DEFAULT_CONTENT_EXPORT_JOBS_LIMIT = 50
+MIN_CONTENT_EXPORT_JOBS_LIMIT = 1
+MAX_CONTENT_EXPORT_JOBS_LIMIT = 100
+
+
+def list_content_export_jobs(
+    session: Session,
+    content_id: str | None = None,
+    request_id: str | None = None,
+    status: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[ContentExportJob]:
+    """Return content export jobs in stable creation order, optionally filtered.
+
+    ``content_id``, ``request_id``, and ``status`` are exact, combinable
+    string matches (case- and whitespace-sensitive); ``status`` is one of
+    the four lifecycle literals when supplied. ``from_dt``/``to_dt`` are
+    timezone-aware UTC instants applied as inclusive ``created_at`` bounds.
+    Filter values are never resolved for existence, so an unknown content or
+    request id is simply an empty match set rather than an error. Results
+    follow the jobs' stable creation order (``created_at`` with the monotonic
+    ``seq`` tiebreaker). The function is strictly read-only: it writes no
+    job and no audit event.
+    """
+    stmt = select(ContentExportJob)
+    if content_id is not None:
+        stmt = stmt.where(ContentExportJob.content_id == content_id)
+    if request_id is not None:
+        stmt = stmt.where(ContentExportJob.request_id == request_id)
+    if status is not None:
+        stmt = stmt.where(ContentExportJob.status == status)
+    if from_dt is not None:
+        stmt = stmt.where(ContentExportJob.created_at >= from_dt)
+    if to_dt is not None:
+        stmt = stmt.where(ContentExportJob.created_at <= to_dt)
+    stmt = stmt.order_by(*_CONTENT_EXPORT_JOB_ORDER)
+    return list(session.execute(stmt).scalars().all())
 
 
 def get_evidence_bundle_exchange(

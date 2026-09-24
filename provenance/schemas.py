@@ -483,6 +483,21 @@ class ContentExportJobResponse(BaseModel):
     error: str | None
 
 
+class ContentExportJobPageResponse(BaseModel):
+    """A cursor-paginated page of content export job public views.
+
+    Each item is exactly the existing single-job public view (including its
+    settled ``result`` snapshot, which itself carries only existing public
+    views -- never raw content, claim payloads, or evidence bytes).
+    """
+
+    items: list[ContentExportJobResponse]
+    #: Total number of jobs after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class EvidenceBundleExchangeResponse(BaseModel):
     """An interoperability snapshot of one evidence bundle for external verifiers.
 

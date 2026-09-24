@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 from typing import Annotated, Literal
 
@@ -18,7 +19,11 @@ from provenance.errors import (
     ProtectedAccessValidationError,
     ProtectedResourceNotFoundError,
 )
-from provenance.models import RELATION_DERIVED_FROM, RELATION_VERSION_OF
+from provenance.models import (
+    CONTENT_EXPORT_JOB_STATES,
+    RELATION_DERIVED_FROM,
+    RELATION_VERSION_OF,
+)
 from provenance.pagination import InvalidCursorError
 from provenance.signing import ATTESTATION_TARGET_TYPES
 from provenance.time_utils import parse_rfc3339_utc
@@ -68,6 +73,7 @@ from provenance.schemas import (
     ClaimSupersessionLineageResponse,
     ContentCreate,
     ContentExportJobCreate,
+    ContentExportJobPageResponse,
     ContentExportJobResponse,
     ContentExportResponse,
     ContentLineageItem,
@@ -1479,6 +1485,166 @@ def _export_job_response(job) -> ContentExportJobResponse:
         result=job.result,
         error=job.error,
     )
+
+
+_CONTENT_EXPORT_JOBS_PARAMS = frozenset(
+    {"content_id", "request_id", "status", "from", "to", "limit", "cursor"}
+)
+
+
+def _parse_literal_filter(raw, field: str, allowed) -> str | None:
+    """Parse an optional filter accepting only exact allowed literals.
+
+    Provided at most once; an absent parameter is ``None`` (unfiltered).
+    Blank, whitespace-padded, and differently-cased spellings are a 422
+    rather than coerced or normalized.
+    """
+    value = _parse_once(raw, field)
+    if value is None:
+        return None
+    if value not in allowed:
+        raise _query_validation_error(
+            field,
+            f"{field} must be one of: {', '.join(sorted(allowed))}",
+            "value_error",
+        )
+    return value
+
+
+@router.get("/content-export-jobs")
+async def list_content_export_jobs(
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # Read-only reviewer search over content export jobs. The GET request
+    # body must be empty: carrying any bytes (even whitespace) is a 422
+    # validated before any parameter or job is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _CONTENT_EXPORT_JOBS_PARAMS
+    if unknown:
+        # A typo (e.g. ``content_ids``) never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    content_id = _parse_nonempty_filter(raw, "content_id")
+    request_id = _parse_nonempty_filter(raw, "request_id")
+    status = _parse_literal_filter(raw, "status", CONTENT_EXPORT_JOB_STATES)
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CONTENT_EXPORT_JOBS_LIMIT,
+        service.MIN_CONTENT_EXPORT_JOBS_LIMIT,
+        service.MAX_CONTENT_EXPORT_JOBS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.content_export_jobs_cursor_secret,
+                pagination.CONTENT_EXPORT_JOBS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered) and the effective limit must match.
+        expected = {
+            "content_id": content_id,
+            "request_id": request_id,
+            "status": status,
+            "from": _audit_time_claim(from_dt),
+            "to": _audit_time_claim(to_dt),
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no job and no audit event. No
+    # filter value is resolved for existence, so an unknown content or
+    # request id is an empty collection rather than a 404. Items reuse the
+    # single-job public view; result snapshots carry only existing public
+    # views, never raw content, payloads, or evidence bytes.
+    items = service.list_content_export_jobs(
+        session, content_id, request_id, status, from_dt, to_dt
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.content_export_jobs_cursor_secret,
+                pagination.CONTENT_EXPORT_JOBS_CURSOR,
+                {
+                    "content_id": content_id,
+                    "request_id": request_id,
+                    "status": status,
+                    "from": _audit_time_claim(from_dt),
+                    "to": _audit_time_claim(to_dt),
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = ContentExportJobPageResponse(
+        items=[_export_job_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, booleans/null literal, integral numbers only,
+    # terminated by exactly one newline.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 @router.post(
