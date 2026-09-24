@@ -71,6 +71,19 @@ def exchange_manifest_digest_hex(snapshot: Any) -> str:
     return hashlib.sha256(canonical_exchange_snapshot_bytes(snapshot)).hexdigest()
 
 
+def content_export_digest_hex(snapshot: Any) -> str:
+    """Return the SHA-256 hex digest of a content export snapshot.
+
+    The content export snapshot (``{"content", "claims"}``) is canonicalized
+    under the same rules as the exchange snapshot: the root member order is
+    kept exactly as received, array element order is kept, nested object
+    members are sorted by Unicode code point, and serialization uses compact
+    separators with non-ASCII emitted unescaped, UTF-8 encoded. The digest
+    is therefore reproducible offline from the export JSON alone.
+    """
+    return hashlib.sha256(canonical_exchange_snapshot_bytes(snapshot)).hexdigest()
+
+
 def audit_events_digest_hex(events: Any) -> str:
     """Return the SHA-256 hex digest of the canonical audit-event array bytes.
 

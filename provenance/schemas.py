@@ -503,6 +503,120 @@ class ContentExportJobPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+#: The sole digest algorithm accepted for content export verifications.
+CONTENT_EXPORT_VERIFICATION_DIGEST_ALGORITHM = "sha256"
+
+
+class ContentExportVerificationSnapshotContent(ContentResponse):
+    """The ``content`` member of an export snapshot under offline verification.
+
+    Exactly the existing public content view's fields: undeclared members
+    (including any raw-material field) are rejected rather than ignored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ContentExportVerificationSnapshotEvidenceBundle(EvidenceBundleResponse):
+    """An ``evidence_bundles`` entry: exactly the existing public bundle view.
+
+    ``metadata`` must be canonicalizable JSON with finite numbers, exactly as
+    at bundle creation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_canonicalizable(cls, v: dict[str, Any]) -> dict[str, Any]:
+        try:
+            canonical_json_bytes(v)
+        except (TypeError, ValueError):
+            # Non-finite numbers (NaN/Infinity) have no canonical JSON form.
+            raise ValueError(
+                "metadata must be a JSON object with finite values"
+            ) from None
+        return v
+
+
+class ContentExportVerificationSnapshotClaim(ClaimResponse):
+    """A ``claims`` entry: exactly the public claim view plus its bundles."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_bundles: list[ContentExportVerificationSnapshotEvidenceBundle]
+
+
+class ContentExportVerificationSnapshot(BaseModel):
+    """The content export snapshot under verification: exactly the two members."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: ContentExportVerificationSnapshotContent
+    #: Claims directly asserting the content; an empty list is a legal
+    #: snapshot and is digested as an empty array.
+    claims: list[ContentExportVerificationSnapshotClaim]
+
+
+class ContentExportVerificationCreate(BaseModel):
+    """An offline content-export verification request.
+
+    Exactly three members: the export ``snapshot`` the digest commits to,
+    the fixed ``digest_algorithm`` (``sha256``), and the claimed
+    ``digest_hex``. Verification is pure: it reads and writes no server
+    state, so no identifier is ever resolved against local resources.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot: ContentExportVerificationSnapshot
+    digest_algorithm: Literal[CONTENT_EXPORT_VERIFICATION_DIGEST_ALGORITHM]
+    digest_hex: str
+
+    @field_validator("digest_hex")
+    @classmethod
+    def _digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "digest_hex must be exactly 64 lowercase hexadecimal characters"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _snapshot_associations_consistent(self):
+        # Purely structural checks, never resolved against local state:
+        # every claim must directly assert the snapshot's content, and every
+        # evidence bundle must belong to its enclosing claim.
+        for claim in self.snapshot.claims:
+            if claim.content_id != self.snapshot.content.id:
+                raise ValueError(
+                    "every snapshot claim's content_id must equal"
+                    " snapshot.content.id"
+                )
+            for bundle in claim.evidence_bundles:
+                if bundle.claim_id != claim.id:
+                    raise ValueError(
+                        "every snapshot evidence bundle's claim_id must equal"
+                        " its claim's id"
+                    )
+        return self
+
+
+class ContentExportVerificationResponse(BaseModel):
+    """The offline content-export verification verdict.
+
+    ``computed_digest_hex`` is present only on a mismatch, so a matching
+    digest renders exactly ``{"valid": true}``.
+    """
+
+    valid: bool
+    #: The digest computed from the submitted snapshot under the canonical
+    #: rules; omitted when it matches the claimed digest.
+    computed_digest_hex: str | None = None
+
+
 class EvidenceBundleExchangeResponse(BaseModel):
     """An interoperability snapshot of one evidence bundle for external verifiers.
 

@@ -76,6 +76,8 @@ from provenance.schemas import (
     ContentExportJobPageResponse,
     ContentExportJobResponse,
     ContentExportResponse,
+    ContentExportVerificationCreate,
+    ContentExportVerificationResponse,
     ContentLineageItem,
     ContentLineageResponse,
     ContentListResponse,
@@ -1579,6 +1581,45 @@ def _content_export_result_payload(session: Session, content_id: str) -> dict:
     strings), so a successful job's result is byte-for-byte that export.
     """
     return _content_export_snapshot(session, content_id).model_dump(mode="json")
+
+
+@router.post("/content-export-verifications")
+async def verify_content_export(
+    payload: ContentExportVerificationCreate, request: Request
+) -> Response:
+    # The route accepts no query parameters: any parameter at all (known or
+    # unknown, blank or repeated) is a 422 rather than silently ignored.
+    _reject_any_query_param(request)
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no resource, snapshot, audit, or log row is
+    # written. Verification uses the request body alone; no identifier is
+    # ever resolved against local state, so unknown resources, repeated
+    # requests, and local contents cannot change the verdict.
+    body = await request.json()
+    # The digest commits to the snapshot exactly as received: the raw JSON
+    # values (root member order, array order, datetime spellings), not any
+    # parsed or re-serialized form. Field validation has already guaranteed
+    # every member is canonicalizable; an empty claims list is legal and is
+    # digested as an empty array.
+    computed_digest_hex = canonical.content_export_digest_hex(body["snapshot"])
+    if computed_digest_hex == payload.digest_hex:
+        result = ContentExportVerificationResponse(valid=True)
+    else:
+        result = ContentExportVerificationResponse(
+            valid=False, computed_digest_hex=computed_digest_hex
+        )
+    # Compact UTF-8 JSON, booleans rendered as such, terminated by exactly
+    # one newline; the result object carries no other fields.
+    response_body = (
+        json.dumps(
+            result.model_dump(mode="json", exclude_none=True),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=response_body, media_type="application/json")
 
 
 def _export_job_response(job) -> ContentExportJobResponse:
