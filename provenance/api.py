@@ -1805,6 +1805,38 @@ def run_content_export_job(
 
 
 @router.post(
+    "/content-export-jobs/run-next",
+    response_model=ContentExportJobResponse,
+)
+async def run_next_content_export_job(
+    request: Request, session: DbSession
+) -> ContentExportJobResponse:
+    # The queue claim takes no body and no query parameters: any non-empty
+    # body (including whitespace, malformed JSON, a JSON object, or any
+    # extra field) and any parameter (unknown, blank, or repeated) is a 422
+    # validation_error, rejected before any job is read -- so a malformed
+    # request never claims, creates, modifies, or audits anything.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # Server-side queue claim: the single oldest pending job in stable
+    # creation order is atomically claimed and settled exactly as one
+    # single-job run. An empty queue is a 404 content_export_job_not_found
+    # with zero writes; losing the claim to a concurrent caller (the chosen
+    # job was claimed first or is no longer pending) is a 409 conflict that
+    # touches no job, creates no resource, and writes no audit event.
+    job = service.run_next_content_export_job(
+        session, _content_export_result_payload
+    )
+    return _export_job_response(job)
+
+
+@router.post(
     "/content-export-verifications",
     response_model=ContentExportVerificationResponse,
     response_model_exclude_none=True,

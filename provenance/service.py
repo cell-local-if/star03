@@ -1721,15 +1721,69 @@ def run_content_export_job(
     job_id: str,
     build_result: ExportResultBuilder,
 ) -> ContentExportJob:
-    """Atomically claim a pending export job and run it to completion.
+    """Atomically claim a pending export job (looked up by id) and run it.
 
     The job must exist or :class:`ContentExportJobNotFoundError` is raised.
-    Only a ``pending`` job can be claimed: the pending-to-running transition
-    is a single conditional ``UPDATE ... WHERE status = 'pending'``, so
-    exactly one concurrent run wins and any other request -- including a
-    repeat run after the job has settled -- observes zero updated rows and
-    raises :class:`ContentExportJobConflictError` without writing a state
-    change or audit event.
+    Claim and settlement follow :func:`_claim_and_run_content_export_job`:
+    only a ``pending`` job can be claimed, so a concurrent or repeated run is
+    a :class:`ContentExportJobConflictError` rather than a second execution.
+    """
+    job = session.execute(
+        select(ContentExportJob).where(ContentExportJob.id == job_id)
+    ).scalar_one_or_none()
+    if job is None:
+        raise ContentExportJobNotFoundError(job_id)
+    return _claim_and_run_content_export_job(session, job, build_result)
+
+
+def run_next_content_export_job(
+    session: Session,
+    build_result: ExportResultBuilder,
+) -> ContentExportJob:
+    """Claim the oldest pending export job and run it to completion.
+
+    The queue candidate is the single oldest job still ``pending`` under the
+    stable creation order (``created_at`` with the monotonic ``seq``
+    tiebreaker, which survives restarts); other pending jobs are left
+    untouched in the queue. When no job is pending,
+    :class:`ContentExportJobNotFoundError` is raised with zero writes: no job
+    is claimed or created and no audit event is recorded.
+
+    The selected job is claimed and settled through exactly the same atomic
+    path as :func:`run_content_export_job`. If a concurrent caller claims the
+    same oldest job (or it otherwise stops being pending) between selection
+    and the claim, the conditional update matches zero rows and this call
+    raises :class:`ContentExportJobConflictError` without modifying any job,
+    creating any resource, or writing an audit event; this loser never falls
+    through to a different (younger) pending job.
+    """
+    job = session.execute(
+        select(ContentExportJob)
+        .where(ContentExportJob.status == CONTENT_EXPORT_JOB_PENDING)
+        .order_by(*_CONTENT_EXPORT_JOB_ORDER)
+        .limit(1)
+    ).scalar_one_or_none()
+    if job is None:
+        # An empty queue is a missing runnable resource, not an execution:
+        # nothing is claimed, created, or written and no audit event is
+        # recorded.
+        raise ContentExportJobNotFoundError()
+    return _claim_and_run_content_export_job(session, job, build_result)
+
+
+def _claim_and_run_content_export_job(
+    session: Session,
+    job: ContentExportJob,
+    build_result: ExportResultBuilder,
+) -> ContentExportJob:
+    """Atomically flip one already-selected job pending->running and settle it.
+
+    The pending-to-running transition is a single conditional
+    ``UPDATE ... WHERE status = 'pending'``, so exactly one concurrent run
+    wins and any other request -- a concurrent loser, or a repeat run after
+    the job has settled -- observes zero updated rows and raises
+    :class:`ContentExportJobConflictError` without writing a state change or
+    audit event.
 
     The winning run stamps UTC ``started_at`` while claiming, builds the
     existing read-only content export, and settles the job in the SAME
@@ -1740,12 +1794,7 @@ def run_content_export_job(
     error, and sets status ``failed``. Either settlement writes the
     ``content_export_job.run`` audit event in that same transaction.
     """
-    job = session.execute(
-        select(ContentExportJob).where(ContentExportJob.id == job_id)
-    ).scalar_one_or_none()
-    if job is None:
-        raise ContentExportJobNotFoundError(job_id)
-
+    job_id = job.id
     # Atomic claim: the status predicate makes the pending->running flip a
     # compare-and-set. Row locking serializes concurrent writers; the loser
     # (the row is no longer pending) updates zero rows.
@@ -1789,7 +1838,7 @@ def run_content_export_job(
         )
         session.add(
             AuditEvent(
-                event_type=EVENT_CONTENT_EXPORT_JOB_RUN, resource_id=job.id
+                event_type=EVENT_CONTENT_EXPORT_JOB_RUN, resource_id=job_id
             )
         )
         session.commit()
@@ -1807,7 +1856,7 @@ def run_content_export_job(
         )
     )
     session.add(
-        AuditEvent(event_type=EVENT_CONTENT_EXPORT_JOB_RUN, resource_id=job.id)
+        AuditEvent(event_type=EVENT_CONTENT_EXPORT_JOB_RUN, resource_id=job_id)
     )
     session.commit()
     # The Core UPDATEs bypassed the ORM unit of work; reload the final state
