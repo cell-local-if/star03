@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 from typing import Annotated, Literal
 
@@ -18,7 +19,11 @@ from provenance.errors import (
     ProtectedAccessValidationError,
     ProtectedResourceNotFoundError,
 )
-from provenance.models import RELATION_DERIVED_FROM, RELATION_VERSION_OF
+from provenance.models import (
+    CONTENT_EXPORT_JOB_STATES,
+    RELATION_DERIVED_FROM,
+    RELATION_VERSION_OF,
+)
 from provenance.pagination import InvalidCursorError
 from provenance.signing import ATTESTATION_TARGET_TYPES
 from provenance.time_utils import parse_rfc3339_utc
@@ -68,6 +73,7 @@ from provenance.schemas import (
     ClaimSupersessionLineageResponse,
     ContentCreate,
     ContentExportJobCreate,
+    ContentExportJobPageResponse,
     ContentExportJobResponse,
     ContentExportResponse,
     ContentLineageItem,
@@ -1526,6 +1532,180 @@ def run_content_export_job(
         session, job_id, _content_export_result_payload
     )
     return _export_job_response(job)
+
+
+_CONTENT_EXPORT_JOBS_PARAMS = frozenset(
+    {"content_id", "request_id", "status", "from", "to", "limit", "cursor"}
+)
+
+
+def _compact_json_response(page: ContentExportJobPageResponse) -> Response:
+    """Render a page as compact UTF-8 JSON terminated by a single newline.
+
+    ``model_dump(mode="json")`` yields exactly the wire view the other
+    routes serve (UTC datetimes as RFC 3339 strings, bare booleans/null,
+    plain integers); compact separators and an unescaped non-ASCII policy
+    make the body minimal. The single trailing newline is appended
+    explicitly.
+    """
+    raw = json.dumps(
+        page.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return Response(content=raw + b"\n", media_type="application/json")
+
+
+@router.get("/content-export-jobs")
+async def list_content_export_jobs(
+    request: Request,
+    session: DbSession,
+    content_id: str | None = Query(default=None),
+    request_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    from_: str | None = Query(default=None, alias="from"),
+    to: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> Response:
+    # Read-only reviewer search over existing content export jobs. Raw
+    # multi-values are inspected deliberately: a repeated scalar is rejected
+    # instead of silently taking the last value, undeclared parameters are
+    # rejected rather than ignored, a blank filter/limit is never coerced to
+    # a default, and the GET body must be empty. Every failure is a 422 and
+    # is rejected before any job is read.
+    raw = request.query_params
+
+    unknown = set(raw) - _CONTENT_EXPORT_JOBS_PARAMS
+    if unknown:
+        # A typo never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    content_id = _parse_nonempty_filter(raw, "content_id")
+    request_id = _parse_nonempty_filter(raw, "request_id")
+
+    status = _parse_once(raw, "status")
+    if status is not None:
+        if not status.strip():
+            # A blank status is invalid rather than the unfiltered default.
+            raise _query_validation_error(
+                "status", "status must not be empty", "value_error"
+            )
+        if status not in CONTENT_EXPORT_JOB_STATES:
+            # Only the four existing lifecycle literals are accepted; casing
+            # variants and unknown spellings are rejected, never normalized.
+            # An absent status (None) imposes no status filter.
+            raise _query_validation_error(
+                "status",
+                "status must be one of 'pending', 'running', 'succeeded', 'failed'",
+                "value_error",
+            )
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CONTENT_EXPORT_JOBS_LIMIT,
+        service.MIN_CONTENT_EXPORT_JOBS_LIMIT,
+        service.MAX_CONTENT_EXPORT_JOBS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.content_export_jobs_cursor_secret,
+                pagination.CONTENT_EXPORT_JOBS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered) and the effective limit must match
+        # exactly, so a foreign-family, tampered, or filter-mismatching
+        # cursor can never resume a different query.
+        expected = {
+            "content_id": content_id,
+            "request_id": request_id,
+            "status": status,
+            "from": _audit_time_claim(from_dt),
+            "to": _audit_time_claim(to_dt),
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # The GET body must be empty; any body bytes are a 422 before the read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Strictly read-only: the search creates no job, changes no state, and
+    # writes no audit event. No filter value is resolved for existence, so an
+    # unknown content or request id is an empty collection, not an error.
+    items = service.list_content_export_jobs(
+        session, content_id, request_id, status, from_dt, to_dt
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.content_export_jobs_cursor_secret,
+                pagination.CONTENT_EXPORT_JOBS_CURSOR,
+                {
+                    "content_id": content_id,
+                    "request_id": request_id,
+                    "status": status,
+                    "from": _audit_time_claim(from_dt),
+                    "to": _audit_time_claim(to_dt),
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the existing single-job public view (which itself carries
+    # only public material): no attachment, raw content, payload, or evidence
+    # byte is added by the search.
+    return _compact_json_response(
+        ContentExportJobPageResponse(
+            items=[_export_job_response(item) for item in page],
+            count=total,
+            next_cursor=next_cursor,
+        )
+    )
 
 
 def _parse_nonempty_filter(raw, field: str) -> str | None:
