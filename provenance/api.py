@@ -1773,6 +1773,38 @@ def create_content_export_job(
     return _export_job_response(job)
 
 
+@router.post(
+    "/content-export-jobs/run-next",
+    response_model=ContentExportJobResponse,
+)
+async def run_next_content_export_job(
+    request: Request, session: DbSession
+) -> ContentExportJobResponse:
+    # The request carries no input: any body bytes (even whitespace, a JSON
+    # null/object, or malformed JSON) and any query parameter (known,
+    # unknown, blank, or repeated) are a 422 validated before any job is
+    # read, so a rejected call creates nothing, changes nothing, and writes
+    # no audit event.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # The server claims the single oldest pending job in stable creation
+    # order and runs it as one atomic run: 200 with the full job view
+    # (succeeded with the export snapshot as result, or failed with null
+    # result and content_export_failed). An empty queue is 404
+    # content_export_job_not_found; a concurrent call that loses the claim
+    # is 409 conflict, and neither writes anything.
+    job = service.run_next_content_export_job(
+        session, _content_export_result_payload
+    )
+    return _export_job_response(job)
+
+
 @router.get(
     "/content-export-jobs/{job_id}",
     response_model=ContentExportJobResponse,

@@ -1816,6 +1816,40 @@ def run_content_export_job(
     return job
 
 
+def run_next_content_export_job(
+    session: Session,
+    build_result: ExportResultBuilder,
+) -> ContentExportJob:
+    """Claim the oldest pending export job and run it to completion.
+
+    The queue is drained in stable creation order (``created_at`` with the
+    monotonic ``seq`` tiebreaker): the single oldest ``pending`` job is
+    selected and then claimed through the same atomic pending-to-running
+    transition as a directed run, so of concurrent or repeated calls at most
+    one wins that job. A call whose selected job was claimed first -- or is
+    no longer pending -- is a :class:`ContentExportJobConflictError` and
+    writes no state change, no resource, and no audit event; later pending
+    jobs stay queued for subsequent calls. An empty queue (no pending job at
+    all) is a :class:`ContentExportJobNotFoundError` and likewise writes
+    nothing.
+
+    The winning call settles exactly as a directed run: ``succeeded`` with
+    UTC ``finished_at`` and the export snapshot as ``result``, or ``failed``
+    with UTC ``finished_at``, null ``result``, and the stable
+    ``content_export_failed`` error, recording the
+    ``content_export_job.run`` audit event in the same transaction.
+    """
+    job = session.execute(
+        select(ContentExportJob)
+        .where(ContentExportJob.status == CONTENT_EXPORT_JOB_PENDING)
+        .order_by(*_CONTENT_EXPORT_JOB_ORDER)
+        .limit(1)
+    ).scalars().first()
+    if job is None:
+        raise ContentExportJobNotFoundError()
+    return run_content_export_job(session, job.id, build_result)
+
+
 # Reviewer content export job search paging bounds.
 DEFAULT_CONTENT_EXPORT_JOBS_LIMIT = 50
 MIN_CONTENT_EXPORT_JOBS_LIMIT = 1

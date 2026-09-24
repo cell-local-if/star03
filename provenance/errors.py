@@ -175,8 +175,10 @@ class ContentExportJobNotFoundError(DomainError):
     code = "content_export_job_not_found"
     message = "The requested content export job does not exist."
 
-    def __init__(self, job_id: str):
-        super().__init__(details={"job_id": job_id})
+    def __init__(self, job_id: str | None = None):
+        # A directed lookup carries the missing job id; a queue drain that
+        # found no pending job has no id to report.
+        super().__init__(details={"job_id": job_id} if job_id else None)
 
 
 class ContentExportRequestConflictError(DomainError):
