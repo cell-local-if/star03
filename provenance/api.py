@@ -76,6 +76,8 @@ from provenance.schemas import (
     ContentExportJobPageResponse,
     ContentExportJobResponse,
     ContentExportResponse,
+    ContentExportVerificationCreate,
+    ContentExportVerificationResponse,
     ContentLineageItem,
     ContentLineageResponse,
     ContentListResponse,
@@ -1440,6 +1442,33 @@ def get_content_export(
             )
             for claim in claims
         ],
+    )
+
+
+@router.post(
+    "/content-export-verifications",
+    response_model=ContentExportVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_content_export(
+    payload: ContentExportVerificationCreate, request: Request
+) -> ContentExportVerificationResponse:
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no audit event is written. Verification
+    # uses the request body alone; the content, claim, and bundle ids are
+    # never resolved against local state, so unknown resources verify
+    # exactly like known ones.
+    body = await request.json()
+    # The digest commits to the snapshot exactly as received: the raw JSON
+    # values (root member order, claim and bundle array order, datetime
+    # spellings), not any parsed or re-serialized form. Field validation
+    # has already guaranteed every member is a public view and
+    # canonicalizable.
+    computed_digest_hex = canonical.content_export_digest_hex(body["snapshot"])
+    if computed_digest_hex == payload.digest_hex:
+        return ContentExportVerificationResponse(valid=True)
+    return ContentExportVerificationResponse(
+        valid=False, computed_digest_hex=computed_digest_hex
     )
 
 

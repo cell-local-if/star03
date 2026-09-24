@@ -36,6 +36,35 @@ def payload_digest_hex(payload: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
+def _ordered_root_canonical_bytes(value: Any) -> bytes:
+    """Serialize a snapshot whose root keeps its own member order.
+
+    Only nested object members are sorted by Unicode code point; the root
+    object keeps its received member order and arrays keep their element
+    order. Serialization is otherwise identical to
+    :func:`canonical_json_bytes` (compact separators, non-ASCII emitted
+    unescaped, UTF-8 encoded), so the bytes are reproducible by an external
+    verifier from the snapshot JSON alone.
+    """
+
+    def canonicalize(member: Any, *, sort_root: bool) -> Any:
+        if isinstance(member, dict):
+            items = sorted(member.items()) if sort_root else member.items()
+            # Every nested object is sorted; the root alone keeps its order.
+            return {key: canonicalize(child, sort_root=True) for key, child in items}
+        if isinstance(member, list):
+            return [canonicalize(item, sort_root=True) for item in member]
+        return member
+
+    normalized = canonicalize(value, sort_root=False)
+    return json.dumps(
+        normalized,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 def canonical_exchange_snapshot_bytes(snapshot: Any) -> bytes:
     """Serialize an exchange snapshot under the manifest canonical rules.
 
@@ -47,28 +76,31 @@ def canonical_exchange_snapshot_bytes(snapshot: Any) -> bytes:
     emitted unescaped, UTF-8 encoded), so the bytes are reproducible by an
     external verifier from the exchange JSON alone.
     """
+    return _ordered_root_canonical_bytes(snapshot)
 
-    def canonicalize(value: Any, *, sort_root: bool) -> Any:
-        if isinstance(value, dict):
-            items = sorted(value.items()) if sort_root else value.items()
-            # Every nested object is sorted; the root alone keeps its order.
-            return {key: canonicalize(member, sort_root=True) for key, member in items}
-        if isinstance(value, list):
-            return [canonicalize(item, sort_root=True) for item in value]
-        return value
 
-    normalized = canonicalize(snapshot, sort_root=False)
-    return json.dumps(
-        normalized,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
+def canonical_content_export_snapshot_bytes(snapshot: Any) -> bytes:
+    """Serialize a content export snapshot under its verification rules.
+
+    The snapshot root keeps its received member order (``content`` then
+    ``claims``) and arrays (the claims and each claim's evidence bundles)
+    keep their element order; every nested object member is sorted by
+    Unicode code point. Serialization is otherwise identical to the
+    exchange snapshot rules (compact separators, non-ASCII emitted
+    unescaped, UTF-8 encoded), so the digest is reproducible offline from
+    the content export JSON alone.
+    """
+    return _ordered_root_canonical_bytes(snapshot)
 
 
 def exchange_manifest_digest_hex(snapshot: Any) -> str:
     """Return the SHA-256 hex digest of the canonical exchange snapshot bytes."""
     return hashlib.sha256(canonical_exchange_snapshot_bytes(snapshot)).hexdigest()
+
+
+def content_export_digest_hex(snapshot: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical content export bytes."""
+    return hashlib.sha256(canonical_content_export_snapshot_bytes(snapshot)).hexdigest()
 
 
 def audit_events_digest_hex(events: Any) -> str:
