@@ -76,6 +76,8 @@ from provenance.schemas import (
     ContentExportJobPageResponse,
     ContentExportJobResponse,
     ContentExportResponse,
+    ContentExportVerificationCreate,
+    ContentExportVerificationResponse,
     ContentLineageItem,
     ContentLineageResponse,
     ContentListResponse,
@@ -1692,6 +1694,33 @@ def run_content_export_job(
         session, job_id, _content_export_result_payload
     )
     return _export_job_response(job)
+
+
+@router.post(
+    "/content-export-verifications",
+    response_model=ContentExportVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_content_export(
+    payload: ContentExportVerificationCreate, request: Request
+) -> ContentExportVerificationResponse:
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no audit event is written. Verification
+    # uses the request body alone; no content, claim, or bundle id is ever
+    # resolved against local state, so unknown resources verify exactly
+    # like known ones and repeated or queried requests cannot change the
+    # verdict.
+    body = await request.json()
+    # The digest commits to the snapshot exactly as received: the raw JSON
+    # values (root member order, array order, datetime spellings), not any
+    # parsed or re-serialized form. Field validation has already guaranteed
+    # every member is canonicalizable.
+    computed_digest_hex = canonical.content_export_digest_hex(body["snapshot"])
+    if computed_digest_hex == payload.digest_hex:
+        return ContentExportVerificationResponse(valid=True)
+    return ContentExportVerificationResponse(
+        valid=False, computed_digest_hex=computed_digest_hex
+    )
 
 
 def _parse_nonempty_filter(raw, field: str) -> str | None:
