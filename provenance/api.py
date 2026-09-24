@@ -643,6 +643,11 @@ def _claim_supersession_lineage_item(
     return ClaimSupersessionLineageItem(**fields, depth=depth)
 
 
+_SUPERSESSION_LINEAGE_PARAMS = frozenset(
+    {"direction", "max_depth", "min_depth", "limit", "cursor"}
+)
+
+
 @router.get(
     "/claims/{claim_id}/supersession-lineage",
     response_model=ClaimSupersessionLineageResponse,
@@ -653,6 +658,9 @@ def get_claim_supersession_lineage(
     session: DbSession,
     direction: str | None = Query(default=None),
     max_depth: str | None = Query(default=None),
+    min_depth: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
 ) -> ClaimSupersessionLineageResponse:
     # Read-only reviewer multi-hop traversal over the immutable supersession
     # graph. Raw multi-values are inspected deliberately: FastAPI otherwise
@@ -660,6 +668,14 @@ def get_claim_supersession_lineage(
     # coerces "8.0" to 8, both of which must be rejected rather than silently
     # defaulted or normalized.
     raw = request.query_params
+
+    unknown = set(raw) - _SUPERSESSION_LINEAGE_PARAMS
+    if unknown:
+        # A typo never silently changes the traversal.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
 
     direction = _parse_once(raw, "direction")
     if direction is None:
@@ -682,18 +698,100 @@ def get_claim_supersession_lineage(
         service.MIN_SUPERSESSION_LINEAGE_MAX_DEPTH,
         service.MAX_SUPERSESSION_LINEAGE_MAX_DEPTH,
     )
+    min_level = _parse_int_param(
+        raw,
+        "min_depth",
+        service.DEFAULT_SUPERSESSION_LINEAGE_MIN_DEPTH,
+        service.MIN_SUPERSESSION_LINEAGE_MIN_DEPTH,
+        service.MAX_SUPERSESSION_LINEAGE_MIN_DEPTH,
+    )
+    if min_level > depth:
+        raise _query_validation_error(
+            "min_depth",
+            "min_depth must not be greater than max_depth",
+            "value_error.range",
+        )
 
-    # Parameters are validated first; a structurally valid request for an
-    # unknown origin claim is the existing claim_not_found 404, not an empty
-    # collection. The traversal is read-only, dedups at shortest depth, and
-    # terminates over anomalous cyclic history; it renders only existing
-    # claim public views plus depth, never the payload.
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_SUPERSESSION_LINEAGE_LIMIT,
+        service.MIN_SUPERSESSION_LINEAGE_LIMIT,
+        service.MAX_SUPERSESSION_LINEAGE_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.supersession_lineage_cursor_secret,
+                pagination.SUPERSESSION_LINEAGE_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the effective
+        # parameters (including their defaults) and the origin must match
+        # exactly. A mismatch is a client validation error, not a new query.
+        expected = {
+            "claim_id": claim_id,
+            "direction": direction,
+            "max_depth": depth,
+            "min_depth": min_level,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Parameters and cursor are validated first; a structurally valid request
+    # for an unknown origin claim is the existing claim_not_found 404, not an
+    # empty collection. Traversal reachability, shortest depths, and
+    # first-discovery order are computed without any filter; min_depth only
+    # removes returned rows. The traversal is read-only, dedups at shortest
+    # depth, and terminates over anomalous cyclic history; it renders only
+    # existing claim public views plus depth, never the payload.
     rows = service.get_claim_supersession_lineage(
         session, claim_id, direction, depth
     )
+    filtered = [(claim, d) for claim, d in rows if d >= min_level]
+    total = len(filtered)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = filtered[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.supersession_lineage_cursor_secret,
+                pagination.SUPERSESSION_LINEAGE_CURSOR,
+                {
+                    "claim_id": claim_id,
+                    "direction": direction,
+                    "max_depth": depth,
+                    "min_depth": min_level,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
     return ClaimSupersessionLineageResponse(
-        items=[_claim_supersession_lineage_item(claim, d) for claim, d in rows],
-        count=len(rows),
+        items=[_claim_supersession_lineage_item(claim, d) for claim, d in page],
+        count=total,
+        next_cursor=next_cursor,
     )
 
 

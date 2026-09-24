@@ -69,6 +69,10 @@ ATTESTATION_ACCESS_GRANTS_CURSOR_VERSION = "ag1"
 #: Marker for cursors that page through the content export job search.
 CONTENT_EXPORT_JOBS_CURSOR_VERSION = "cx1"
 
+#: Marker for cursors that page through a claim's supersession-lineage
+#: traversal.
+SUPERSESSION_LINEAGE_CURSOR_VERSION = "sl1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -508,6 +512,44 @@ CONTENT_EXPORT_JOBS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_content_export_jobs_claims,
+)
+
+
+def _validate_supersession_lineage_claims(claims: dict[str, Any]) -> None:
+    if not isinstance(claims["claim_id"], str) or not claims["claim_id"]:
+        raise InvalidCursorError("cursor claim_id is invalid")
+    if claims["direction"] not in ("newer", "older"):
+        raise InvalidCursorError("cursor direction is invalid")
+    for field in ("max_depth", "min_depth", "limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["max_depth"] <= 32):
+        raise InvalidCursorError("cursor max_depth is out of range")
+    if not (1 <= claims["min_depth"] <= claims["max_depth"]):
+        raise InvalidCursorError("cursor min_depth is out of range")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    # An offset of 0 is never issued (a first page carries no cursor); a
+    # negative offset is structurally invalid. No tight upper bound is
+    # imposed: a wide graph can legitimately page past any small constant,
+    # and a client cannot forge a large value without the server secret.
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for
+#: ``GET /v1/claims/{claim_id}/supersession-lineage``.
+SUPERSESSION_LINEAGE_CURSOR = CursorKind(
+    version=SUPERSESSION_LINEAGE_CURSOR_VERSION,
+    claim_fields=(
+        "claim_id",
+        "direction",
+        "max_depth",
+        "min_depth",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_supersession_lineage_claims,
 )
 
 

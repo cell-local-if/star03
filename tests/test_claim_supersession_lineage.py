@@ -86,7 +86,8 @@ def test_newer_walks_superseded_to_replacement_excluding_origin(client):
     resp = _lineage(client, claims["a"]["id"], "newer")
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {"items", "count"}
+    assert set(body) == {"items", "count", "next_cursor"}
+    assert body["next_cursor"] is None
     assert body["count"] == 2
     assert [item["id"] for item in body["items"]] == [
         claims["b"]["id"],
@@ -148,7 +149,11 @@ def test_empty_traversal_returns_empty_set_not_404(client):
     ):
         resp = _lineage(client, origin, direction)
         assert resp.status_code == 200
-        assert resp.json() == {"items": [], "count": 0}
+        assert resp.json() == {
+            "items": [],
+            "count": 0,
+            "next_cursor": None,
+        }
 
 
 def test_unknown_origin_is_claim_not_found(client):

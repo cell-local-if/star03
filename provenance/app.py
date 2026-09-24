@@ -68,6 +68,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.attestation_access_grants_cursor_secret = secrets.token_bytes(32)
     app.state.content_export_jobs_cursor_secret = secrets.token_bytes(32)
+    app.state.supersession_lineage_cursor_secret = secrets.token_bytes(32)
 
     register_exception_handlers(app)
     app.include_router(v1_router)
