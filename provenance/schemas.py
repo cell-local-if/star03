@@ -795,6 +795,141 @@ class ExchangeManifestVerificationResponse(BaseModel):
     computed_digest_hex: str | None = None
 
 
+#: The sole digest algorithm accepted for offline content export verification.
+CONTENT_EXPORT_DIGEST_ALGORITHM = "sha256"
+
+
+class ContentExportVerificationContent(ContentResponse):
+    """The ``content`` member of a content export snapshot under verification.
+
+    Exactly the existing public content view's fields: undeclared members
+    (including any raw-material field such as content bytes) are rejected
+    rather than ignored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ContentExportVerificationEvidenceBundle(EvidenceBundleResponse):
+    """An evidence bundle nested in a content export snapshot under verification.
+
+    Exactly the existing public bundle view. ``metadata`` must be
+    canonicalizable JSON with finite numbers, exactly as at bundle creation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_canonicalizable(cls, v: dict[str, Any]) -> dict[str, Any]:
+        try:
+            canonical_json_bytes(v)
+        except (TypeError, ValueError):
+            # Non-finite numbers (NaN/Infinity) have no canonical JSON form.
+            raise ValueError(
+                "metadata must be a JSON object with finite values"
+            ) from None
+        return v
+
+
+class ContentExportVerificationClaim(ClaimExportItem):
+    """A claim in a content export snapshot under verification.
+
+    The full public claim view plus its ``evidence_bundles`` array, each
+    bundle exactly the existing strict public bundle view. Undeclared
+    members (including a raw claim ``payload`` or a signature field) are
+    rejected on the claim and on every bundle.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_bundles: list[ContentExportVerificationEvidenceBundle]
+
+
+class ContentExportVerificationSnapshot(BaseModel):
+    """The content export snapshot under verification: exactly two members.
+
+    ``content`` is the full public content view and ``claims`` is the array
+    of directly asserting claims (an empty array is a legal snapshot), each
+    with its evidence bundles. Undeclared members are rejected rather than
+    ignored, so no raw content, payload, evidence, or signature field can
+    enter the snapshot.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: ContentExportVerificationContent
+    claims: list[ContentExportVerificationClaim]
+
+
+def _validate_content_export_snapshot_associations(
+    snapshot: ContentExportVerificationSnapshot,
+) -> None:
+    """Validate the internal references of one content export snapshot.
+
+    Every claim must directly assert the snapshot's exact content, and each
+    claim's evidence bundle must be attached to that exact claim. The checks
+    are purely structural and never resolve any id against local state, so
+    they apply identically whether any referenced resource exists locally.
+    """
+    for claim in snapshot.claims:
+        if claim.content_id != snapshot.content.id:
+            raise ValueError(
+                "every snapshot claim must directly assert snapshot.content.id"
+            )
+        for bundle in claim.evidence_bundles:
+            if bundle.claim_id != claim.id:
+                raise ValueError(
+                    "every snapshot evidence bundle must attach to its"
+                    " enclosing claim"
+                )
+
+
+class ContentExportVerificationCreate(BaseModel):
+    """An offline content export snapshot verification request.
+
+    Exactly three members: the public content export ``snapshot`` (only the
+    direct assertions of its content and their evidence bundles), the fixed
+    ``digest_algorithm`` (``sha256``), and the claimed ``digest_hex`` (exactly
+    64 lowercase hexadecimal characters). Verification is pure: it reads and
+    writes no server state, so every identifier is an opaque reference.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot: ContentExportVerificationSnapshot
+    digest_algorithm: Literal[CONTENT_EXPORT_DIGEST_ALGORITHM]
+    digest_hex: str
+
+    @field_validator("digest_hex")
+    @classmethod
+    def _digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "digest_hex must be exactly 64 lowercase hexadecimal characters"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _snapshot_associations_consistent(self):
+        _validate_content_export_snapshot_associations(self.snapshot)
+        return self
+
+
+class ContentExportVerificationResponse(BaseModel):
+    """The offline content export verification verdict.
+
+    ``computed_digest_hex`` is present only on a mismatch, so a matching
+    digest renders exactly ``{"valid": true}``.
+    """
+
+    valid: bool
+    #: The digest recomputed from the submitted snapshot; omitted on match.
+    computed_digest_hex: str | None = None
+
+
 class EvidenceBundleExchangeImportManifest(BaseModel):
     """The manifest half of a received exchange package under controlled import.
 

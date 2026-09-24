@@ -36,16 +36,15 @@ def payload_digest_hex(payload: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
-def canonical_exchange_snapshot_bytes(snapshot: Any) -> bytes:
-    """Serialize an exchange snapshot under the manifest canonical rules.
+def _ordered_root_canonical_bytes(value: Any) -> bytes:
+    """Serialize with the root member order kept and nested keys sorted.
 
-    Unlike :func:`canonical_json_bytes`, the snapshot root keeps its member
-    names in the snapshot's own order (``content``, ``claim``,
-    ``evidence_bundle``, ``attestations``) and arrays keep their element
-    order; only nested object members are sorted by Unicode code point.
-    Serialization is otherwise identical (compact separators, non-ASCII
-    emitted unescaped, UTF-8 encoded), so the bytes are reproducible by an
-    external verifier from the exchange JSON alone.
+    The root object keeps its member names in the received order and arrays
+    keep their element order; every nested object's members are sorted by
+    Unicode code point. Serialization is otherwise identical to
+    :func:`canonical_json_bytes` (compact separators, non-ASCII emitted
+    unescaped, UTF-8 encoded), so the bytes are reproducible by an external
+    verifier from the received JSON alone.
     """
 
     def canonicalize(value: Any, *, sort_root: bool) -> Any:
@@ -57,7 +56,7 @@ def canonical_exchange_snapshot_bytes(snapshot: Any) -> bytes:
             return [canonicalize(item, sort_root=True) for item in value]
         return value
 
-    normalized = canonicalize(snapshot, sort_root=False)
+    normalized = canonicalize(value, sort_root=False)
     return json.dumps(
         normalized,
         separators=(",", ":"),
@@ -66,9 +65,42 @@ def canonical_exchange_snapshot_bytes(snapshot: Any) -> bytes:
     ).encode("utf-8")
 
 
+def canonical_exchange_snapshot_bytes(snapshot: Any) -> bytes:
+    """Serialize an exchange snapshot under the manifest canonical rules.
+
+    Unlike :func:`canonical_json_bytes`, the snapshot root keeps its member
+    names in the snapshot's own order (``content``, ``claim``,
+    ``evidence_bundle``, ``attestations``) and arrays keep their element
+    order; only nested object members are sorted by Unicode code point.
+    Serialization is otherwise identical (compact separators, non-ASCII
+    emitted unescaped, UTF-8 encoded), so the bytes are reproducible by an
+    external verifier from the exchange JSON alone.
+    """
+    return _ordered_root_canonical_bytes(snapshot)
+
+
 def exchange_manifest_digest_hex(snapshot: Any) -> str:
     """Return the SHA-256 hex digest of the canonical exchange snapshot bytes."""
     return hashlib.sha256(canonical_exchange_snapshot_bytes(snapshot)).hexdigest()
+
+
+def canonical_content_export_snapshot_bytes(snapshot: Any) -> bytes:
+    """Serialize a content export snapshot under its offline digest rules.
+
+    Exactly the same canonical form as
+    :func:`canonical_exchange_snapshot_bytes`: the snapshot root keeps its
+    member order (``content`` then ``claims``), arrays keep their element
+    order, and every nested object's members sort by Unicode code point,
+    with compact separators, unescaped non-ASCII, and UTF-8 encoding -- so
+    an offline verifier reproduces the bytes from the export JSON alone,
+    including an empty ``claims`` array.
+    """
+    return _ordered_root_canonical_bytes(snapshot)
+
+
+def content_export_snapshot_digest_hex(snapshot: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical content export bytes."""
+    return hashlib.sha256(canonical_content_export_snapshot_bytes(snapshot)).hexdigest()
 
 
 def audit_events_digest_hex(events: Any) -> str:
