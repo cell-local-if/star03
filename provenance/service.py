@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 from typing import Callable
 
-from sqlalchemy import exists, or_, select, update as sa_update
+from sqlalchemy import exists, func, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -41,6 +41,7 @@ from provenance.models import (
     CONTENT_EXPORT_JOB_FAILED_ERROR,
     CONTENT_EXPORT_JOB_PENDING,
     CONTENT_EXPORT_JOB_RUNNING,
+    CONTENT_EXPORT_JOB_STATES,
     CONTENT_EXPORT_JOB_SUCCEEDED,
     EVENT_ACTOR_CREATED,
     EVENT_ATTESTATION_ACCESS_GRANTED,
@@ -1904,6 +1905,38 @@ def list_content_export_jobs(
         stmt = stmt.where(ContentExportJob.created_at <= to_dt)
     stmt = stmt.order_by(*_CONTENT_EXPORT_JOB_ORDER)
     return list(session.execute(stmt).scalars().all())
+
+
+def summarize_content_export_jobs(
+    session: Session,
+) -> tuple[dict[str, int], ContentExportJob | None]:
+    """Return per-status counts over all jobs and the oldest pending job.
+
+    The counts cover every existing job keyed by the four lifecycle states
+    (``pending``/``running``/``succeeded``/``failed``), each defaulting to
+    zero; settled jobs remain in their ``succeeded``/``failed`` counts. The
+    second element is the single oldest ``pending`` job under the stable
+    creation order (``created_at`` with the monotonic ``seq`` tiebreaker,
+    which survives restarts), or ``None`` when no job is pending. Both are
+    computed from the current persisted state at call time -- nothing is
+    frozen, claimed, or settled. The function is strictly read-only: it
+    writes no job and no audit event.
+    """
+    rows = session.execute(
+        select(ContentExportJob.status, func.count()).group_by(
+            ContentExportJob.status
+        )
+    ).all()
+    counts = {state: 0 for state in CONTENT_EXPORT_JOB_STATES}
+    for status_value, total in rows:
+        counts[status_value] = total
+    oldest_pending = session.execute(
+        select(ContentExportJob)
+        .where(ContentExportJob.status == CONTENT_EXPORT_JOB_PENDING)
+        .order_by(*_CONTENT_EXPORT_JOB_ORDER)
+        .limit(1)
+    ).scalar_one_or_none()
+    return counts, oldest_pending
 
 
 def get_evidence_bundle_exchange(

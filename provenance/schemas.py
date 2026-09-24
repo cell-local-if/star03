@@ -503,6 +503,26 @@ class ContentExportJobPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ContentExportJobSummaryResponse(BaseModel):
+    """Read-only queue summary over all existing content export jobs.
+
+    Exactly six members: the four per-status counts (covering every existing
+    job, settled ones included), plus the stable id of the oldest ``pending``
+    job and the whole seconds it has waited so far. On an empty queue every
+    count is zero and both oldest-pending members are null. All numbers are
+    integers.
+    """
+
+    pending: int
+    running: int
+    succeeded: int
+    failed: int
+    #: Stable id of the oldest pending job, or null when none is pending.
+    oldest_pending_id: str | None
+    #: Whole seconds the oldest pending job has waited, or null when none.
+    oldest_pending_wait_seconds: int | None
+
+
 class EvidenceBundleExchangeResponse(BaseModel):
     """An interoperability snapshot of one evidence bundle for external verifiers.
 

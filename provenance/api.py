@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 from typing import Annotated, Literal
 
@@ -20,13 +21,17 @@ from provenance.errors import (
     ProtectedResourceNotFoundError,
 )
 from provenance.models import (
+    CONTENT_EXPORT_JOB_FAILED,
+    CONTENT_EXPORT_JOB_PENDING,
+    CONTENT_EXPORT_JOB_RUNNING,
     CONTENT_EXPORT_JOB_STATES,
+    CONTENT_EXPORT_JOB_SUCCEEDED,
     RELATION_DERIVED_FROM,
     RELATION_VERSION_OF,
 )
 from provenance.pagination import InvalidCursorError
 from provenance.signing import ATTESTATION_TARGET_TYPES
-from provenance.time_utils import parse_rfc3339_utc
+from provenance.time_utils import parse_rfc3339_utc, utc_now
 from provenance.schemas import (
     AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
     AUDIT_CHECKPOINT_VERSION,
@@ -75,6 +80,7 @@ from provenance.schemas import (
     ContentExportJobCreate,
     ContentExportJobPageResponse,
     ContentExportJobResponse,
+    ContentExportJobSummaryResponse,
     ContentExportResponse,
     ContentExportVerificationCreate,
     ContentExportVerificationResponse,
@@ -1745,6 +1751,58 @@ async def list_content_export_jobs(
     )
     # Compact UTF-8 JSON, booleans/null literal, integral numbers only,
     # terminated by exactly one newline.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
+
+
+@router.get("/content-export-jobs/summary")
+async def get_content_export_jobs_summary(
+    request: Request, session: DbSession
+) -> Response:
+    # Registered before "/content-export-jobs/{job_id}" so the literal
+    # "summary" segment is never captured as a job id. The summary takes no
+    # body and no query parameters: any non-empty body (including whitespace
+    # or malformed JSON) and any parameter (unknown, blank, or repeated) is
+    # a 422 validation_error, both rejected before any job is read -- an
+    # invalid request never produces a partial summary.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # Strictly read-only: the four counts and the oldest pending job are
+    # computed from the current persisted state at read time; nothing is
+    # frozen, claimed, settled, created, or audited, and the job lifecycle
+    # is unchanged.
+    counts, oldest = service.summarize_content_export_jobs(session)
+    wait_seconds: int | None = None
+    if oldest is not None:
+        # Whole seconds waited so far: the current UTC instant minus the
+        # job's creation time, floored to an integer.
+        wait_seconds = math.floor(
+            (utc_now() - oldest.created_at).total_seconds()
+        )
+    result = ContentExportJobSummaryResponse(
+        pending=counts[CONTENT_EXPORT_JOB_PENDING],
+        running=counts[CONTENT_EXPORT_JOB_RUNNING],
+        succeeded=counts[CONTENT_EXPORT_JOB_SUCCEEDED],
+        failed=counts[CONTENT_EXPORT_JOB_FAILED],
+        oldest_pending_id=oldest.id if oldest is not None else None,
+        oldest_pending_wait_seconds=wait_seconds,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated by
+    # exactly one newline.
     body = (
         json.dumps(
             result.model_dump(mode="json"),
