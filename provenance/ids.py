@@ -270,6 +270,23 @@ def checkpoint_import_id(
     return "aci_" + hashlib.sha256(material).hexdigest()
 
 
+def actor_trust_policy_id(actor_id: str, threshold: int) -> str:
+    """Return a stable ``atp_``-prefixed id for a subject trust policy.
+
+    The identity is exactly the registration key: the subject and its signer
+    threshold. A retry of the same pair maps to the same policy; the same
+    subject with a different threshold maps to a different id (and is
+    rejected as a conflict). The material is a canonical JSON array so
+    fields containing separators cannot collide with different field splits.
+    """
+    material = json.dumps(
+        ["actor_trust_policy", actor_id, threshold],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "atp_" + hashlib.sha256(material).hexdigest()
+
+
 def content_export_job_id(content_id: str, request_id: str) -> str:
     """Return a stable ``cxj_``-prefixed id for a content export job.
 

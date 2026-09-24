@@ -179,6 +179,24 @@ class ContentExportJobNotFoundError(DomainError):
         super().__init__(details={"job_id": job_id})
 
 
+class ActorTrustPolicyConflictError(DomainError):
+    """A policy already exists for the subject with a different threshold.
+
+    A subject carries at most one immutable trust policy, and there is no
+    update path: a registration whose threshold differs from the subject's
+    existing policy is a 409 conflict rather than a second row or an
+    in-place change. A retry of the same subject-and-threshold pair is
+    idempotent (200) and never reaches this error.
+    """
+
+    status_code = 409
+    code = "actor_trust_policy_conflict"
+    message = "A trust policy with a different threshold already exists for the subject."
+
+    def __init__(self, actor_id: str):
+        super().__init__(details={"actor_id": actor_id})
+
+
 class ContentExportRequestConflictError(DomainError):
     """A request_id reused for a different content than its first submission."""
 

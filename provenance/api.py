@@ -34,6 +34,8 @@ from provenance.schemas import (
     EXCHANGE_MANIFEST_VERSION,
     ActorCreate,
     ActorResponse,
+    ActorTrustPolicyCreate,
+    ActorTrustPolicyResponse,
     AttestationAccessGrantCreate,
     AttestationAccessGrantPageResponse,
     AttestationAccessGrantResponse,
@@ -100,6 +102,7 @@ from provenance.schemas import (
     EvidenceBundleResponse,
     ExchangeManifestVerificationCreate,
     ExchangeManifestVerificationResponse,
+    TrustDecisionResponse,
     TrustEvaluationResponse,
 )
 
@@ -2414,6 +2417,147 @@ def evaluate_trust(
         session, target_type, target_id, threshold
     )
     return TrustEvaluationResponse(**result)
+
+
+_TRUST_DECISIONS_PARAMS = frozenset({"actor_id", "target_type", "target_id"})
+
+
+def _trust_policy_response(policy) -> ActorTrustPolicyResponse:
+    return ActorTrustPolicyResponse.model_validate(policy)
+
+
+@router.post(
+    "/trust-policies", response_model=ActorTrustPolicyResponse
+)
+async def create_trust_policy(
+    request: Request,
+    payload: ActorTrustPolicyCreate,
+    session: DbSession,
+    response: Response,
+) -> ActorTrustPolicyResponse:
+    # The signature covers the exact bytes on the wire; FastAPI's parsed
+    # model is built from the same cached body, so body_sha256 matches what
+    # the client signed. The authenticated caller is the policy's subject.
+    raw_body = await request.body()
+    # This capability deliberately diverges from the older grant write
+    # route's credential boundary: missing credentials, a credential no
+    # current key verifies, and an invalid signed payload all collapse into
+    # the opaque 404 (``read=True`` semantics), while a structurally
+    # malformed timestamp or signature encoding stays a 422. An authenticated
+    # caller naming another subject is the same opaque 404 below.
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+    policy, created = service.create_actor_trust_policy(
+        session, payload, caller
+    )
+    # First registration -> 201 and one ``actor_trust_policy.created`` audit
+    # event in the same transaction; a retried submission for the same
+    # subject and threshold -> 200 with the existing policy and no new write.
+    # A different threshold for the same subject is a 409 conflict; an
+    # authenticated caller naming another subject is the opaque 404.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _trust_policy_response(policy)
+
+
+@router.get("/trust-decisions")
+async def decide_trust(
+    request: Request,
+    session: DbSession,
+    actor_id: str | None = Query(default=None),
+    target_type: str | None = Query(default=None),
+    target_id: str | None = Query(default=None),
+) -> Response:
+    # Subject-level authorization decision for one existing claim or
+    # evidence bundle. Raw multi-values are inspected deliberately: a
+    # repeated scalar is rejected instead of silently taking the last value,
+    # undeclared parameters are rejected rather than ignored, and a blank
+    # identifier is never coerced. Query structure is validated first, then
+    # the X-PA/X-PT/X-PS credentials, so a structurally malformed request is
+    # always a 422; missing or unverifiable credentials collapse into the
+    # opaque 404 exactly as on the other protected reads.
+    raw = request.query_params
+
+    unknown = set(raw) - _TRUST_DECISIONS_PARAMS
+    if unknown:
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    actor_id = _parse_once(raw, "actor_id")
+    if actor_id is None:
+        raise _query_validation_error(
+            "actor_id", "Field required", "value_error.missing"
+        )
+    if not actor_id.strip():
+        raise _query_validation_error(
+            "actor_id", "actor_id must not be empty", "value_error"
+        )
+
+    target_type = _parse_once(raw, "target_type")
+    if target_type is None:
+        raise _query_validation_error(
+            "target_type", "Field required", "value_error.missing"
+        )
+    if target_type not in ATTESTATION_TARGET_TYPES:
+        # Covers missing values, whitespace/blank strings, casing variants,
+        # and anything other than the two literal target types.
+        raise _query_validation_error(
+            "target_type",
+            "target_type must be 'claim' or 'evidence_bundle'",
+            "value_error",
+        )
+
+    target_id = _parse_once(raw, "target_id")
+    if target_id is None:
+        raise _query_validation_error(
+            "target_id", "Field required", "value_error.missing"
+        )
+    if not target_id.strip():
+        raise _query_validation_error(
+            "target_id", "target_id must not be empty", "value_error"
+        )
+
+    # A GET carries no body; the signed body_sha256 is therefore the digest
+    # of zero bytes, exactly as on the other protected reads. Malformed
+    # credentials stay 422; missing or unverifiable credentials are the
+    # same opaque 404 used for an unauthorized caller.
+    raw_body = await request.body()
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+    if caller != actor_id:
+        # A valid signature for one subject used to query another subject's
+        # decision is an unauthorized request, indistinguishable from a
+        # missing resource: the opaque 404, never a 422.
+        raise ProtectedResourceNotFoundError()
+
+    result = service.evaluate_trust_decision(
+        session, actor_id, target_type, target_id
+    )
+    reason = result.pop("reason")
+    decision = TrustDecisionResponse(**result, reason=reason)
+    body_obj = decision.model_dump(mode="json")
+    # ``reason`` is carried only by the policy-missing result; the empty
+    # identifier (``policy_id: null``) is always present, so only ``reason``
+    # is omitted -- never the null policy id.
+    if body_obj["reason"] is None:
+        body_obj.pop("reason")
+    # Compact UTF-8 JSON, booleans/null literal, integral numbers only,
+    # terminated by exactly one newline.
+    body = (
+        json.dumps(
+            body_obj,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 _AUDIT_EVENTS_PARAMS = frozenset(

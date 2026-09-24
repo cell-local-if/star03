@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from provenance import canonical, ed25519, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
+    ActorTrustPolicyConflictError,
     AuditCheckpointImportNotFoundError,
     AttestationAccessGrantRevocationNotFoundError,
     AttestationNotFoundError,
@@ -34,6 +35,7 @@ from provenance.errors import (
     EvidenceBundleExchangeImportNotFoundError,
     EvidenceBundleNotFoundError,
     ProtectedAccessValidationError,
+    ProtectedResourceNotFoundError,
     UnknownActorError,
 )
 from provenance.models import (
@@ -43,6 +45,7 @@ from provenance.models import (
     CONTENT_EXPORT_JOB_RUNNING,
     CONTENT_EXPORT_JOB_SUCCEEDED,
     EVENT_ACTOR_CREATED,
+    EVENT_ACTOR_TRUST_POLICY_CREATED,
     EVENT_ATTESTATION_ACCESS_GRANTED,
     EVENT_ATTESTATION_ACCESS_GRANT_REVOKED,
     EVENT_ATTESTATION_CREATED,
@@ -59,6 +62,7 @@ from provenance.models import (
     EVENT_EVIDENCE_BUNDLE_CREATED,
     EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
     Actor,
+    ActorTrustPolicy,
     Attestation,
     AttestationAccessGrant,
     AttestationAccessGrantRevocation,
@@ -76,6 +80,7 @@ from provenance.models import (
 )
 from provenance.schemas import (
     ActorCreate,
+    ActorTrustPolicyCreate,
     AttestationAccessGrantCreate,
     AttestationAccessGrantRevocationCreate,
     AttestationCreate,
@@ -2263,6 +2268,120 @@ def evaluate_trust(
 
     # Exclude any attestation carrying at least one revocation record: its
     # proof is preserved but no longer qualifies the target for trust.
+    qualified = _qualified_signer_count(session, target_type, target_id)
+    return {
+        "target_type": target_type,
+        "target_id": target_id,
+        "min_signers": min_signers,
+        "qualified_signer_count": qualified,
+        "decision": (
+            TRUST_DECISION_TRUSTED
+            if qualified >= min_signers
+            else TRUST_DECISION_UNTRUSTED
+        ),
+    }
+
+
+# Subject trust-policy threshold bounds.
+MIN_ACTOR_TRUST_POLICY_THRESHOLD = 1
+MAX_ACTOR_TRUST_POLICY_THRESHOLD = 100
+
+#: A trust decision with no registered policy carries this reason.
+TRUST_DECISION_REASON_POLICY_MISSING = "policy_missing"
+
+
+def find_actor_trust_policy(
+    session: Session, actor_id: str
+) -> ActorTrustPolicy | None:
+    """Return the subject's trust policy, or ``None`` when none is registered.
+
+    At most one policy exists per subject. The lookup is strictly read-only:
+    it writes no resource and no audit event.
+    """
+    return session.execute(
+        select(ActorTrustPolicy).where(ActorTrustPolicy.actor_id == actor_id)
+    ).scalar_one_or_none()
+
+
+def create_actor_trust_policy(
+    session: Session,
+    payload: ActorTrustPolicyCreate,
+    caller_actor_id: str,
+) -> tuple[ActorTrustPolicy, bool]:
+    """Register one subject-level signer-threshold policy.
+
+    The authenticated caller must be the subject named in the body; the
+    subject must already exist. A subject carries at most one policy: a
+    retried submission for the same subject and threshold returns the
+    existing policy with ``created=False`` and writes no row or audit
+    event, while a different threshold for the same subject raises
+    :class:`ActorTrustPolicyConflictError` and writes nothing. On first
+    registration the policy row and its ``actor_trust_policy.created`` audit
+    event commit in a single transaction.
+    """
+    if payload.actor_id != caller_actor_id:
+        # An authenticated caller registering a policy for another subject is
+        # an unauthorized request; the route renders it as the opaque 404 and
+        # never a 422, even when the named subject does not exist.
+        raise ProtectedResourceNotFoundError()
+
+    actor = session.get(Actor, payload.actor_id)
+    if actor is None:
+        # An authenticated caller always has an existing subject (its
+        # authenticating attestation or rotation requires one), so this is a
+        # defensive guard rather than a reachable client path.
+        raise ProtectedResourceNotFoundError()
+
+    existing = find_actor_trust_policy(session, payload.actor_id)
+    if existing is not None:
+        if existing.threshold != payload.threshold:
+            # A subject's threshold is immutable: there is no update path, so
+            # a different value is a conflict, not a second row or a change.
+            raise ActorTrustPolicyConflictError(payload.actor_id)
+        return existing, False
+
+    policy = ActorTrustPolicy(
+        id=ids.actor_trust_policy_id(payload.actor_id, payload.threshold),
+        actor_id=payload.actor_id,
+        threshold=payload.threshold,
+        enabled=True,
+    )
+    session.add(policy)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_ACTOR_TRUST_POLICY_CREATED,
+            resource_id=policy.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent request registered this subject's policy first: roll
+        # back and reconcile -- a matching threshold is an idempotent retry,
+        # a differing threshold is the conflict.
+        session.rollback()
+        raced = find_actor_trust_policy(session, payload.actor_id)
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if raced.threshold != payload.threshold:
+            raise ActorTrustPolicyConflictError(payload.actor_id) from None
+        return raced, False
+    session.refresh(policy)
+    return policy, True
+
+
+def _qualified_signer_count(
+    session: Session, target_type: str, target_id: str
+) -> int:
+    """Count distinct subjects with a verified, non-revoked proof of a target.
+
+    This is the shared "qualified signer" semantics of the reviewer trust
+    evaluation and the subject trust decision: only attestations of the
+    exact target with no recorded revocation qualify (every stored
+    attestation was verified when written), and several attestations by the
+    same ``signer_actor_id`` -- for example under different keys -- count
+    once. Strictly read-only.
+    """
     revoked = exists().where(
         AttestationRevocation.attestation_id == Attestation.id
     )
@@ -2275,17 +2394,74 @@ def evaluate_trust(
         )
         .distinct()
     ).scalars().all()
-    qualified = len(set(signer_ids))
+    return len(set(signer_ids))
+
+
+def evaluate_trust_decision(
+    session: Session,
+    actor_id: str,
+    target_type: str,
+    target_id: str,
+) -> dict:
+    """Evaluate one subject's trust decision for an existing claim or bundle.
+
+    The subject's current policy is resolved first and takes precedence over
+    the target lookup: with no policy the result is 200 ``untrusted`` with
+    ``reason="policy_missing"``, a null policy id, and a zero qualified
+    count, and the target is never inspected -- so a missing target with no
+    policy still yields this result rather than a resource-missing 404.
+
+    Once a policy exists the target must exist: a missing claim raises
+    :class:`ClaimNotFoundError` and a missing evidence bundle raises
+    :class:`EvidenceBundleNotFoundError`, matched by the declared
+    ``target_type``. The qualified signer count and the decision are
+    recomputed live against the current policy threshold and the current
+    revocation state, so a restart and later revocations always reflect the
+    present state. The function is strictly read-only: it writes no resource
+    and no audit event.
+    """
+    policy = find_actor_trust_policy(session, actor_id)
+    if policy is None:
+        # Policy-missing precedes the target lookup: the target is never
+        # read, so its existence cannot change the result.
+        return {
+            "policy_id": None,
+            "actor_id": actor_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "threshold": 0,
+            "qualified_signer_count": 0,
+            "decision": TRUST_DECISION_UNTRUSTED,
+            "reason": TRUST_DECISION_REASON_POLICY_MISSING,
+        }
+
+    if target_type == signing.TARGET_CLAIM:
+        target = session.execute(
+            select(Claim).where(Claim.id == target_id)
+        ).scalar_one_or_none()
+        if target is None:
+            raise ClaimNotFoundError(target_id)
+    else:
+        target = session.execute(
+            select(EvidenceBundle).where(EvidenceBundle.id == target_id)
+        ).scalar_one_or_none()
+        if target is None:
+            raise EvidenceBundleNotFoundError(target_id)
+
+    qualified = _qualified_signer_count(session, target_type, target_id)
     return {
+        "policy_id": policy.id,
+        "actor_id": actor_id,
         "target_type": target_type,
         "target_id": target_id,
-        "min_signers": min_signers,
+        "threshold": policy.threshold,
         "qualified_signer_count": qualified,
         "decision": (
             TRUST_DECISION_TRUSTED
-            if qualified >= min_signers
+            if qualified >= policy.threshold
             else TRUST_DECISION_UNTRUSTED
         ),
+        "reason": None,
     }
 
 

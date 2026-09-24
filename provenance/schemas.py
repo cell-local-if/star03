@@ -1340,6 +1340,63 @@ class TrustEvaluationResponse(BaseModel):
     decision: Literal["trusted", "untrusted"]
 
 
+class ActorTrustPolicyCreate(BaseModel):
+    """A request to register one subject-level signer-threshold trust policy.
+
+    Exactly two members: an existing non-empty ``actor_id`` subject and an
+    integer ``threshold`` from 1 to 100. Undeclared fields are rejected
+    rather than silently discarded. The authenticated caller must be the
+    same subject named in the body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The subject whose trust decisions this policy governs.
+    actor_id: str = Field(..., min_length=1, max_length=255)
+    #: Required number of distinct qualified signers (1 to 100 inclusive).
+    threshold: StrictInt = Field(..., ge=1, le=100)
+
+    @field_validator("actor_id")
+    @classmethod
+    def _actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "actor_id")
+
+
+class ActorTrustPolicyResponse(BaseModel):
+    """Public trust-policy view: stable id, subject, threshold, state, time."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    actor_id: str
+    threshold: int
+    #: Always true: a registered policy can never be deactivated.
+    enabled: bool
+    created_at: datetime
+
+
+class TrustDecisionResponse(BaseModel):
+    """Read-only subject trust decision for one claim or evidence bundle.
+
+    Computed live against the subject's current policy and the current
+    revocation state: only verified, non-revoked attestations of the exact
+    target count, and distinct signing subjects count once. The decision is
+    ``trusted`` when the qualified signer count reaches the policy threshold
+    and ``untrusted`` otherwise. When the subject has no policy the body is
+    200 ``untrusted`` with ``reason="policy_missing"`` and a null policy id;
+    ``reason`` is omitted once a policy exists.
+    """
+
+    policy_id: str | None
+    actor_id: str
+    target_type: Literal["claim", "evidence_bundle"]
+    target_id: str
+    threshold: int
+    qualified_signer_count: int
+    decision: Literal["trusted", "untrusted"]
+    reason: Literal["policy_missing"] | None = None
+
+
 class AuthenticationKeyRotationCreate(BaseModel):
     # A rotation carries exactly its declared verification material. There
     # is deliberately no field capable of carrying a private key or a raw
