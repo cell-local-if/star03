@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 from typing import Callable
 
-from sqlalchemy import exists, or_, select, update as sa_update
+from sqlalchemy import exists, func, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -1904,6 +1904,41 @@ def list_content_export_jobs(
         stmt = stmt.where(ContentExportJob.created_at <= to_dt)
     stmt = stmt.order_by(*_CONTENT_EXPORT_JOB_ORDER)
     return list(session.execute(stmt).scalars().all())
+
+
+def summarize_content_export_jobs(
+    session: Session,
+) -> tuple[dict[str, int], ContentExportJob | None]:
+    """Return queue-wide status counts and the oldest pending job.
+
+    The counts cover every persisted job, keyed by the four lifecycle
+    states; settled jobs (``succeeded``/``failed``) remain counted in their
+    terminal state. The oldest pending job is selected in stable creation
+    order (``created_at`` with the monotonic ``seq`` tiebreaker); ``None``
+    when no job is pending. The function is strictly read-only: it writes
+    no job and no audit event, and it neither freezes nor changes any
+    job's lifecycle state.
+    """
+    rows = session.execute(
+        select(ContentExportJob.status, func.count()).group_by(
+            ContentExportJob.status
+        )
+    ).all()
+    counts = {
+        CONTENT_EXPORT_JOB_PENDING: 0,
+        CONTENT_EXPORT_JOB_RUNNING: 0,
+        CONTENT_EXPORT_JOB_SUCCEEDED: 0,
+        CONTENT_EXPORT_JOB_FAILED: 0,
+    }
+    for status_value, total in rows:
+        counts[status_value] = total
+    oldest_pending = session.execute(
+        select(ContentExportJob)
+        .where(ContentExportJob.status == CONTENT_EXPORT_JOB_PENDING)
+        .order_by(*_CONTENT_EXPORT_JOB_ORDER)
+        .limit(1)
+    ).scalar_one_or_none()
+    return counts, oldest_pending
 
 
 def get_evidence_bundle_exchange(

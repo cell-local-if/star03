@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 from typing import Annotated, Literal
 
@@ -26,7 +27,7 @@ from provenance.models import (
 )
 from provenance.pagination import InvalidCursorError
 from provenance.signing import ATTESTATION_TARGET_TYPES
-from provenance.time_utils import parse_rfc3339_utc
+from provenance.time_utils import parse_rfc3339_utc, utc_now
 from provenance.schemas import (
     AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
     AUDIT_CHECKPOINT_VERSION,
@@ -75,6 +76,7 @@ from provenance.schemas import (
     ContentExportJobCreate,
     ContentExportJobPageResponse,
     ContentExportJobResponse,
+    ContentExportJobSummaryResponse,
     ContentExportResponse,
     ContentExportVerificationCreate,
     ContentExportVerificationResponse,
@@ -1745,6 +1747,61 @@ async def list_content_export_jobs(
     )
     # Compact UTF-8 JSON, booleans/null literal, integral numbers only,
     # terminated by exactly one newline.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
+
+
+# Registered before ``/content-export-jobs/{job_id}`` so the literal
+# ``summary`` segment is never captured as a job id.
+@router.get("/content-export-jobs/summary")
+async def get_content_export_jobs_summary(
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # Strictly read-only queue summary: the GET request body must be empty
+    # and no query parameters are accepted. Both are validated before any
+    # job is read, so a rejected request produces no partial result.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # The counts and the oldest pending job reflect the persisted state at
+    # read time; nothing is frozen, created, modified, or audited. The wait
+    # time is recomputed per read: current UTC time minus the job's
+    # creation time, floored to whole seconds (never negative, never -0.0).
+    counts, oldest_pending = service.summarize_content_export_jobs(session)
+    oldest_id: str | None = None
+    wait_seconds: int | None = None
+    if oldest_pending is not None:
+        oldest_id = oldest_pending.id
+        wait_seconds = max(
+            0,
+            math.floor((utc_now() - oldest_pending.created_at).total_seconds()),
+        )
+
+    result = ContentExportJobSummaryResponse(
+        pending=counts["pending"],
+        running=counts["running"],
+        succeeded=counts["succeeded"],
+        failed=counts["failed"],
+        oldest_pending_job_id=oldest_id,
+        oldest_pending_wait_seconds=wait_seconds,
+    )
+    # Compact UTF-8 JSON, integral numbers only, terminated by exactly one
+    # newline.
     body = (
         json.dumps(
             result.model_dump(mode="json"),
