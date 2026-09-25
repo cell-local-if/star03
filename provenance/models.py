@@ -51,6 +51,7 @@ EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 EVENT_AUDIT_CHECKPOINT_IMPORTED = "audit.checkpoint_imported"
 EVENT_CONTENT_EXPORT_JOB_CREATED = "content_export_job.created"
 EVENT_CONTENT_EXPORT_JOB_RUN = "content_export_job.run"
+EVENT_ACTOR_TRUST_POLICY_CREATED = "actor_trust_policy.created"
 
 # Content export job lifecycle states. A job is created ``pending``; a run
 # atomically claims it into ``running`` and then settles it as
@@ -574,6 +575,46 @@ class AuthenticationKeyRotation(Base):
     #: audit event; null while the key is active.
     retired_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime, nullable=True
+    )
+
+    actor: Mapped[Actor] = relationship()
+
+
+class ActorTrustPolicy(Base):
+    """A subject's immutable signer-threshold trust policy.
+
+    A policy registers the number of distinct qualified signers (1..100) the
+    subject requires before a claim or evidence bundle is trusted in an
+    authorization decision. Each subject has at most one policy: the
+    ``actor_id`` is unique, so a retried registration of the same threshold
+    returns the original record and a different threshold is a conflict
+    rather than a replacement. Policies are append-only and immutable --
+    there is deliberately no update, delete, deactivate, or replace path;
+    ``enabled`` is true from creation and never flips.
+    """
+
+    __tablename__ = "actor_trust_policies"
+    __table_args__ = (
+        UniqueConstraint("actor_id", name="uq_actor_trust_policies_actor"),
+        Index("ix_actor_trust_policies_created_order", "created_at", "seq"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable policy identifier ("atp_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The subject the policy belongs to; exactly one policy per subject.
+    actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: Distinct qualified signers required for a ``trusted`` decision.
+    threshold: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: True from creation; policies are never deactivated.
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
     )
 
     actor: Mapped[Actor] = relationship()

@@ -196,6 +196,22 @@ class ContentExportRequestConflictError(DomainError):
         super().__init__(details={"request_id": request_id})
 
 
+class ActorTrustPolicyConflictError(DomainError):
+    """A second, different trust policy for a subject that already has one.
+
+    A subject's policy is immutable: a registration carrying a threshold
+    different from the subject's existing policy is a conflict, not a
+    replacement, and writes nothing.
+    """
+
+    status_code = 409
+    code = "actor_trust_policy_conflict"
+    message = "The actor already has a trust policy with a different threshold."
+
+    def __init__(self, actor_id: str):
+        super().__init__(details={"actor_id": actor_id})
+
+
 class ContentExportJobConflictError(DomainError):
     """A run against a job that is no longer pending.
 

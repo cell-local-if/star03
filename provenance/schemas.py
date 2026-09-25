@@ -1500,6 +1500,62 @@ class TrustEvaluationResponse(BaseModel):
     decision: Literal["trusted", "untrusted"]
 
 
+class ActorTrustPolicyCreate(BaseModel):
+    # A policy carries exactly its declared fields; undeclared fields are
+    # rejected rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The subject the policy is registered for. The authenticated caller
+    #: must be this same actor.
+    actor_id: str = Field(..., min_length=1, max_length=255)
+    #: Distinct qualified signers required for a ``trusted`` decision. A
+    #: pure decimal integer only: booleans, strings, and fractional or
+    #: exponent-notation numbers are rejected, never coerced.
+    threshold: StrictInt = Field(..., ge=1, le=100)
+
+    @field_validator("actor_id")
+    @classmethod
+    def _actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "actor_id")
+
+
+class ActorTrustPolicyResponse(BaseModel):
+    """Public policy view: subject, threshold, enabled flag, UTC timestamp."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    actor_id: str
+    threshold: int
+    #: Always true: policies are immutable and never deactivated.
+    enabled: bool
+    created_at: datetime
+
+
+class TrustDecisionResponse(BaseModel):
+    """Read-only authorization decision under the caller's current policy.
+
+    Computed on demand from the caller's stored policy and the attestations
+    already stored for the target: no resource or audit event is created.
+    """
+
+    target_type: Literal["claim", "evidence_bundle"]
+    target_id: str
+    #: The deciding policy; null when the caller has no policy.
+    policy_id: str | None
+    #: The policy's signer threshold; null when the caller has no policy.
+    threshold: int | None
+    #: Number of distinct signing actors with a verified, non-revoked
+    #: attestation of the target; zero when no policy exists (the target is
+    #: never looked up in that case).
+    qualified_signer_count: int
+    #: ``"trusted"`` only when a policy exists and its threshold is met.
+    decision: Literal["trusted", "untrusted"]
+    #: Why the decision came out: the threshold was met, the count fell
+    #: below it, or the caller has no policy at all.
+    reason: Literal["threshold_met", "below_threshold", "policy_missing"]
+
+
 class AuthenticationKeyRotationCreate(BaseModel):
     # A rotation carries exactly its declared verification material. There
     # is deliberately no field capable of carrying a private key or a raw

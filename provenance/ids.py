@@ -286,3 +286,20 @@ def content_export_job_id(content_id: str, request_id: str) -> str:
         ensure_ascii=False,
     ).encode("utf-8")
     return "cxj_" + hashlib.sha256(material).hexdigest()
+
+
+def actor_trust_policy_id(actor_id: str) -> str:
+    """Return a stable ``atp_``-prefixed identifier for a trust policy.
+
+    The identity is exactly the idempotency key: the subject the policy
+    belongs to (each subject has at most one immutable policy, so a retried
+    registration maps to the same record and id). The material is a
+    canonical JSON array so fields containing separators cannot collide
+    with different field splits.
+    """
+    material = json.dumps(
+        ["actor_trust_policy", actor_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "atp_" + hashlib.sha256(material).hexdigest()
