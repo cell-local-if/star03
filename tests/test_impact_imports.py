@@ -30,6 +30,7 @@ persisted or echoed. All fixtures are deterministic and offline.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 from datetime import datetime
@@ -357,6 +358,34 @@ def test_import_is_idempotent_across_app_restart(file_client, tmp_db_url):
         retry = client.post(URL, json=request)
         assert retry.status_code == 200, retry.text
         assert retry.json() == expected
+
+
+def test_concurrent_identical_imports_register_exactly_once(file_client):
+    # The real service serves requests concurrently: a burst of identical
+    # imports must not wedge on connection checkout or fail with service
+    # errors -- exactly one submission registers (201) and every retry
+    # receives the original receipt (200), with one row and one audit event.
+    request = _offline_request()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        responses = list(
+            pool.map(lambda _: file_client.post(URL, json=request), range(40))
+        )
+
+    statuses = [resp.status_code for resp in responses]
+    assert statuses.count(201) == 1, statuses
+    assert statuses.count(200) == len(responses) - 1, statuses
+    bodies = {
+        json.dumps(resp.json(), sort_keys=True) for resp in responses
+    }
+    assert len(bodies) == 1
+
+    session = file_client.app.state.session_factory()
+    try:
+        rows = session.execute(select(ImpactImportRecord)).scalars().all()
+        assert len(rows) == 1
+        assert len(_import_events(session)) == 1
+    finally:
+        session.close()
 
 
 # --- Read endpoint -------------------------------------------------------------

@@ -9,6 +9,7 @@ import re
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from provenance import access_signing, canonical, pagination, service
@@ -3349,8 +3350,14 @@ async def import_revocation_impacts(
     # Verification is decided entirely by the request body: the described
     # impacts are never resolved against local state, so whether they exist
     # locally cannot change the receipt, and no revocation or other resource
-    # is created or modified.
-    record, created = service.create_revocation_impact_import(session, payload)
+    # is created or modified. The registration runs in a worker thread: the
+    # session's first statement checks a connection out of the pool and the
+    # commit can wait on SQLite's write serialization, and neither may block
+    # the event loop -- a loop blocked here stalls every concurrent request
+    # until pooled connections time out and reads fail as service errors.
+    record, created = await run_in_threadpool(
+        service.create_revocation_impact_import, session, payload
+    )
     # First registration of this receiving identity -> 201; a retried
     # submission -> 200 with the original record and no new audit event.
     response.status_code = (
