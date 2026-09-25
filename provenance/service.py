@@ -1258,6 +1258,72 @@ def list_revocations_for_attestation(
     return list(session.execute(stmt).scalars().all())
 
 
+# Global attestation-revocation search paging bounds.
+DEFAULT_ATTESTATION_REVOCATIONS_LIMIT = 50
+MIN_ATTESTATION_REVOCATIONS_LIMIT = 1
+MAX_ATTESTATION_REVOCATIONS_LIMIT = 100
+
+
+def list_attestation_revocations_page(
+    session: Session,
+    attestation_id: str | None = None,
+    revoker_actor_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+    limit: int = DEFAULT_ATTESTATION_REVOCATIONS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[AttestationRevocation], int]:
+    """Return one revocation page and the filtered total, both in SQL.
+
+    ``attestation_id``, ``revoker_actor_id``, and ``reason`` are non-empty,
+    case- and whitespace-sensitive exact matches that combine as logical AND;
+    ``None`` means unfiltered. ``from_dt``/``to_dt`` are timezone-aware UTC
+    instants applied as inclusive ``created_at`` bounds. Filter values are
+    never resolved for existence, so an unknown value is an empty result
+    rather than a missing resource.
+
+    The total is a SQL ``COUNT`` over the filtered set (independent of the
+    page) and the page is a SQL ``LIMIT``/``OFFSET`` window of that set in
+    stable creation order (``created_at`` then the monotonic ``seq``
+    tiebreaker), so ordering and paging never depend on in-memory sorting
+    and stay stable across an app restart. The search is strictly read-only:
+    it writes no revocation, grant, authorization, or audit event. The
+    revocation public view carries only associations, reason, and the
+    timestamp -- never the proof text, signatures, authentication headers,
+    private keys, or content bytes.
+    """
+    filters = []
+    if attestation_id is not None:
+        filters.append(AttestationRevocation.attestation_id == attestation_id)
+    if revoker_actor_id is not None:
+        filters.append(
+            AttestationRevocation.revoker_actor_id == revoker_actor_id
+        )
+    if reason is not None:
+        filters.append(AttestationRevocation.reason == reason)
+    if from_dt is not None:
+        filters.append(AttestationRevocation.created_at >= from_dt)
+    if to_dt is not None:
+        filters.append(AttestationRevocation.created_at <= to_dt)
+
+    total = session.execute(
+        select(func.count())
+        .select_from(AttestationRevocation)
+        .where(*filters)
+    ).scalar_one()
+
+    page_stmt = (
+        select(AttestationRevocation)
+        .where(*filters)
+        .order_by(*_ATTESTATION_REVOCATION_ORDER)
+        .limit(limit)
+        .offset(offset)
+    )
+    page = list(session.execute(page_stmt).scalars().all())
+    return page, int(total)
+
+
 def _grant_identity_select(payload: AttestationAccessGrantCreate):
     return select(AttestationAccessGrant).where(
         AttestationAccessGrant.attestation_id == payload.attestation_id,

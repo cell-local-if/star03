@@ -1184,6 +1184,16 @@ class AttestationRevocationListResponse(BaseModel):
     count: int
 
 
+class AttestationRevocationPageResponse(BaseModel):
+    """A cursor-paginated page of revocation public views."""
+
+    items: list[AttestationRevocationResponse]
+    #: Total number of revocation records after filtering, across all pages.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.
