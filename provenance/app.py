@@ -16,19 +16,22 @@ from provenance import __version__
 from provenance.api import router as v1_router
 from provenance.config import Settings
 from provenance.database import (
-    init_db,
     make_engine,
     make_session_factory,
 )
 from provenance.errors import register_exception_handlers
+from provenance.migrations import run_migrations
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
 
     engine = make_engine(settings.database_url)
-    # Create tables eagerly so the database is ready as soon as the app exists.
-    init_db(engine)
+    # Bring the schema to the current version. A brand-new database gets the
+    # full current schema and the baseline version record; an existing
+    # database is upgraded in place. Either way the call is idempotent and
+    # restart-safe, and the database is ready as soon as the app exists.
+    run_migrations(engine)
     session_factory = make_session_factory(engine)
 
     @asynccontextmanager

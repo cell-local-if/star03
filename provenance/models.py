@@ -80,6 +80,10 @@ class Actor(Base):
     """A provenance subject (person, organization, device, software, ...)."""
 
     __tablename__ = "actors"
+    __table_args__ = (
+        UniqueConstraint("seq", name="uq_actors_seq"),
+        Index("ix_actors_created_order", "created_at", "seq"),
+    )
 
     #: Client-supplied stable identifier.
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
@@ -88,6 +92,10 @@ class Actor(Base):
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, nullable=False, default=utc_now
     )
+    #: Explicit persistent insertion order, assigned as max(seq)+1 at
+    #: creation. Breaks same-``created_at`` ties deterministically without
+    #: relying on the SQLite rowid, and survives VACUUM and restarts.
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     contents: Mapped[list["Content"]] = relationship(
         back_populates="actor", passive_deletes=True

@@ -79,8 +79,12 @@ def make_session_factory(engine) -> sessionmaker[Session]:
 
 
 def init_db(engine) -> None:
-    """Create all tables. Safe and idempotent on a fresh or existing database."""
-    # Import models so they are registered on ``Base.metadata`` before create.
-    from provenance import models  # noqa: F401
+    """Create all tables and record the current migration version.
 
-    Base.metadata.create_all(bind=engine)
+    Safe and idempotent on a fresh or existing database. Delegates to the
+    versioned migration runner so direct callers and application startup
+    share the one schema-establishment path.
+    """
+    from provenance.migrations import run_migrations
+
+    run_migrations(engine)
