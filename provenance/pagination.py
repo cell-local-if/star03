@@ -99,6 +99,9 @@ REVOCATION_IMPACTS_CURSOR_VERSION = "ri1"
 #: Marker for cursors that page through impact-import receipts.
 IMPACT_IMPORTS_CURSOR_VERSION = "ii1"
 
+#: Marker for cursors that page through impact-import reconciliations.
+IMPACT_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "rr1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -860,6 +863,32 @@ IMPACT_IMPORTS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_impact_imports_claims,
+)
+
+
+def _validate_impact_import_reconciliations_claims(
+    claims: dict[str, Any],
+) -> None:
+    # The two read-time reconciliation filters are either absent (null,
+    # meaning unfiltered) or strict JSON booleans bound from the request's
+    # lowercase ``true``/``false`` literals.
+    for field in ("local_available", "matches"):
+        if claims[field] is not None and not isinstance(claims[field], bool):
+            raise InvalidCursorError(f"cursor {field} is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/impact-import-reconciliations``.
+IMPACT_IMPORT_RECONCILIATIONS_CURSOR = CursorKind(
+    version=IMPACT_IMPORT_RECONCILIATIONS_CURSOR_VERSION,
+    claim_fields=("local_available", "matches", "limit", "offset"),
+    validate=_validate_impact_import_reconciliations_claims,
 )
 
 

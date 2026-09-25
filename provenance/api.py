@@ -64,6 +64,8 @@ from provenance.schemas import (
     RevocationImpactCheckpointResponse,
     RevocationImpactImportCreate,
     RevocationImpactImportPageResponse,
+    RevocationImpactImportReconciliationItem,
+    RevocationImpactImportReconciliationPageResponse,
     RevocationImpactImportReconciliationResponse,
     RevocationImpactImportResponse,
     RevocationImpactPackageResponse,
@@ -3592,6 +3594,195 @@ def reconcile_revocation_impact_import(
         local_checkpoint=local_checkpoint,
         matches=matches,
     )
+
+
+_IMPACT_IMPORT_RECONCILIATIONS_PARAMS = frozenset(
+    {"local_available", "matches", "limit", "cursor"}
+)
+
+
+def _reconcile_impact_import_record(
+    record, local_checkpoint: RevocationImpactCheckpointResponse
+) -> tuple[bool, bool]:
+    """Return ``(local_available, matches)`` for one receipt.
+
+    The current local checkpoint is the complete, unfiltered local
+    revocation-impact checkpoint shared by every receipt on a page.
+    ``local_available`` is true exactly when that local impact set is
+    non-empty; an empty set still yields its deterministic checkpoint.
+    ``matches`` requires the receipt's version, impact count, and digest to
+    all equal that checkpoint.
+    """
+    local_available = local_checkpoint.impact_count > 0
+    matches = (
+        record.checkpoint_version == local_checkpoint.checkpoint_version
+        and record.impact_count == local_checkpoint.impact_count
+        and record.impacts_digest_hex == local_checkpoint.impacts_digest_hex
+    )
+    return local_available, matches
+
+
+def _impact_import_reconciliation_item(
+    record,
+    local_checkpoint: RevocationImpactCheckpointResponse,
+    local_available: bool,
+    matches: bool,
+) -> RevocationImpactImportReconciliationItem:
+    # The existing single-receipt public view, with local_available, the
+    # current unfiltered local checkpoint, and the match verdict appended;
+    # the imported impacts array and every raw material are absent.
+    return RevocationImpactImportReconciliationItem(
+        id=record.id,
+        checkpoint_version=record.checkpoint_version,
+        impact_count=record.impact_count,
+        impacts_digest_hex=record.impacts_digest_hex,
+        received_at=record.created_at,
+        local_available=local_available,
+        local_checkpoint=local_checkpoint,
+        matches=matches,
+    )
+
+
+@router.get("/impact-import-reconciliations")
+async def list_revocation_impact_import_reconciliations(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only, paginated reconciliation of every impact-import receipt.
+    # The GET request body must be empty: carrying any bytes (even
+    # whitespace, arbitrary bytes, or malformed JSON) is a 422 validated
+    # before any query parameter, cursor, or receipt is read. Raw
+    # multi-values are then inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, a blank filter or limit
+    # is never coerced to a default, and the two boolean filters accept
+    # only the lowercase literals ``true``/``false``.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _IMPACT_IMPORT_RECONCILIATIONS_PARAMS
+    if unknown:
+        # The collection accepts only the two filters plus limit/cursor; a
+        # typo never silently changes the page.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    local_available = _parse_bool_literal_param(raw, "local_available")
+    matches = _parse_bool_literal_param(raw, "matches")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_IMPACT_IMPORT_RECONCILIATIONS_LIMIT,
+        service.MIN_IMPACT_IMPORT_RECONCILIATIONS_LIMIT,
+        service.MAX_IMPACT_IMPORT_RECONCILIATIONS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.impact_import_reconciliations_cursor_secret,
+                pagination.IMPACT_IMPORT_RECONCILIATIONS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: both effective
+        # filters (null when unfiltered) and the effective limit are bound.
+        # A cursor minted by another endpoint family already fails decoding.
+        expected = {
+            "local_available": local_available,
+            "matches": matches,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    def _encode_cursor(next_offset: int) -> str:
+        return pagination.encode_typed_cursor(
+            request.app.state.impact_import_reconciliations_cursor_secret,
+            pagination.IMPACT_IMPORT_RECONCILIATIONS_CURSOR,
+            {
+                "local_available": local_available,
+                "matches": matches,
+                "limit": page_limit,
+                "offset": next_offset,
+            },
+        )
+
+    # Strictly read-only: the listing writes no resource, receipt, or audit
+    # event. Receipts follow stable creation order, and the current local
+    # impact set is read complete and unfiltered once, under exactly the
+    # single-receipt reconciliation rules, so every item and the single
+    # receipt route agree. The optional filters apply to those read-time
+    # results as logical AND (absent means unfiltered); there is no reverse
+    # lookup by digest or any other resource.
+    records = service.list_revocation_impact_import_reconciliations(session)
+    local_checkpoint = _local_revocation_impact_checkpoint(session)
+
+    reconciled: list[tuple[object, bool, bool]] = []
+    for record in records:
+        available, record_matches = _reconcile_impact_import_record(
+            record, local_checkpoint
+        )
+        if local_available is not None and available != local_available:
+            continue
+        if matches is not None and record_matches != matches:
+            continue
+        reconciled.append((record, available, record_matches))
+
+    total = len(reconciled)
+    items: list[RevocationImpactImportReconciliationItem] = []
+    next_cursor: str | None = None
+    if offset < total:
+        page = reconciled[offset : offset + page_limit]
+        for record, available, record_matches in page:
+            items.append(
+                _impact_import_reconciliation_item(
+                    record, local_checkpoint, available, record_matches
+                )
+            )
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = _encode_cursor(next_offset)
+
+    result = RevocationImpactImportReconciliationPageResponse(
+        items=items,
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, null/boolean literals, integral numbers only,
+    # terminated by exactly one newline; members appear as items, count,
+    # next_cursor.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 _TRUST_EVALUATION_PARAMS = frozenset(
