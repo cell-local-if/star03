@@ -2411,6 +2411,19 @@ def evaluate_trust(
     }
 
 
+# Trust-policy search paging bounds.
+DEFAULT_TRUST_POLICIES_LIMIT = 50
+MIN_TRUST_POLICIES_LIMIT = 1
+MAX_TRUST_POLICIES_LIMIT = 100
+
+#: Stable creation order of policy records: timestamp, then the monotonic
+#: insertion surrogate as the tiebreaker.
+_ACTOR_TRUST_POLICY_ORDER = (
+    ActorTrustPolicy.created_at.asc(),
+    ActorTrustPolicy.seq.asc(),
+)
+
+
 def create_actor_trust_policy(
     session: Session,
     payload: ActorTrustPolicyCreate,
@@ -2481,6 +2494,27 @@ def create_actor_trust_policy(
         raise ActorTrustPolicyConflictError(payload.actor_id)
     session.refresh(policy)
     return policy, True
+
+
+def list_actor_trust_policies(
+    session: Session,
+    actor_id: str | None = None,
+) -> list[ActorTrustPolicy]:
+    """Return existing immutable trust policies in stable creation order.
+
+    The optional ``actor_id`` filter is an exact, case- and
+    whitespace-sensitive string match; ``None`` means unfiltered. Results
+    follow the policies' stable creation order (``created_at`` with the
+    monotonic ``seq`` tiebreaker). The search is strictly read-only: it
+    writes no policy, resource, or audit event, and no referenced actor
+    existence is required, so a filter that matches nothing -- including an
+    unknown subject -- is an empty result rather than a missing resource.
+    """
+    stmt = select(ActorTrustPolicy)
+    if actor_id is not None:
+        stmt = stmt.where(ActorTrustPolicy.actor_id == actor_id)
+    stmt = stmt.order_by(*_ACTOR_TRUST_POLICY_ORDER)
+    return list(session.execute(stmt).scalars().all())
 
 
 def decide_trust(

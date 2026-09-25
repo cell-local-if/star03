@@ -71,6 +71,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.claim_supersession_lineage_cursor_secret = (
         secrets.token_bytes(32)
     )
+    app.state.trust_policies_cursor_secret = secrets.token_bytes(32)
 
     register_exception_handlers(app)
     app.include_router(v1_router)
