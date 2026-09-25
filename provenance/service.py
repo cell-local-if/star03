@@ -1271,7 +1271,7 @@ def list_attestation_revocations_page(
     reason: str | None = None,
     from_dt=None,
     to_dt=None,
-    limit: int = DEFAULT_ATTESTATION_REVOCATIONS_LIMIT,
+    limit: int | None = DEFAULT_ATTESTATION_REVOCATIONS_LIMIT,
     offset: int = 0,
 ) -> tuple[list[AttestationRevocation], int]:
     """Return one revocation page and the filtered total, both in SQL.
@@ -1287,8 +1287,10 @@ def list_attestation_revocations_page(
     page) and the page is a SQL ``LIMIT``/``OFFSET`` window of that set in
     stable creation order (``created_at`` then the monotonic ``seq``
     tiebreaker), so ordering and paging never depend on in-memory sorting and
-    stay stable across restarts. The retrieval is strictly read-only: it
-    writes no revocation, attestation, grant, resource, or audit event.
+    stay stable across restarts. ``limit=None`` returns the entire filtered
+    set in one read (used by the unpaginated checkpoint package export). The
+    retrieval is strictly read-only: it writes no revocation, attestation,
+    grant, resource, or audit event.
     """
     filters = []
     if attestation_id is not None:
@@ -1334,7 +1336,7 @@ def list_revocation_impacts_page(
     reason: str | None = None,
     from_dt=None,
     to_dt=None,
-    limit: int = DEFAULT_REVOCATION_IMPACTS_LIMIT,
+    limit: int | None = DEFAULT_REVOCATION_IMPACTS_LIMIT,
     offset: int = 0,
 ) -> tuple[list[dict], int]:
     """Return one page of cross-content revocation impacts plus the total.
@@ -1545,6 +1547,37 @@ def list_revocation_impacts_page(
             }
         )
     return results, total
+
+
+def list_revocation_impacts(
+    session: Session,
+    attestation_id: str | None = None,
+    revoker_actor_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[dict]:
+    """Return every filtered revocation impact in stable creation order.
+
+    The unpaginated counterpart of :func:`list_revocation_impacts_page`:
+    the same filters (non-empty exact-match strings combined as logical
+    AND, inclusive timezone-aware UTC ``created_at`` bounds), the same
+    stable revocation creation order, and the same per-item enrichment,
+    but with no LIMIT/OFFSET window so the checkpoint package export can
+    snapshot the entire filtered set in one read. Strictly read-only: it
+    writes no revocation, attestation, grant, resource, or audit event.
+    """
+    impacts, _total = list_revocation_impacts_page(
+        session,
+        attestation_id,
+        revoker_actor_id,
+        reason,
+        from_dt,
+        to_dt,
+        limit=None,
+        offset=0,
+    )
+    return impacts
 
 
 

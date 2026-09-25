@@ -37,6 +37,8 @@ from provenance.schemas import (
     AUDIT_CHECKPOINT_VERSION,
     EXCHANGE_MANIFEST_DIGEST_ALGORITHM,
     EXCHANGE_MANIFEST_VERSION,
+    REVOCATION_IMPACT_CHECKPOINT_VERSION,
+    REVOCATION_IMPACT_DIGEST_ALGORITHM,
     ActorCreate,
     ActorPageResponse,
     ActorResponse,
@@ -58,6 +60,10 @@ from provenance.schemas import (
     AttestationRevocationResponse,
     RevocationImpactPageResponse,
     RevocationImpactResponse,
+    RevocationImpactCheckpointResponse,
+    RevocationImpactPackageResponse,
+    RevocationImpactVerificationCreate,
+    RevocationImpactVerificationResponse,
     AuditCheckpointImportCreate,
     AuditCheckpointImportPageResponse,
     AuditCheckpointImportReconciliationItem,
@@ -3130,6 +3136,173 @@ async def list_revocation_impacts(
         + "\n"
     ).encode("utf-8")
     return Response(content=body, media_type="application/json")
+
+
+_REVOCATION_IMPACT_PACKAGE_PARAMS = frozenset(
+    {"attestation_id", "revoker_actor_id", "reason", "from", "to"}
+)
+
+
+def _revocation_impact_package_filters(request: Request):
+    """Parse and validate the impact-package query filters.
+
+    The package route shares the impact search's parameter contract minus
+    pagination: only attestation_id/revoker_actor_id/reason/from/to are
+    accepted, so limit/cursor and every other undeclared parameter are
+    rejected rather than ignored, a repeated scalar is rejected instead
+    of silently taking the last value, and blank or malformed values are
+    never coerced. Returns
+    ``(attestation_id, revoker_actor_id, reason, from_dt, to_dt)``.
+    """
+    raw = request.query_params
+
+    unknown = set(raw) - _REVOCATION_IMPACT_PACKAGE_PARAMS
+    if unknown:
+        # A typo (e.g. ``revoker``) or a pagination parameter never
+        # silently changes the snapshot.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    attestation_id = _parse_nonempty_filter(raw, "attestation_id")
+    revoker_actor_id = _parse_nonempty_filter(raw, "revoker_actor_id")
+    reason = _parse_nonempty_filter(raw, "reason")
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    return attestation_id, revoker_actor_id, reason, from_dt, to_dt
+
+
+@router.get("/revocation-impact-package")
+async def export_revocation_impact_package(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only export of the whole filtered revocation-impact snapshot
+    # together with its auditable checkpoint. The GET request body must be
+    # empty, exactly as on the impact search: carrying any bytes (even
+    # whitespace, arbitrary bytes, or malformed JSON) is a 422 validated
+    # before any query parameter or revocation record is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Same filter contract as GET /v1/revocation-impacts, but no limit and
+    # no cursor: the package always snapshots every matching impact in one
+    # read. Undeclared (including limit/cursor), blank, repeated, or
+    # malformed parameters are all 422 before any revocation is read.
+    (
+        attestation_id,
+        revoker_actor_id,
+        reason,
+        from_dt,
+        to_dt,
+    ) = _revocation_impact_package_filters(request)
+
+    # Strictly read-only, and both halves come from the same state read:
+    # every matching impact is read once in the revocations' stable
+    # creation order, the impacts member renders those existing public
+    # views, and the checkpoint digests exactly that same array, so the
+    # two can never disagree. No resource, record, or audit event is
+    # written; an empty match set yields "impacts": [] with impact_count 0
+    # and the digest of the empty array.
+    impacts = service.list_revocation_impacts(
+        session,
+        attestation_id,
+        revoker_actor_id,
+        reason,
+        from_dt,
+        to_dt,
+    )
+    impact_views = [_revocation_impact_item(impact) for impact in impacts]
+    # mode="json" yields exactly the wire view served in this response's
+    # impacts member (UTC datetimes as RFC 3339 strings), so the
+    # checkpoint binds to exactly those impacts and is reproducible by an
+    # external verifier from the package body alone.
+    impact_payloads = [view.model_dump(mode="json") for view in impact_views]
+    package = RevocationImpactPackageResponse(
+        checkpoint=RevocationImpactCheckpointResponse(
+            checkpoint_version=REVOCATION_IMPACT_CHECKPOINT_VERSION,
+            digest_algorithm=REVOCATION_IMPACT_DIGEST_ALGORITHM,
+            impact_count=len(impact_payloads),
+            impacts_digest_hex=canonical.revocation_impacts_digest_hex(
+                impact_payloads
+            ),
+        ),
+        impacts=impact_views,
+    )
+    # Compact UTF-8 JSON, null/boolean literals, integral numbers only,
+    # terminated by exactly one newline; root members appear as
+    # checkpoint, impacts.
+    body = (
+        json.dumps(
+            package.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
+
+
+@router.post(
+    "/impact-verifications",
+    response_model=RevocationImpactVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_revocation_impacts(
+    payload: RevocationImpactVerificationCreate, request: Request
+) -> Response:
+    # The route accepts no query parameters: any (or repeated) parameter is
+    # a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no resource, audit row, or log is written.
+    # Verification uses the request body alone; no revocation,
+    # attestation, actor, content, or bundle id is ever resolved against
+    # local state, so unknown resources, repeated requests, and differing
+    # local state verify identically. Malformed JSON and every
+    # structural, field, type, association, or digest-input failure are
+    # rejected by the request model as a 422 before this body runs.
+    body = await request.json()
+    # The digest commits to the impacts array exactly as received: the raw
+    # JSON values (array order, datetime spellings), not any parsed or
+    # re-serialized form. The array keeps its order; nested object keys
+    # sort by Unicode code point under the checkpoint canonical rules.
+    computed_digest_hex = canonical.revocation_impacts_digest_hex(
+        body["impacts"]
+    )
+    if computed_digest_hex == payload.checkpoint.impacts_digest_hex:
+        result = {"valid": True}
+    else:
+        result = {
+            "valid": False,
+            "computed_digest_hex": computed_digest_hex,
+        }
+    # Compact UTF-8 JSON, boolean literals, terminated by exactly one
+    # newline; a match carries no field besides valid.
+    data = (
+        json.dumps(
+            result,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=data, media_type="application/json")
 
 
 _TRUST_EVALUATION_PARAMS = frozenset(

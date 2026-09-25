@@ -1295,6 +1295,232 @@ class RevocationImpactPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+#: Fixed checkpoint format version emitted for revocation-impact packages.
+REVOCATION_IMPACT_CHECKPOINT_VERSION = (
+    "provenance-revocation-impact-checkpoint-v1"
+)
+#: The sole digest algorithm used for revocation-impact checkpoints.
+REVOCATION_IMPACT_DIGEST_ALGORITHM = "sha256"
+
+
+class RevocationImpactCheckpointResponse(BaseModel):
+    """A read-only integrity checkpoint over a filtered impact snapshot.
+
+    Exactly four members: the fixed ``checkpoint_version`` and
+    ``digest_algorithm``, the number of impacts in the filtered snapshot,
+    and the SHA-256 hex digest of the canonical impacts array. The
+    checkpoint is derived purely from the existing revocation records: it
+    introduces no resource, record, or audit event, and its value is
+    stable for unchanged persisted state -- including the empty snapshot.
+    """
+
+    checkpoint_version: Literal[REVOCATION_IMPACT_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[REVOCATION_IMPACT_DIGEST_ALGORITHM]
+    impact_count: int
+    impacts_digest_hex: str
+
+
+class RevocationImpactPackageResponse(BaseModel):
+    """One read returning a filtered impact snapshot with its checkpoint.
+
+    Exactly two members: ``checkpoint`` is the four-field impact
+    checkpoint for the effective filter and ``impacts`` lists, in the
+    revocations' stable creation order, the existing revocation-impact
+    public views matched by that same filter (each exactly the existing
+    13-field impact view). The checkpoint digest is computed over exactly
+    the ``impacts`` array returned in this response under the checkpoint
+    canonical rules (array order kept, nested object keys sorted by
+    Unicode code point, compact separators, unescaped non-ASCII, UTF-8);
+    both derive from a single read-only state read, so they can never
+    disagree. The package introduces no resource, record, or audit event;
+    an empty match yields ``"impacts": []`` together with the digest of
+    the empty array.
+    """
+
+    checkpoint: RevocationImpactCheckpointResponse
+    impacts: list[RevocationImpactResponse]
+
+
+class RevocationImpactVerificationImpact(BaseModel):
+    """One impact under stateless verification: exactly the public view.
+
+    The structure must match the exported impact public view field for
+    field -- the existing revocation public view plus the content
+    association, target type, signing subject, and the before/after
+    coverage fields -- with no undeclared member (so no raw signature,
+    key, payload, content, or evidence byte can enter the request).
+    ``created_at`` is kept as the raw string so the digest commits to the
+    timestamp exactly as spelled on the wire; it must be a strict RFC
+    3339 UTC timestamp, exactly as the revocation time filters require.
+    The before/after counts, their delta, and the coverage statuses must
+    be internally consistent; verification never resolves any id against
+    local state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # --- Existing revocation public view ---------------------------------
+    id: str = Field(..., min_length=1, max_length=80)
+    attestation_id: str = Field(..., min_length=1, max_length=80)
+    revoker_actor_id: str = Field(..., min_length=1, max_length=255)
+    reason: str = Field(..., min_length=1, max_length=4096)
+    created_at: str
+    # --- Content association of the revoked proof ------------------------
+    content_id: str = Field(..., min_length=1, max_length=255)
+    target_type: Literal["claim", "evidence_bundle"]
+    signer_actor_id: str = Field(..., min_length=1, max_length=255)
+    # --- Coverage after / before the revocation ---------------------------
+    qualified_signer_count_after: StrictInt = Field(..., ge=0)
+    coverage_status_after: Literal["uncovered", "partial", "covered"]
+    qualified_signer_count_before: StrictInt = Field(..., ge=0)
+    coverage_status_before: Literal["uncovered", "partial", "covered"]
+    qualified_signer_count_delta: StrictInt = Field(..., ge=0)
+
+    @field_validator(
+        "id", "attestation_id", "revoker_actor_id", "content_id", "signer_actor_id"
+    )
+    @classmethod
+    def _identifier_nonempty(cls, v: str) -> str:
+        # Every identifier is a non-empty, non-whitespace string; nothing is
+        # trimmed or normalized.
+        if not v.strip():
+            raise ValueError("identifier must not be empty")
+        return v
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("reason must not be empty")
+        return v
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_strict_rfc3339_utc(cls, v: str) -> str:
+        if parse_rfc3339_utc(v) is None:
+            raise ValueError(
+                "created_at must be a strict RFC 3339 UTC timestamp"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _coverage_fields_internally_consistent(self):
+        # The only associations checkable without local state are the
+        # record's own before/after invariants: the delta is exactly
+        # before - after (always zero or one), the after count never
+        # exceeds the before count, and each coverage status matches its
+        # signer count under the summary rules (a positive count is always
+        # "covered"; a zero count is "uncovered" or "partial").
+        if self.qualified_signer_count_after > self.qualified_signer_count_before:
+            raise ValueError(
+                "qualified_signer_count_after must not exceed"
+                " qualified_signer_count_before"
+            )
+        delta = (
+            self.qualified_signer_count_before
+            - self.qualified_signer_count_after
+        )
+        if self.qualified_signer_count_delta != delta:
+            raise ValueError(
+                "qualified_signer_count_delta must equal"
+                " qualified_signer_count_before - qualified_signer_count_after"
+            )
+        if delta not in (0, 1):
+            raise ValueError(
+                "qualified_signer_count_delta must be zero or one"
+            )
+        for count, status in (
+            (
+                self.qualified_signer_count_after,
+                self.coverage_status_after,
+            ),
+            (
+                self.qualified_signer_count_before,
+                self.coverage_status_before,
+            ),
+        ):
+            if count >= 1 and status != "covered":
+                raise ValueError(
+                    "coverage status must be 'covered' when the qualified"
+                    " signer count is positive"
+                )
+            if count == 0 and status == "covered":
+                raise ValueError(
+                    "coverage status must not be 'covered' when the qualified"
+                    " signer count is zero"
+                )
+        return self
+
+
+class RevocationImpactVerificationCheckpoint(BaseModel):
+    """The claimed checkpoint under stateless impact verification.
+
+    Exactly the existing four-field checkpoint structure: the fixed
+    ``checkpoint_version`` and ``digest_algorithm``, the claimed impact
+    count, and the claimed impacts digest. Undeclared members are
+    rejected rather than ignored, exactly as on the package export.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_version: Literal[REVOCATION_IMPACT_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[REVOCATION_IMPACT_DIGEST_ALGORITHM]
+    #: Non-negative integer count the submitted impacts array must match.
+    impact_count: StrictInt = Field(..., ge=0)
+    impacts_digest_hex: str
+
+    @field_validator("impacts_digest_hex")
+    @classmethod
+    def _impacts_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "impacts_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class RevocationImpactVerificationCreate(BaseModel):
+    """A stateless revocation-impact checkpoint verification request.
+
+    Exactly two members: ``checkpoint`` carries the claimed four-field
+    impact checkpoint and ``impacts`` carries the impact sequence it
+    commits to, with exactly ``checkpoint.impact_count`` elements, each
+    exactly the exported impact public view and internally consistent.
+    Verification is pure: it reads and writes no server state, so no
+    revocation, attestation, or resource id is ever resolved against
+    local state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint: RevocationImpactVerificationCheckpoint
+    impacts: list[RevocationImpactVerificationImpact]
+
+    @model_validator(mode="after")
+    def _impacts_match_claimed_count(self):
+        if len(self.impacts) != self.checkpoint.impact_count:
+            raise ValueError(
+                "impacts must contain exactly checkpoint.impact_count elements"
+            )
+        return self
+
+
+class RevocationImpactVerificationResponse(BaseModel):
+    """The stateless impact verification verdict.
+
+    ``computed_digest_hex`` is present only on a mismatch, so a matching
+    checkpoint renders exactly ``{"valid": true}``.
+    """
+
+    valid: bool
+    #: The digest computed from the submitted impacts array under the
+    #: checkpoint canonical rules; omitted when it matches the claim.
+    computed_digest_hex: str | None = None
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.
