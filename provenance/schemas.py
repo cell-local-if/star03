@@ -160,9 +160,14 @@ class ContentResponse(BaseModel):
     created_at: datetime
 
 
-class ContentListResponse(BaseModel):
+class ContentPageResponse(BaseModel):
+    """A cursor-paginated page of content public views."""
+
     items: list[ContentResponse]
+    #: Total number of contents after filtering, independent of pagination.
     count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None
 
 
 class ContentLineageItem(ContentResponse):

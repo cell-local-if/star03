@@ -79,6 +79,9 @@ TRUST_POLICIES_CURSOR_VERSION = "tp1"
 #: Marker for cursors that page through the reviewer actor retrieval.
 ACTORS_CURSOR_VERSION = "ac1"
 
+#: Marker for cursors that page through the reviewer content search.
+CONTENTS_CURSOR_VERSION = "ct1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -605,6 +608,45 @@ ACTORS_CURSOR = CursorKind(
     version=ACTORS_CURSOR_VERSION,
     claim_fields=("actor_id", "name", "actor_type", "limit", "offset"),
     validate=_validate_actors_claims,
+)
+
+
+def _validate_contents_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null, meaning unfiltered) or
+    # non-empty strings; matching is case- and whitespace-sensitive, so the
+    # raw value is bound.
+    _optional_nonempty_str(claims, "actor_id")
+    _optional_nonempty_str(claims, "digest_algorithm")
+    _optional_nonempty_str(claims, "media_type")
+    # The digest filter is absent (null) or the strict 64 lowercase hex
+    # spelling; an uppercase or trimmed spelling is a different value and is
+    # never normalized.
+    digest = claims["digest_hex"]
+    if digest is not None and (
+        not isinstance(digest, str) or not _HEX64_LOWER.fullmatch(digest)
+    ):
+        raise InvalidCursorError("cursor digest_hex is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/contents``.
+CONTENTS_CURSOR = CursorKind(
+    version=CONTENTS_CURSOR_VERSION,
+    claim_fields=(
+        "actor_id",
+        "digest_algorithm",
+        "digest_hex",
+        "media_type",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_contents_claims,
 )
 
 

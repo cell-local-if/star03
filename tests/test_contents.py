@@ -222,4 +222,4 @@ def test_list_filter_unknown_actor_returns_empty_list(client):
     # An unknown filter value is an empty collection, not a 404.
     resp = client.get("/v1/contents", params={"actor_id": "ghost"})
     assert resp.status_code == 200
-    assert resp.json() == {"items": [], "count": 0}
+    assert resp.json() == {"items": [], "count": 0, "next_cursor": None}
