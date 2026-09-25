@@ -81,6 +81,7 @@ from provenance.schemas import (
     ClaimSupersessionLineageItem,
     ClaimSupersessionLineageResponse,
     ContentCreate,
+    ContentEvidenceCoverageResponse,
     ContentExportJobCreate,
     ContentExportJobPageResponse,
     ContentExportJobResponse,
@@ -1821,6 +1822,42 @@ def get_content_export(
             )
             for claim in claims
         ],
+    )
+
+
+@router.get("/contents/{content_id}/evidence-coverage")
+async def get_content_evidence_coverage(
+    content_id: str, request: Request, session: DbSession
+) -> Response:
+    # Read-only evidence-coverage summary of one content. The request takes
+    # no body and no query parameters: any non-empty body (including
+    # whitespace or malformed JSON) and any parameter (unknown, blank, or
+    # repeated) is a 422 validation_error, both rejected before anything is
+    # read. A blank content identifier is a 422 as well; an unknown one is
+    # the existing content_not_found 404, decided only after validation.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    if not content_id.strip():
+        raise _query_validation_error(
+            "content_id", "content_id must not be empty", "value_error"
+        )
+    # Strictly read-only: the summary is computed from the persisted claims,
+    # bundles, attestations, and revocations at read time and writes no
+    # resource, snapshot, audit event, or log. Only counts and the status
+    # are returned -- never raw content, claim payloads, evidence bytes,
+    # raw signatures, or key material.
+    result = service.get_content_evidence_coverage(session, content_id)
+    # Compact UTF-8 JSON, integral counts, terminated by exactly one
+    # newline; members appear as content_id, claim_count, bundle_count,
+    # attestation_count, qualified_signer_count, coverage_status.
+    return _compact_json_response(
+        ContentEvidenceCoverageResponse(**result), status.HTTP_200_OK
     )
 
 

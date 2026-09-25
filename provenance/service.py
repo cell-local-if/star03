@@ -1738,6 +1738,110 @@ def get_content_export(
     return content, claims, bundles_by_claim
 
 
+#: Coverage statuses for the read-only evidence-coverage summary.
+COVERAGE_UNCOVERED = "uncovered"
+COVERAGE_PARTIAL = "partial"
+COVERAGE_COVERED = "covered"
+
+
+def get_content_evidence_coverage(
+    session: Session, content_id: str
+) -> dict:
+    """Summarize the evidence coverage of one existing content.
+
+    Only claims that directly assert this exact content count -- no lineage
+    traversal -- and only the bundles attached to those claims (deduplicated
+    by their stable identity). The attestation count covers every stored
+    attestation whose target is one of those claims or bundles, including
+    revoked proofs, which are retained for history. The qualified signer
+    count is the number of distinct signing actors with a verified,
+    non-revoked attestation of any of those targets; multiple attestations
+    by the same actor qualify once, and an actor whose proofs are all
+    revoked drops out. With no claims every count is zero and the status is
+    ``uncovered``; with claims but no qualified signer the status is
+    ``partial``; a single qualified signer makes it ``covered`` (this
+    summary never changes the trust-evaluation threshold semantics).
+
+    The function is strictly read-only: it writes no resource, snapshot,
+    audit event, or log, and the same persisted state always yields the
+    same counts and status. The content must exist; an unknown content id
+    is a missing resource, not a zeroed summary.
+    """
+    _require_content(session, content_id)
+
+    claim_ids = list(
+        session.execute(
+            select(Claim.id)
+            .where(Claim.content_id == content_id)
+            .order_by(*_CLAIM_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    claim_count = len(claim_ids)
+
+    bundle_ids: list[str] = []
+    if claim_ids:
+        # Stable creation order; deduplicated by identity so a bundle can
+        # never be counted twice.
+        seen: set[str] = set()
+        for bundle_id in session.execute(
+            select(EvidenceBundle.id)
+            .join(Claim, EvidenceBundle.claim_id == Claim.id)
+            .where(Claim.content_id == content_id)
+            .order_by(*_EVIDENCE_BUNDLE_ORDER)
+        ).scalars().all():
+            if bundle_id not in seen:
+                seen.add(bundle_id)
+                bundle_ids.append(bundle_id)
+    bundle_count = len(bundle_ids)
+
+    attestation_count = 0
+    qualified_signer_count = 0
+    if claim_ids or bundle_ids:
+        target_filter = or_(
+            (Attestation.target_type == signing.TARGET_CLAIM)
+            & Attestation.target_id.in_(claim_ids),
+            (Attestation.target_type == signing.TARGET_EVIDENCE_BUNDLE)
+            & Attestation.target_id.in_(bundle_ids),
+        )
+        attestation_count = session.execute(
+            select(func.count())
+            .select_from(Attestation)
+            .where(target_filter)
+        ).scalar_one()
+        revoked = exists().where(
+            AttestationRevocation.attestation_id == Attestation.id
+        )
+        qualified_signer_count = len(
+            set(
+                session.execute(
+                    select(Attestation.signer_actor_id)
+                    .where(target_filter, ~revoked)
+                    .distinct()
+                )
+                .scalars()
+                .all()
+            )
+        )
+
+    if claim_count == 0:
+        coverage_status = COVERAGE_UNCOVERED
+    elif qualified_signer_count >= 1:
+        coverage_status = COVERAGE_COVERED
+    else:
+        coverage_status = COVERAGE_PARTIAL
+
+    return {
+        "content_id": content_id,
+        "claim_count": claim_count,
+        "bundle_count": bundle_count,
+        "attestation_count": attestation_count,
+        "qualified_signer_count": qualified_signer_count,
+        "coverage_status": coverage_status,
+    }
+
+
 #: Builds the stored export result for one content: the wire-shaped
 #: ``{"content", "claims"}`` snapshot served by the read-only export route.
 #: Injected by the API layer so the service stays free of response schemas

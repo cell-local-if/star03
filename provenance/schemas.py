@@ -455,6 +455,31 @@ class ContentExportResponse(BaseModel):
     claims: list[ClaimExportItem]
 
 
+class ContentEvidenceCoverageResponse(BaseModel):
+    """Read-only evidence-coverage summary of one content.
+
+    Computed on demand from the claims, evidence bundles, attestations, and
+    revocations already stored: no resource, snapshot, audit event, or log is
+    created. Counts only; no raw content, claim payload, evidence byte, raw
+    signature, or key material can ever appear here.
+    """
+
+    content_id: str
+    #: Claims that directly assert this exact content.
+    claim_count: int
+    #: Distinct evidence bundles attached to those claims.
+    bundle_count: int
+    #: Attestations targeting those claims or bundles; revoked proofs are
+    #: retained and still counted.
+    attestation_count: int
+    #: Distinct signing actors with a verified, non-revoked attestation of
+    #: those claims or bundles.
+    qualified_signer_count: int
+    #: ``uncovered`` with no claims, ``partial`` with claims but no qualified
+    #: signer, ``covered`` once one qualified signer exists.
+    coverage_status: Literal["uncovered", "partial", "covered"]
+
+
 class ContentExportJobCreate(BaseModel):
     """A request to register one asynchronous content export job.
 
