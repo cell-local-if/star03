@@ -132,6 +132,10 @@ _CONTENT_EXPORT_JOB_ORDER = (
     ContentExportJob.created_at.asc(),
     ContentExportJob.seq.asc(),
 )
+_ACTOR_TRUST_POLICY_ORDER = (
+    ActorTrustPolicy.created_at.asc(),
+    ActorTrustPolicy.seq.asc(),
+)
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -2533,6 +2537,31 @@ def decide_trust(
             TRUST_REASON_THRESHOLD_MET if met else TRUST_REASON_BELOW_THRESHOLD
         ),
     }
+
+
+# Trust-policy retrieval paging bounds.
+DEFAULT_TRUST_POLICIES_LIMIT = 50
+MIN_TRUST_POLICIES_LIMIT = 1
+MAX_TRUST_POLICIES_LIMIT = 100
+
+
+def list_actor_trust_policies(
+    session: Session, actor_id: str | None = None
+) -> list[ActorTrustPolicy]:
+    """Return existing immutable trust policies in stable creation order.
+
+    ``actor_id`` is an exact, case- and whitespace-sensitive match on the
+    policy subject; ``None`` means unfiltered. The filter value is never
+    resolved for existence, so an unknown subject is an empty result rather
+    than a missing resource. Results follow the policies' stable creation
+    order (``created_at`` with the monotonic ``seq`` tiebreaker). The search
+    is strictly read-only: it writes no policy, resource, or audit event.
+    """
+    stmt = select(ActorTrustPolicy)
+    if actor_id is not None:
+        stmt = stmt.where(ActorTrustPolicy.actor_id == actor_id)
+    stmt = stmt.order_by(*_ACTOR_TRUST_POLICY_ORDER)
+    return list(session.execute(stmt).scalars().all())
 
 
 # Audit-event search paging bounds.

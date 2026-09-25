@@ -73,6 +73,9 @@ CONTENT_EXPORT_JOBS_CURSOR_VERSION = "cx1"
 #: traversal.
 CLAIM_SUPERSESSION_LINEAGE_CURSOR_VERSION = "sl1"
 
+#: Marker for cursors that page through the trust-policy retrieval.
+TRUST_POLICIES_CURSOR_VERSION = "tp1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -553,6 +556,28 @@ CLAIM_SUPERSESSION_LINEAGE_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_claim_supersession_lineage_claims,
+)
+
+
+def _validate_trust_policies_claims(claims: dict[str, Any]) -> None:
+    # The exact-match subject filter is either absent (null, meaning
+    # unfiltered) or a non-empty string; matching is case- and
+    # whitespace-sensitive, so the raw value is bound.
+    _optional_nonempty_str(claims, "actor_id")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/trust-policies``.
+TRUST_POLICIES_CURSOR = CursorKind(
+    version=TRUST_POLICIES_CURSOR_VERSION,
+    claim_fields=("actor_id", "limit", "offset"),
+    validate=_validate_trust_policies_claims,
 )
 
 

@@ -40,6 +40,7 @@ from provenance.schemas import (
     ActorCreate,
     ActorResponse,
     ActorTrustPolicyCreate,
+    ActorTrustPolicyPageResponse,
     ActorTrustPolicyResponse,
     AttestationAccessGrantCreate,
     AttestationAccessGrantPageResponse,
@@ -2708,6 +2709,114 @@ async def create_actor_trust_policy(
         ActorTrustPolicyResponse.model_validate(policy),
         status.HTTP_201_CREATED if created else status.HTTP_200_OK,
     )
+
+
+_TRUST_POLICIES_PARAMS = frozenset({"actor_id", "limit", "cursor"})
+
+
+@router.get("/trust-policies")
+async def list_actor_trust_policies(request: Request, session: DbSession) -> Response:
+    # Read-only retrieval of the existing immutable trust policies. The GET
+    # request body must be empty: carrying any bytes (even whitespace or
+    # malformed JSON) is a 422 validated before any parameter or policy is
+    # read. Raw multi-values are inspected deliberately: a repeated scalar
+    # is rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _TRUST_POLICIES_PARAMS
+    if unknown:
+        # A typo (e.g. ``actor_ids``) never silently changes the retrieval.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    actor_id = _parse_nonempty_filter(raw, "actor_id")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_TRUST_POLICIES_LIMIT,
+        service.MIN_TRUST_POLICIES_LIMIT,
+        service.MAX_TRUST_POLICIES_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.trust_policies_cursor_secret,
+                pagination.TRUST_POLICIES_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the effective
+        # subject filter (null when unfiltered) and the effective limit must
+        # match exactly. A cursor minted by another endpoint family already
+        # fails decoding above.
+        expected = {
+            "actor_id": actor_id,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the retrieval writes no policy, resource, or audit
+    # event. The subject filter is never resolved for existence, so an
+    # unknown actor is an empty collection rather than a 404.
+    items = service.list_actor_trust_policies(session, actor_id)
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.trust_policies_cursor_secret,
+                pagination.TRUST_POLICIES_CURSOR,
+                {
+                    "actor_id": actor_id,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the existing policy public view only: the stable id,
+    # subject, threshold, enabled flag, and UTC timestamp. No private key,
+    # raw signature, claim payload, content, or evidence byte is ever part
+    # of that view.
+    result = ActorTrustPolicyPageResponse(
+        items=[ActorTrustPolicyResponse.model_validate(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    return _compact_json_response(result, status.HTTP_200_OK)
 
 
 _TRUST_DECISION_PARAMS = frozenset({"target_type", "target_id"})
