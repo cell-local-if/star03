@@ -1295,6 +1295,182 @@ class RevocationImpactPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+#: Fixed checkpoint format version emitted by this service for
+#: revocation-impact packages.
+REVOCATION_IMPACT_CHECKPOINT_VERSION = "provenance-revocation-impact-checkpoint-v1"
+#: The sole digest algorithm used for revocation-impact checkpoints.
+REVOCATION_IMPACT_CHECKPOINT_DIGEST_ALGORITHM = "sha256"
+
+
+class RevocationImpactCheckpointResponse(BaseModel):
+    """A read-only integrity checkpoint over a filtered impact sequence.
+
+    Exactly four members: the fixed ``checkpoint_version`` and
+    ``digest_algorithm``, the number of impacts in the filtered sequence,
+    and the SHA-256 hex digest of the canonical impact array (each impact
+    reduced to the revocation-impact public view). The checkpoint is
+    derived purely from the existing revocation records: it introduces no
+    resource, record, or audit event, and its value is stable for
+    unchanged persisted state -- including the empty sequence.
+    """
+
+    checkpoint_version: Literal[REVOCATION_IMPACT_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[REVOCATION_IMPACT_CHECKPOINT_DIGEST_ALGORITHM]
+    impact_count: int
+    impacts_digest_hex: str
+
+
+class RevocationImpactPackageResponse(BaseModel):
+    """One read returning a filtered impact sequence with its checkpoint.
+
+    Exactly two members: ``checkpoint`` is the four-field revocation-impact
+    checkpoint for the effective filter and ``impacts`` lists, in stable
+    revocation creation order, the existing revocation-impact public views
+    matched by that same filter. The checkpoint digest is computed over
+    exactly the ``impacts`` array returned in this response under the
+    checkpoint canonical rules; both derive from a single read-only state
+    read, so they can never disagree. The package introduces no resource,
+    record, or audit event; an empty match yields ``"impacts": []``
+    together with the digest of the empty array.
+    """
+
+    checkpoint: RevocationImpactCheckpointResponse
+    impacts: list[RevocationImpactResponse]
+
+
+class RevocationImpactVerificationItem(BaseModel):
+    """An impact under checkpoint verification: exactly the export public view.
+
+    ``created_at`` is kept as the raw string so the digest commits to the
+    timestamp exactly as spelled on the wire; it must be a strict RFC 3339
+    UTC timestamp, exactly as the impact time filters require.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1)
+    attestation_id: str = Field(..., min_length=1)
+    revoker_actor_id: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1)
+    created_at: str
+    content_id: str = Field(..., min_length=1)
+    target_type: Literal["claim", "evidence_bundle"]
+    signer_actor_id: str = Field(..., min_length=1)
+    qualified_signer_count_after: StrictInt = Field(..., ge=0)
+    coverage_status_after: Literal["uncovered", "partial", "covered"]
+    qualified_signer_count_before: StrictInt = Field(..., ge=0)
+    coverage_status_before: Literal["uncovered", "partial", "covered"]
+    qualified_signer_count_delta: StrictInt = Field(..., ge=0, le=1)
+
+    @field_validator(
+        "id",
+        "attestation_id",
+        "revoker_actor_id",
+        "reason",
+        "content_id",
+        "signer_actor_id",
+    )
+    @classmethod
+    def _nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_strict_rfc3339_utc(cls, v: str) -> str:
+        if parse_rfc3339_utc(v) is None:
+            raise ValueError(
+                "created_at must be a strict RFC 3339 UTC timestamp"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _counts_and_delta_are_consistent(self):
+        # The only association check stateless verification can make: the
+        # delta is exactly the before/after difference (the export always
+        # serves ``before - after == delta``). Resolving any id against a
+        # resource would violate the stateless contract.
+        if (
+            self.qualified_signer_count_before
+            - self.qualified_signer_count_after
+            != self.qualified_signer_count_delta
+        ):
+            raise ValueError(
+                "qualified_signer_count_delta must equal"
+                " qualified_signer_count_before - qualified_signer_count_after"
+            )
+        return self
+
+
+class RevocationImpactVerificationCheckpoint(BaseModel):
+    """The claimed checkpoint under stateless impact verification.
+
+    Exactly the four-field revocation-impact checkpoint structure: the
+    fixed ``checkpoint_version`` and ``digest_algorithm``, the claimed
+    impact count, and the claimed impacts digest. Undeclared members are
+    rejected rather than ignored, exactly as on the package export route.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_version: Literal[REVOCATION_IMPACT_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[REVOCATION_IMPACT_CHECKPOINT_DIGEST_ALGORITHM]
+    #: Non-negative integer count the submitted impact array must match.
+    impact_count: StrictInt = Field(..., ge=0)
+    impacts_digest_hex: str
+
+    @field_validator("impacts_digest_hex")
+    @classmethod
+    def _impacts_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "impacts_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class RevocationImpactVerificationCreate(BaseModel):
+    """A stateless revocation-impact checkpoint verification request.
+
+    Exactly two members: ``checkpoint`` carries the claimed four-field
+    impact checkpoint and ``impacts`` carries the impact sequence it
+    commits to, with exactly ``checkpoint.impact_count`` elements.
+    Verification is pure: it reads and writes no server state, so no
+    revocation, attestation, or resource id is ever resolved against
+    local state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint: RevocationImpactVerificationCheckpoint
+    impacts: list[RevocationImpactVerificationItem]
+
+    @model_validator(mode="after")
+    def _impacts_match_claimed_count(self):
+        if len(self.impacts) != self.checkpoint.impact_count:
+            raise ValueError(
+                "impacts must contain exactly checkpoint.impact_count elements"
+            )
+        return self
+
+
+class RevocationImpactVerificationResponse(BaseModel):
+    """The stateless impact-checkpoint verification verdict.
+
+    ``computed_digest_hex`` is present only on a mismatch, so a matching
+    checkpoint renders exactly ``{"valid": true}``.
+    """
+
+    valid: bool
+    #: The digest computed from the submitted impact array under the
+    #: checkpoint canonical rules; omitted when it matches the claim.
+    computed_digest_hex: str | None = None
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.

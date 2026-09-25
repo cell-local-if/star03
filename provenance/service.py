@@ -1367,7 +1367,54 @@ def list_revocation_impacts_page(
     )
     if not page:
         return [], total
+    return _enrich_revocation_impacts(session, page), total
 
+
+def list_revocation_impacts(
+    session: Session,
+    attestation_id: str | None = None,
+    revoker_actor_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> tuple[list[dict], int]:
+    """Return the complete filtered impact set (no pagination window) + total.
+
+    The checkpoint package export binds a checkpoint to exactly the full
+    filtered impact set, so unlike :func:`list_revocation_impacts_page` no
+    ``LIMIT`` is applied: every matched revocation is read in one stable
+    creation-order query (``limit=None`` removes the SQL LIMIT clause) and
+    enriched exactly as a search page would be. Strictly read-only.
+    """
+    page, total = list_attestation_revocations_page(
+        session,
+        attestation_id,
+        revoker_actor_id,
+        reason,
+        from_dt,
+        to_dt,
+        None,
+        0,
+    )
+    if not page:
+        return [], total
+    return _enrich_revocation_impacts(session, page), total
+
+
+def _enrich_revocation_impacts(
+    session: Session, page: list[AttestationRevocation]
+) -> list[dict]:
+    """Enrich a stable-ordered revocation page with per-content impacts.
+
+    Counts follow the content evidence-coverage summary caliber: distinct
+    signing actors with a verified, non-revoked attestation targeting a
+    claim that directly asserts the content or a bundle attached to such a
+    claim. The "after" counts apply every stored revocation; the "before"
+    counts ignore only the row's own revocation while every other
+    revocation still applies, so the before/after delta is always zero or
+    one. Coverage statuses use the same ``uncovered``/``partial``/
+    ``covered`` rules as the summary. Strictly read-only.
+    """
     # The revoked attestations (foreign keys guarantee they exist).
     page_attestation_ids = list({rev.attestation_id for rev in page})
     attestations = {
@@ -1544,7 +1591,7 @@ def list_revocation_impacts_page(
                 ),
             }
         )
-    return results, total
+    return results
 
 
 

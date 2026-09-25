@@ -113,3 +113,16 @@ def audit_events_digest_hex(events: Any) -> str:
     from the filtered audit-event listing alone.
     """
     return hashlib.sha256(canonical_json_bytes(events)).hexdigest()
+
+
+def revocation_impacts_digest_hex(impacts: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical impact array bytes.
+
+    The array keeps its element order (the stable revocation creation
+    order the export serves); each impact object's members are sorted by
+    Unicode code point, with compact separators, non-ASCII emitted
+    unescaped, and UTF-8 encoding -- the same canonical form as
+    :func:`canonical_json_bytes`, so the digest is reproducible offline
+    from the exported ``impacts`` array alone, including the empty array.
+    """
+    return hashlib.sha256(canonical_json_bytes(impacts)).hexdigest()
