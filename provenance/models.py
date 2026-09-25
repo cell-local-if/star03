@@ -80,9 +80,16 @@ class Actor(Base):
     """A provenance subject (person, organization, device, software, ...)."""
 
     __tablename__ = "actors"
+    __table_args__ = (
+        Index("ix_actors_created_order", "created_at", "seq"),
+    )
 
-    #: Client-supplied stable identifier.
-    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Client-supplied stable identifier, unique across actors.
+    id: Mapped[str] = mapped_column(String(255), unique=True)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(

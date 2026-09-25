@@ -100,6 +100,7 @@ from provenance.time_utils import utc_now
 
 # Stable creation order: timestamp first, with the monotonic sequence as a
 # deterministic tiebreaker.
+_ACTOR_ORDER = (Actor.created_at.asc(), Actor.seq.asc())
 _CONTENT_ORDER = (Content.created_at.asc(), Content.seq.asc())
 _CLAIM_ORDER = (Claim.created_at.asc(), Claim.seq.asc())
 _CLAIM_SUPERSESSION_ORDER = (
@@ -138,12 +139,24 @@ _ACTOR_TRUST_POLICY_ORDER = (
 )
 
 
+def get_actor_by_id(session: Session, actor_id: str) -> Actor | None:
+    """Return the actor with the client-supplied id, or ``None``.
+
+    The actor's stable business identifier is unique but is not the ORM
+    primary key (the monotonic ``seq`` is), so lookups go through a select
+    rather than ``Session.get``.
+    """
+    return session.execute(
+        select(Actor).where(Actor.id == actor_id)
+    ).scalar_one_or_none()
+
+
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
     """Create an actor and its audit event atomically.
 
     Raises :class:`ActorAlreadyExistsError` on a duplicate identifier.
     """
-    existing = session.get(Actor, payload.id)
+    existing = get_actor_by_id(session, payload.id)
     if existing is not None:
         raise ActorAlreadyExistsError(payload.id)
 
@@ -162,6 +175,40 @@ def create_actor(session: Session, payload: ActorCreate) -> Actor:
     return actor
 
 
+# Actor search paging bounds.
+DEFAULT_ACTORS_LIMIT = 50
+MIN_ACTORS_LIMIT = 1
+MAX_ACTORS_LIMIT = 100
+
+
+def list_actors(
+    session: Session,
+    actor_id: str | None = None,
+    name: str | None = None,
+    actor_type: str | None = None,
+) -> list[Actor]:
+    """Return existing actors in stable creation order, optionally filtered.
+
+    ``actor_id``, ``name``, and ``actor_type`` are exact, case- and
+    whitespace-sensitive matches that combine as logical AND; ``None`` means
+    unfiltered. The values are never resolved for existence, so an unknown
+    identifier, name, or type is an empty result rather than a missing
+    resource. Results follow the actors' stable creation order
+    (``created_at`` with the monotonic ``seq`` tiebreaker), which stays fixed
+    across an app restart. The search is strictly read-only: it writes no
+    actor, resource, or audit event.
+    """
+    stmt = select(Actor)
+    if actor_id is not None:
+        stmt = stmt.where(Actor.id == actor_id)
+    if name is not None:
+        stmt = stmt.where(Actor.name == name)
+    if actor_type is not None:
+        stmt = stmt.where(Actor.type == actor_type)
+    stmt = stmt.order_by(*_ACTOR_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 def create_content(
     session: Session, payload: ContentCreate
 ) -> tuple[Content, bool]:
@@ -171,7 +218,7 @@ def create_content(
     digest already exists, the existing resource is returned with
     ``created=False`` and no row or audit event is written.
     """
-    actor = session.get(Actor, payload.actor_id)
+    actor = get_actor_by_id(session, payload.actor_id)
     if actor is None:
         raise UnknownActorError(payload.actor_id)
 
@@ -258,7 +305,7 @@ def create_claim(session: Session, payload: ClaimCreate) -> tuple[Claim, bool]:
     ).scalar_one_or_none()
     if content is None:
         raise ContentNotFoundError(payload.content_id)
-    actor = session.get(Actor, payload.actor_id)
+    actor = get_actor_by_id(session, payload.actor_id)
     if actor is None:
         raise UnknownActorError(payload.actor_id)
 
@@ -960,7 +1007,7 @@ def create_attestation(
         if target is None:
             raise EvidenceBundleNotFoundError(payload.target_id)
 
-    actor = session.get(Actor, payload.signer_actor_id)
+    actor = get_actor_by_id(session, payload.signer_actor_id)
     if actor is None:
         raise UnknownActorError(payload.signer_actor_id)
 
@@ -1079,7 +1126,7 @@ def create_attestation_revocation(
     if attestation is None:
         raise AttestationNotFoundError(payload.attestation_id)
 
-    actor = session.get(Actor, payload.revoker_actor_id)
+    actor = get_actor_by_id(session, payload.revoker_actor_id)
     if actor is None:
         raise UnknownActorError(payload.revoker_actor_id)
 
@@ -1189,7 +1236,7 @@ def create_attestation_access_grant(
     if attestation.signer_actor_id != caller_actor_id:
         raise ProtectedAccessValidationError("caller_not_signer")
 
-    grantee = session.get(Actor, payload.grantee_actor_id)
+    grantee = get_actor_by_id(session, payload.grantee_actor_id)
     if grantee is None:
         raise ProtectedAccessValidationError("unknown_grantee_actor")
 
@@ -1452,7 +1499,7 @@ def list_authentication_key_rotations_for_actor(
     collection. The function is strictly read-only: it writes no rotation,
     resource, or audit event.
     """
-    if session.get(Actor, actor_id) is None:
+    if get_actor_by_id(session, actor_id) is None:
         raise UnknownActorError(actor_id)
     stmt = (
         select(AuthenticationKeyRotation)
@@ -1483,7 +1530,7 @@ def create_authentication_key_rotation(
     """
     # Validate the subject before the credential-derived identity lookup:
     # an unknown subject and a caller/body mismatch are 422s, not 404s.
-    actor = session.get(Actor, payload.actor_id)
+    actor = get_actor_by_id(session, payload.actor_id)
     if actor is None:
         raise ProtectedAccessValidationError("unknown_actor")
 
@@ -2436,7 +2483,7 @@ def create_actor_trust_policy(
     """
     # Validate the subject before the identity lookup: an unknown subject
     # and a caller/body mismatch are 422s, not 404s.
-    actor = session.get(Actor, payload.actor_id)
+    actor = get_actor_by_id(session, payload.actor_id)
     if actor is None:
         raise ProtectedAccessValidationError("unknown_actor")
 

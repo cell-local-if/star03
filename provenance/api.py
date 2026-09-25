@@ -38,6 +38,7 @@ from provenance.schemas import (
     EXCHANGE_MANIFEST_DIGEST_ALGORITHM,
     EXCHANGE_MANIFEST_VERSION,
     ActorCreate,
+    ActorPageResponse,
     ActorResponse,
     ActorTrustPolicyCreate,
     ActorTrustPolicyPageResponse,
@@ -135,6 +136,122 @@ DbSession = Annotated[Session, Depends(get_db)]
 def create_actor(payload: ActorCreate, session: DbSession) -> ActorResponse:
     actor = service.create_actor(session, payload)
     return ActorResponse.model_validate(actor)
+
+
+_ACTORS_PARAMS = frozenset({"id", "name", "type", "limit", "cursor"})
+
+
+@router.get("/actors")
+async def list_actors(request: Request, session: DbSession) -> Response:
+    # Read-only reviewer search over existing source actors. The GET request
+    # body must be empty: carrying any bytes (even whitespace or malformed
+    # JSON) is a 422 validated before any parameter or actor is read. Raw
+    # multi-values are inspected deliberately: a repeated scalar is rejected
+    # instead of silently taking the last value, undeclared parameters are
+    # rejected rather than ignored, and a blank filter/limit is never coerced
+    # to a default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _ACTORS_PARAMS
+    if unknown:
+        # A typo (e.g. ``actor_id``) never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    actor_id = _parse_nonempty_filter(raw, "id")
+    name = _parse_nonempty_filter(raw, "name")
+    actor_type = _parse_nonempty_filter(raw, "type")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_ACTORS_LIMIT,
+        service.MIN_ACTORS_LIMIT,
+        service.MAX_ACTORS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.actors_cursor_secret,
+                pagination.ACTORS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered) and the effective limit must match
+        # exactly. A cursor minted by another endpoint family already fails
+        # decoding above.
+        expected = {
+            "id": actor_id,
+            "name": name,
+            "type": actor_type,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no actor, resource, or audit
+    # event. No filter value is resolved for existence, so an unknown id,
+    # name, or type is an empty collection rather than a 404. Actors follow
+    # stable creation order (created_at with the monotonic seq tiebreaker),
+    # which stays fixed across a restart.
+    items = service.list_actors(session, actor_id, name, actor_type)
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.actors_cursor_secret,
+                pagination.ACTORS_CURSOR,
+                {
+                    "id": actor_id,
+                    "name": name,
+                    "type": actor_type,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the existing actor public view (id, name, type, UTC
+    # created_at); the view carries no private key, raw signature, payload,
+    # content, or bytes. Compact UTF-8 JSON terminated by exactly one newline,
+    # with members in the order items, count, next_cursor.
+    result = ActorPageResponse(
+        items=[ActorResponse.model_validate(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    return _compact_json_response(result, status.HTTP_200_OK)
 
 
 @router.post("/contents", response_model=ContentResponse)
