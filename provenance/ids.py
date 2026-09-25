@@ -270,6 +270,34 @@ def checkpoint_import_id(
     return "aci_" + hashlib.sha256(material).hexdigest()
 
 
+def impact_import_id(
+    checkpoint_version: str,
+    impact_count: int,
+    impacts_digest_hex: str,
+) -> str:
+    """Return a stable ``rii_``-prefixed receipt id for an impact import.
+
+    The identity is exactly the receiving identity: the fixed checkpoint
+    version, the claimed impact count, and the impacts SHA-256 digest. The
+    impacts array itself never enters the material -- only its verified
+    digest -- so the same offline-verified checkpoint always maps to the
+    same receipt id even though no impact data is persisted. The material
+    is a canonical JSON array so fields containing separators cannot
+    collide with different field splits.
+    """
+    material = json.dumps(
+        [
+            "revocation_impact_import",
+            checkpoint_version,
+            impact_count,
+            impacts_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "rii_" + hashlib.sha256(material).hexdigest()
+
+
 def content_export_job_id(content_id: str, request_id: str) -> str:
     """Return a stable ``cxj_``-prefixed id for a content export job.
 

@@ -16,6 +16,7 @@ from provenance.access_signing import AccessAuthError
 from provenance.errors import (
     AuditCheckpointImportValidationError,
     EvidenceBundleExchangeImportValidationError,
+    ImpactImportValidationError,
     LineageValidationError,
     ProtectedAccessValidationError,
     ProtectedResourceNotFoundError,
@@ -61,6 +62,9 @@ from provenance.schemas import (
     RevocationImpactPageResponse,
     RevocationImpactResponse,
     RevocationImpactCheckpointResponse,
+    RevocationImpactImportCreate,
+    RevocationImpactImportReconciliationResponse,
+    RevocationImpactImportResponse,
     RevocationImpactPackageResponse,
     RevocationImpactVerificationCreate,
     RevocationImpactVerificationResponse,
@@ -3303,6 +3307,129 @@ async def verify_revocation_impacts(
         + "\n"
     ).encode("utf-8")
     return Response(content=data, media_type="application/json")
+
+
+def _impact_import_response(record) -> RevocationImpactImportResponse:
+    return RevocationImpactImportResponse(
+        id=record.id,
+        checkpoint_version=record.checkpoint_version,
+        impact_count=record.impact_count,
+        impacts_digest_hex=record.impacts_digest_hex,
+        received_at=record.created_at,
+    )
+
+
+@router.post(
+    "/impact-imports",
+    response_model=RevocationImpactImportResponse,
+)
+async def import_revocation_impacts(
+    payload: RevocationImpactImportCreate,
+    request: Request,
+    session: DbSession,
+    response: Response,
+) -> RevocationImpactImportResponse:
+    # Structure, fixed version/algorithm, strict digest spelling, the
+    # impact-item fields and timestamps, the internal before/after coverage
+    # associations, and the claimed impact count have all passed request
+    # validation exactly as on the stateless verification route. The digest
+    # match is enforced here over the raw received JSON, so array order and
+    # datetime spellings participate exactly as received; a mismatch is a
+    # 422 and writes nothing.
+    body = await request.json()
+    computed_digest_hex = canonical.revocation_impacts_digest_hex(
+        body["impacts"]
+    )
+    if computed_digest_hex != payload.checkpoint.impacts_digest_hex:
+        raise ImpactImportValidationError(
+            "impacts_digest_mismatch",
+            details={"computed_digest_hex": computed_digest_hex},
+        )
+
+    # Verification is decided entirely by the request body: the described
+    # impacts are never resolved against local state, so whether they exist
+    # locally cannot change the receipt, and no revocation or other resource
+    # is created or modified.
+    record, created = service.create_revocation_impact_import(session, payload)
+    # First registration of this receiving identity -> 201; a retried
+    # submission -> 200 with the original record and no new audit event.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _impact_import_response(record)
+
+
+@router.get(
+    "/impact-imports/{import_id}",
+    response_model=RevocationImpactImportResponse,
+)
+def get_revocation_impact_import(
+    import_id: str, request: Request, session: DbSession
+) -> RevocationImpactImportResponse:
+    # The receipt read takes no query parameters: any (or repeated)
+    # parameter is a 422 before the receipt lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only: a receipt read writes no resource and no audit
+    # event. An unknown id is an explicit, specific 404.
+    record = service.get_revocation_impact_import(session, import_id)
+    return _impact_import_response(record)
+
+
+def _local_revocation_impact_checkpoint(
+    session: Session,
+) -> RevocationImpactCheckpointResponse:
+    """Compute the current unfiltered local revocation-impact checkpoint.
+
+    Exactly the ``GET /v1/revocation-impact-package`` rules with no
+    filters: every local impact is read once in the revocations' stable
+    creation order and rendered through the same public wire view, so the
+    fixed version, digest algorithm, impact count, canonical digest, and
+    UTC representation are identical to that route. Strictly read-only.
+    """
+    impacts = service.list_revocation_impacts(session)
+    impact_views = [_revocation_impact_item(impact) for impact in impacts]
+    # mode="json" yields exactly the wire view the package export serves
+    # (UTC datetimes as RFC 3339 strings), so the digest is reproducible by
+    # an external verifier from the package body alone.
+    impact_payloads = [view.model_dump(mode="json") for view in impact_views]
+    return RevocationImpactCheckpointResponse(
+        checkpoint_version=REVOCATION_IMPACT_CHECKPOINT_VERSION,
+        digest_algorithm=REVOCATION_IMPACT_DIGEST_ALGORITHM,
+        impact_count=len(impact_payloads),
+        impacts_digest_hex=canonical.revocation_impacts_digest_hex(
+            impact_payloads
+        ),
+    )
+
+
+@router.get(
+    "/impact-imports/{import_id}/recon",
+    response_model=RevocationImpactImportReconciliationResponse,
+)
+def reconcile_revocation_impact_import(
+    import_id: str, request: Request, session: DbSession
+) -> RevocationImpactImportReconciliationResponse:
+    # Same boundary as the receipt read route: any (or repeated) query
+    # parameter is a 422 before the receipt lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only: the reconciliation writes no resource, receipt, or
+    # audit event. An unknown receipt id is the impact_import_not_found 404.
+    record = service.get_revocation_impact_import(session, import_id)
+
+    # The current local impact set is always read complete and unfiltered;
+    # the receipt's imported impacts array is not persisted and is never
+    # read or echoed.
+    local_checkpoint = _local_revocation_impact_checkpoint(session)
+    matches = (
+        record.checkpoint_version == local_checkpoint.checkpoint_version
+        and record.impact_count == local_checkpoint.impact_count
+        and record.impacts_digest_hex == local_checkpoint.impacts_digest_hex
+    )
+    return RevocationImpactImportReconciliationResponse(
+        import_id=record.id,
+        local_checkpoint=local_checkpoint,
+        matches=matches,
+    )
 
 
 _TRUST_EVALUATION_PARAMS = frozenset(

@@ -170,6 +170,35 @@ class AuditCheckpointImportValidationError(DomainError):
         super().__init__(details=merged)
 
 
+class ImpactImportNotFoundError(DomainError):
+    status_code = 404
+    code = "impact_import_not_found"
+    message = "The requested revocation impact import does not exist."
+
+    def __init__(self, import_id: str):
+        super().__init__(details={"import_id": import_id})
+
+
+class ImpactImportValidationError(DomainError):
+    """A structurally valid impact-import request that fails verification.
+
+    An impacts digest that does not match the canonical SHA-256 of the
+    received impacts array renders with the same ``validation_error`` code
+    and 422 status as a malformed payload: the checkpoint is refused before
+    any receipt or audit row is written.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str, details: dict | None = None):
+        merged = {"reason": reason}
+        if details:
+            merged.update(details)
+        super().__init__(details=merged)
+
+
 class ContentExportJobNotFoundError(DomainError):
     status_code = 404
     code = "content_export_job_not_found"
