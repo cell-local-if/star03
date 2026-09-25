@@ -33,6 +33,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Re-ensure the schema on every startup, not just at factory time:
+        # shutdown disposes the engine, and for an in-memory database that
+        # drops the whole schema, so a restarted lifespan must recreate the
+        # tables before the reused connection serves requests again. The
+        # call is idempotent on an already-migrated database.
+        init_db(engine)
         try:
             yield
         finally:

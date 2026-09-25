@@ -359,6 +359,46 @@ def test_import_is_idempotent_across_app_restart(file_client, tmp_db_url):
         assert retry.json() == expected
 
 
+def test_import_survives_lifespan_restart_of_the_same_app(tmp_db_url):
+    # A lifespan shutdown disposes the engine; restarting the same app
+    # instance must re-ensure the schema before the reused engine serves
+    # requests again. On a file database the receipt itself survives.
+    app = create_app(Settings(database_url=tmp_db_url))
+    request = _offline_request()
+    with TestClient(app) as first:
+        original = first.post(URL, json=request)
+        assert original.status_code == 201
+
+    with TestClient(app) as restarted:
+        retry = restarted.post(URL, json=request)
+        assert retry.status_code == 200, retry.text
+        assert retry.json() == original.json()
+        receipt_id = original.json()["id"]
+        assert restarted.get(f"{URL}/{receipt_id}").status_code == 200
+        assert restarted.get(f"{URL}/{receipt_id}/recon").status_code == 200
+
+
+def test_import_tables_recreated_on_in_memory_lifespan_restart():
+    # Disposing the engine drops an in-memory database entirely: a restarted
+    # lifespan must recreate the impact-import tables rather than answer
+    # with a missing-table service error.
+    app = create_app(Settings(database_url="sqlite:///:memory:"))
+    request = _offline_request()
+    with TestClient(app) as first:
+        assert first.post(URL, json=request).status_code == 201
+
+    with TestClient(app) as restarted:
+        # The fresh in-memory database holds no receipts: the same
+        # checkpoint registers as new instead of failing.
+        resp = restarted.post(URL, json=request)
+        assert resp.status_code == 201, resp.text
+        receipt_id = resp.json()["id"]
+        assert restarted.get(f"{URL}/{receipt_id}").status_code == 200
+        assert (
+            restarted.get(f"{URL}/{receipt_id}/recon").status_code == 200
+        )
+
+
 # --- Read endpoint -------------------------------------------------------------
 
 
