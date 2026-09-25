@@ -1806,11 +1806,25 @@ COVERAGE_UNCOVERED = "uncovered"
 COVERAGE_PARTIAL = "partial"
 COVERAGE_COVERED = "covered"
 
+#: The three existing coverage status literals, in stable order.
+COVERAGE_STATUSES = (COVERAGE_UNCOVERED, COVERAGE_PARTIAL, COVERAGE_COVERED)
+
 
 def get_content_evidence_coverage(
     session: Session, content_id: str
 ) -> dict:
     """Summarize the evidence coverage of one existing content.
+
+    The content must exist; an unknown content id is a missing resource, not
+    a zeroed summary. See :func:`_content_evidence_coverage` for the counting
+    and status rules.
+    """
+    _require_content(session, content_id)
+    return _content_evidence_coverage(session, content_id)
+
+
+def _content_evidence_coverage(session: Session, content_id: str) -> dict:
+    """Summarize the evidence coverage of one content known to exist.
 
     Only claims that directly assert this exact content count -- no lineage
     traversal -- and only the bundles attached to those claims (deduplicated
@@ -1827,11 +1841,8 @@ def get_content_evidence_coverage(
 
     The function is strictly read-only: it writes no resource, snapshot,
     audit event, or log, and the same persisted state always yields the
-    same counts and status. The content must exist; an unknown content id
-    is a missing resource, not a zeroed summary.
+    same counts and status.
     """
-    _require_content(session, content_id)
-
     claim_ids = list(
         session.execute(
             select(Claim.id)
@@ -1903,6 +1914,67 @@ def get_content_evidence_coverage(
         "qualified_signer_count": qualified_signer_count,
         "coverage_status": coverage_status,
     }
+
+
+# Content coverage search paging bounds.
+DEFAULT_CONTENT_COVERAGE_SEARCH_LIMIT = 50
+MIN_CONTENT_COVERAGE_SEARCH_LIMIT = 1
+MAX_CONTENT_COVERAGE_SEARCH_LIMIT = 100
+
+
+def list_content_coverage_search_page(
+    session: Session,
+    actor_id: str | None = None,
+    media_type: str | None = None,
+    coverage_status: str | None = None,
+    limit: int = DEFAULT_CONTENT_COVERAGE_SEARCH_LIMIT,
+    offset: int = 0,
+) -> tuple[list[tuple[Content, dict]], int]:
+    """Return one cross-content coverage page and the filtered total.
+
+    ``actor_id`` and ``media_type`` are non-empty, case- and
+    whitespace-sensitive exact matches on the content identity that combine
+    as logical AND; ``coverage_status`` is one of the three existing
+    coverage literals matched against each content's current summary;
+    ``None`` means unfiltered. Filter values are never resolved for
+    existence, so an unknown value is an empty result rather than a missing
+    resource.
+
+    Each returned row pairs the content with its existing evidence-coverage
+    summary (the same four counts and status as the per-content coverage
+    read, computed by the same rules). Rows follow the contents' stable
+    creation order (``created_at`` then the monotonic ``seq`` tiebreaker),
+    so ordering and paging never depend on in-memory sorting and stay
+    stable across an app restart. The total covers the whole filtered set,
+    independent of the page. The search is strictly read-only: it writes no
+    content, migration record, resource, or audit event.
+    """
+    filters = []
+    if actor_id is not None:
+        filters.append(Content.actor_id == actor_id)
+    if media_type is not None:
+        filters.append(Content.media_type == media_type)
+
+    contents = list(
+        session.execute(
+            select(Content).where(*filters).order_by(*_CONTENT_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+
+    items: list[tuple[Content, dict]] = []
+    for content in contents:
+        summary = _content_evidence_coverage(session, content.id)
+        if (
+            coverage_status is not None
+            and summary["coverage_status"] != coverage_status
+        ):
+            continue
+        items.append((content, summary))
+
+    total = len(items)
+    return items[offset : offset + limit], total
 
 
 #: Builds the stored export result for one content: the wire-shaped

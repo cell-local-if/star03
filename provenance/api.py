@@ -81,6 +81,8 @@ from provenance.schemas import (
     ClaimSupersessionResponse,
     ClaimSupersessionLineageItem,
     ClaimSupersessionLineageResponse,
+    ContentCoverageSearchItem,
+    ContentCoverageSearchPageResponse,
     ContentCreate,
     ContentEvidenceCoverageResponse,
     ContentExportJobCreate,
@@ -2041,6 +2043,158 @@ async def get_content_evidence_coverage(
     return _compact_json_response(
         ContentEvidenceCoverageResponse(**result), status.HTTP_200_OK
     )
+
+
+_CONTENT_COVERAGE_SEARCH_PARAMS = frozenset(
+    {"actor_id", "media_type", "coverage_status", "limit", "cursor"}
+)
+
+
+def _coverage_search_item(content, summary: dict) -> ContentCoverageSearchItem:
+    # The full public content view, with the existing four coverage counts
+    # and the coverage status added; no other field.
+    fields = ContentResponse.model_validate(content).model_dump()
+    return ContentCoverageSearchItem(
+        **fields,
+        claim_count=summary["claim_count"],
+        bundle_count=summary["bundle_count"],
+        attestation_count=summary["attestation_count"],
+        qualified_signer_count=summary["qualified_signer_count"],
+        coverage_status=summary["coverage_status"],
+    )
+
+
+@router.get("/content-coverage-search")
+async def list_content_coverage_search(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only reviewer cross-content evidence-coverage search. The GET
+    # request body must be empty: carrying any bytes (even whitespace or
+    # malformed JSON) is a 422 validated before any parameter or content is
+    # read. Raw multi-values are inspected deliberately: a repeated scalar
+    # is rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _CONTENT_COVERAGE_SEARCH_PARAMS
+    if unknown:
+        # A typo never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    actor_id = _parse_nonempty_filter(raw, "actor_id")
+    media_type = _parse_nonempty_filter(raw, "media_type")
+
+    coverage_status = _parse_once(raw, "coverage_status")
+    if coverage_status is not None and coverage_status not in (
+        service.COVERAGE_STATUSES
+    ):
+        # Only the three existing coverage literals are accepted; blanks,
+        # casing variants, and any other spelling are rejected rather than
+        # normalized.
+        raise _query_validation_error(
+            "coverage_status",
+            "coverage_status must be 'uncovered', 'partial', or 'covered'",
+            "value_error",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CONTENT_COVERAGE_SEARCH_LIMIT,
+        service.MIN_CONTENT_COVERAGE_SEARCH_LIMIT,
+        service.MAX_CONTENT_COVERAGE_SEARCH_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.content_coverage_search_cursor_secret,
+                pagination.CONTENT_COVERAGE_SEARCH_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered) and the effective limit must match
+        # exactly. A cursor minted by another endpoint family already fails
+        # decoding above.
+        expected = {
+            "actor_id": actor_id,
+            "media_type": media_type,
+            "coverage_status": coverage_status,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no content, migration record,
+    # resource, or audit event. Rows follow the contents' stable creation
+    # order (created_at then the monotonic insertion sequence), so ordering
+    # and paging survive a restart. Filter values are never resolved for
+    # existence, so an unknown or nonexistent value is an empty collection
+    # rather than a 404. Each item is the content public view plus the
+    # existing four coverage counts and status: no claim payload, raw
+    # signature, private key, content, or evidence byte can ever be echoed.
+    page, total = service.list_content_coverage_search_page(
+        session,
+        actor_id,
+        media_type,
+        coverage_status,
+        page_limit,
+        offset,
+    )
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.content_coverage_search_cursor_secret,
+                pagination.CONTENT_COVERAGE_SEARCH_CURSOR,
+                {
+                    "actor_id": actor_id,
+                    "media_type": media_type,
+                    "coverage_status": coverage_status,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = ContentCoverageSearchPageResponse(
+        items=[_coverage_search_item(content, summary) for content, summary in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated by
+    # exactly one newline; members appear as items, count, next_cursor.
+    return _compact_json_response(result, status.HTTP_200_OK)
 
 
 def _content_export_snapshot(session: Session, content_id: str) -> ContentExportResponse:

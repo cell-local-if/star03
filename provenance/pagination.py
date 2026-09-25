@@ -89,6 +89,10 @@ ATTESTATION_REVOCATIONS_CURSOR_VERSION = "ar1"
 #: Marker for cursors that page through the global content-relation search.
 CONTENT_RELATIONS_CURSOR_VERSION = "rl1"
 
+#: Marker for cursors that page through the cross-content evidence-coverage
+#: search.
+CONTENT_COVERAGE_SEARCH_CURSOR_VERSION = "cc1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -739,6 +743,44 @@ CONTENT_RELATIONS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_content_relations_claims,
+)
+
+
+def _validate_content_coverage_search_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null, meaning unfiltered) or
+    # non-empty strings; matching is case- and whitespace-sensitive, so the
+    # raw value is bound.
+    _optional_nonempty_str(claims, "actor_id")
+    _optional_nonempty_str(claims, "media_type")
+    # The status filter is absent (null) or one of the three existing
+    # coverage literals; no other spelling is valid.
+    coverage_status = claims["coverage_status"]
+    if coverage_status is not None and coverage_status not in (
+        "uncovered",
+        "partial",
+        "covered",
+    ):
+        raise InvalidCursorError("cursor coverage_status is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/content-coverage-search``.
+CONTENT_COVERAGE_SEARCH_CURSOR = CursorKind(
+    version=CONTENT_COVERAGE_SEARCH_CURSOR_VERSION,
+    claim_fields=(
+        "actor_id",
+        "media_type",
+        "coverage_status",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_content_coverage_search_claims,
 )
 
 
