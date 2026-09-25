@@ -1628,3 +1628,28 @@ class AuthenticationKeyRotationPageResponse(BaseModel):
     count: int
     #: Opaque server cursor for the next page, or null on the final page.
     next_cursor: str | None = None
+
+
+class ContentEvidenceCoverageResponse(BaseModel):
+    """Read-only evidence-coverage summary of one content.
+
+    Exactly six members in this order: the echoed ``content_id``; the number
+    of existing claims that directly assert this content; the number of
+    distinct existing evidence bundles attached to those claims; the number
+    of existing attestations (revoked ones retained) of those claims or
+    bundles; the number of distinct signing subjects with at least one
+    verified, non-revoked attestation among them; and the coverage status.
+    All counts are integers. The view carries no raw content, claim payload,
+    evidence byte, public key, signature, or signature digest.
+    """
+
+    content_id: str
+    claim_count: int
+    bundle_count: int
+    #: Existing proofs targeting the content's claims or bundles; revoked
+    #: proofs are retained and still counted.
+    attestation_count: int
+    #: Distinct signing subjects with a verified, non-revoked proof of any of
+    #: the content's claims or associated bundles.
+    qualified_signer_count: int
+    coverage_status: Literal["uncovered", "partial", "covered"]

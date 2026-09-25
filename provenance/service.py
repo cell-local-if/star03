@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 from typing import Callable
 
-from sqlalchemy import exists, func, or_, select, update as sa_update
+from sqlalchemy import and_, exists, func, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -2514,6 +2514,117 @@ def evaluate_trust(
             if qualified >= min_signers
             else TRUST_DECISION_UNTRUSTED
         ),
+    }
+
+
+# Content evidence-coverage statuses. Coverage needs exactly one distinct
+# qualified signing subject (verified, non-revoked proof) over the content's
+# claims or their evidence bundles; this deliberately does not reuse the
+# configurable trust-evaluation threshold.
+CONTENT_EVIDENCE_COVERAGE_UNCOVERED = "uncovered"
+CONTENT_EVIDENCE_COVERAGE_PARTIAL = "partial"
+CONTENT_EVIDENCE_COVERAGE_COVERED = "covered"
+
+
+def get_content_evidence_coverage(session: Session, content_id: str) -> dict:
+    """Summarize the existing evidence coverage of one content, read-only.
+
+    Only claims that directly assert this exact content participate; no
+    lineage traversal is performed. Counts:
+
+    * ``claim_count`` -- the existing direct claims (stable creation order);
+    * ``bundle_count`` -- distinct existing evidence bundles attached to
+      those claims, deduplicated by id (a bundle belongs to exactly one
+      claim, so the join cannot duplicate it, but the id set makes the
+      dedup guarantee explicit);
+    * ``attestation_count`` -- existing attestations whose target is any of
+      those claims or bundles; revoked attestations are retained and still
+      counted;
+    * ``qualified_signer_count`` -- distinct ``signer_actor_id`` values over
+      only the verified, non-revoked attestations among that same target set
+      (every stored attestation is a verified one).
+
+    The content must exist or :class:`ContentNotFoundError` is raised.
+    Status is ``"uncovered"`` with every count zero when the content has no
+    claims, ``"partial"`` when it has claims but no qualified signer (all
+    proofs revoked counts as zero), and ``"covered"`` once at least one
+    distinct qualified subject is present. Strictly read-only: it reads
+    contents, claims, bundles, attestations, and revocation records only and
+    writes no resource, snapshot, audit event, or log.
+    """
+    _require_content(session, content_id)
+
+    claims = list(
+        session.execute(
+            select(Claim.id)
+            .where(Claim.content_id == content_id)
+            .order_by(*_CLAIM_ORDER)
+        ).scalars().all()
+    )
+    claim_count = len(claims)
+
+    bundle_ids = list(
+        session.execute(
+            select(EvidenceBundle.id)
+            .where(EvidenceBundle.claim_id.in_(claims))
+            .order_by(*_EVIDENCE_BUNDLE_ORDER)
+        ).scalars().all()
+    ) if claims else []
+    # Distinct existing bundles in their stable creation order (a bundle is
+    # attached to exactly one claim, so the join already cannot repeat one;
+    # the set keeps the dedup contract explicit and defensive).
+    bundle_ids = list(dict.fromkeys(bundle_ids))
+    bundle_count = len(bundle_ids)
+
+    # Proofs whose target is one of the content's claims or one of the
+    # associated bundles. Revoked proofs are retained, so the raw count
+    # includes them; the qualified signer count excludes them.
+    target_match = or_(
+        and_(
+            Attestation.target_type == signing.TARGET_CLAIM,
+            Attestation.target_id.in_(claims),
+        ),
+        and_(
+            Attestation.target_type == signing.TARGET_EVIDENCE_BUNDLE,
+            Attestation.target_id.in_(bundle_ids),
+        ),
+    )
+    attestation_count = (
+        session.execute(
+            select(func.count()).select_from(Attestation).where(target_match)
+        ).scalar_one()
+        if (claims or bundle_ids)
+        else 0
+    )
+
+    not_revoked = ~exists().where(
+        AttestationRevocation.attestation_id == Attestation.id
+    )
+    signer_ids = (
+        session.execute(
+            select(Attestation.signer_actor_id)
+            .where(target_match, not_revoked)
+            .distinct()
+        ).scalars().all()
+        if (claims or bundle_ids)
+        else []
+    )
+    qualified_signer_count = len(set(signer_ids))
+
+    if claim_count == 0:
+        coverage_status = CONTENT_EVIDENCE_COVERAGE_UNCOVERED
+    elif qualified_signer_count == 0:
+        coverage_status = CONTENT_EVIDENCE_COVERAGE_PARTIAL
+    else:
+        coverage_status = CONTENT_EVIDENCE_COVERAGE_COVERED
+
+    return {
+        "content_id": content_id,
+        "claim_count": claim_count,
+        "bundle_count": bundle_count,
+        "attestation_count": int(attestation_count),
+        "qualified_signer_count": qualified_signer_count,
+        "coverage_status": coverage_status,
     }
 
 

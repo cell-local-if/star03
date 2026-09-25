@@ -88,6 +88,7 @@ from provenance.schemas import (
     ContentExportResponse,
     ContentExportVerificationCreate,
     ContentExportVerificationResponse,
+    ContentEvidenceCoverageResponse,
     ContentLineageItem,
     ContentLineageResponse,
     ContentPageResponse,
@@ -1821,6 +1822,44 @@ def get_content_export(
             )
             for claim in claims
         ],
+    )
+
+
+@router.get(
+    "/contents/{content_id}/evidence-coverage",
+)
+async def get_content_evidence_coverage(
+    content_id: str, request: Request, session: DbSession
+) -> Response:
+    # Read-only content evidence-coverage summary. The request has no body
+    # and no query parameters: any body bytes (including whitespace or
+    # malformed JSON) and any query parameter (unknown, blank, or repeated)
+    # are a 422 validation_error before the content is read, so a malformed
+    # request never produces a partial summary.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # A blank/whitespace-only path identifier is a client validation error
+    # rather than a lookup of the empty/trimmed string (which would 404).
+    if not content_id.strip():
+        raise _query_validation_error(
+            "content_id", "content_id must not be empty", "value_error"
+        )
+    # Strictly read-only: counts come from the existing content, its direct
+    # claims, the bundles attached to those claims, and the attestations and
+    # revocation records of those targets only. No lineage is traversed and
+    # no resource, snapshot, audit event, or log is written. An unknown
+    # content id is the existing content_not_found 404. Raw content, claim
+    # payloads, evidence bytes, keys, and raw signatures never enter the
+    # view.
+    result = service.get_content_evidence_coverage(session, content_id)
+    return _compact_json_response(
+        ContentEvidenceCoverageResponse(**result), status.HTTP_200_OK
     )
 
 
