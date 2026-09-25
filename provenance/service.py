@@ -3004,6 +3004,71 @@ def list_content_relations(
     return list(session.execute(stmt).scalars().all())
 
 
+DEFAULT_CONTENT_RELATIONS_LIMIT = 50
+MIN_CONTENT_RELATIONS_LIMIT = 1
+MAX_CONTENT_RELATIONS_LIMIT = 100
+
+
+def list_content_relations_page(
+    session: Session,
+    relation_id: str | None = None,
+    content_id: str | None = None,
+    parent_content_id: str | None = None,
+    relation_type: str | None = None,
+    from_dt=None,
+    to_dt=None,
+    limit: int = DEFAULT_CONTENT_RELATIONS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[ContentRelation], int]:
+    """Return one relation page and the filtered total, both in SQL.
+
+    ``relation_id``, ``content_id``, and ``parent_content_id`` are
+    non-empty, case- and whitespace-sensitive exact matches;
+    ``relation_type`` is one of the two supported relation literals; all
+    combine as logical AND and ``None`` means unfiltered. ``from_dt``/
+    ``to_dt`` are timezone-aware UTC instants applied as inclusive
+    ``created_at`` bounds. Filter values are never resolved for existence,
+    so an unknown id or type value is an empty result rather than a missing
+    resource.
+
+    The total is a SQL ``COUNT`` over the filtered set (independent of the
+    page) and the page is a SQL ``LIMIT``/``OFFSET`` window of that set in
+    stable creation order (``created_at`` then the monotonic ``seq``
+    tiebreaker), so ordering and paging never depend on in-memory sorting
+    and stay stable across restarts. The retrieval is strictly read-only:
+    it writes no relation, content, or audit event.
+    """
+    filters = []
+    if relation_id is not None:
+        filters.append(ContentRelation.id == relation_id)
+    if content_id is not None:
+        filters.append(ContentRelation.content_id == content_id)
+    if parent_content_id is not None:
+        filters.append(ContentRelation.parent_content_id == parent_content_id)
+    if relation_type is not None:
+        filters.append(ContentRelation.relation_type == relation_type)
+    if from_dt is not None:
+        filters.append(ContentRelation.created_at >= from_dt)
+    if to_dt is not None:
+        filters.append(ContentRelation.created_at <= to_dt)
+
+    total = session.execute(
+        select(func.count())
+        .select_from(ContentRelation)
+        .where(*filters)
+    ).scalar_one()
+
+    page_stmt = (
+        select(ContentRelation)
+        .where(*filters)
+        .order_by(*_CONTENT_RELATION_ORDER)
+        .limit(limit)
+        .offset(offset)
+    )
+    page = list(session.execute(page_stmt).scalars().all())
+    return page, int(total)
+
+
 # Lineage traversal directions.
 LINEAGE_ANCESTORS = "ancestors"
 LINEAGE_DESCENDANTS = "descendants"

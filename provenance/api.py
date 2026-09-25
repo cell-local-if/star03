@@ -95,6 +95,7 @@ from provenance.schemas import (
     ContentPageResponse,
     ContentRelationCreate,
     ContentRelationListResponse,
+    ContentRelationPageResponse,
     ContentRelationResponse,
     ContentResponse,
     EvidenceBundleCreate,
@@ -466,6 +467,186 @@ def list_content_relations(
         items=[ContentRelationResponse.model_validate(item) for item in items],
         count=len(items),
     )
+
+
+_CONTENT_RELATIONS_PARAMS = frozenset(
+    {
+        "id",
+        "content_id",
+        "parent_content_id",
+        "relation_type",
+        "from",
+        "to",
+        "limit",
+        "cursor",
+    }
+)
+
+
+@router.get("/content-relations")
+async def list_content_relations_global(
+    request: Request, session: DbSession
+) -> Response:
+    # Global read-only search over the immutable lineage relations. The GET
+    # request body must be empty: carrying any bytes (even whitespace,
+    # arbitrary bytes, or malformed JSON) is a 422 validated before any query
+    # parameter, cursor, or relation record is read. Raw multi-values are
+    # inspected deliberately: a repeated scalar is rejected instead of
+    # silently taking the last value, undeclared parameters are rejected
+    # rather than ignored, and a blank filter/limit is never coerced to a
+    # default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _CONTENT_RELATIONS_PARAMS
+    if unknown:
+        # A typo (e.g. ``relation_id``) never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    relation_id = _parse_nonempty_filter(raw, "id")
+    content_id = _parse_nonempty_filter(raw, "content_id")
+    parent_content_id = _parse_nonempty_filter(raw, "parent_content_id")
+
+    relation_type = _parse_once(raw, "relation_type")
+    if relation_type is not None and relation_type not in (
+        RELATION_VERSION_OF,
+        RELATION_DERIVED_FROM,
+    ):
+        # Covers blank/whitespace values and any spelling other than the two
+        # README relation literals; no value is ever normalized.
+        raise _query_validation_error(
+            "relation_type",
+            "relation_type must be 'version_of' or 'derived_from'",
+            "value_error",
+        )
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CONTENT_RELATIONS_LIMIT,
+        service.MIN_CONTENT_RELATIONS_LIMIT,
+        service.MAX_CONTENT_RELATIONS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.content_relations_cursor_secret,
+                pagination.CONTENT_RELATIONS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered; the time claim canonicalizes "Z" and
+        # "+00:00" to the same instant) and the effective limit must match
+        # exactly. A cursor minted by another endpoint family already fails
+        # decoding above.
+        expected = {
+            "relation_id": relation_id,
+            "content_id": content_id,
+            "parent_content_id": parent_content_id,
+            "relation_type": relation_type,
+            "from": _audit_time_claim(from_dt),
+            "to": _audit_time_claim(to_dt),
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no relation, content, resource,
+    # or audit event. The total is a SQL COUNT over the filtered set
+    # (covering every page) and the page is a SQL LIMIT/OFFSET window
+    # ordered in SQL by created_at then the monotonic insertion sequence,
+    # so ordering and paging survive a restart. Filter values are never
+    # resolved for existence, so an unknown relation id, content id, or
+    # parent id is an empty collection rather than a 404. Each item is
+    # exactly the relation public view: stable id, both endpoints, the
+    # relation type, and its UTC created_at.
+    page, total = service.list_content_relations_page(
+        session,
+        relation_id,
+        content_id,
+        parent_content_id,
+        relation_type,
+        from_dt,
+        to_dt,
+        page_limit,
+        offset,
+    )
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.content_relations_cursor_secret,
+                pagination.CONTENT_RELATIONS_CURSOR,
+                {
+                    "relation_id": relation_id,
+                    "content_id": content_id,
+                    "parent_content_id": parent_content_id,
+                    "relation_type": relation_type,
+                    "from": _audit_time_claim(from_dt),
+                    "to": _audit_time_claim(to_dt),
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = ContentRelationPageResponse(
+        items=[
+            ContentRelationResponse.model_validate(item) for item in page
+        ],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated by
+    # exactly one newline; members appear as items, count, next_cursor.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 def _lineage_item(content, depth: int):

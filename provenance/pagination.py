@@ -86,6 +86,9 @@ CONTENTS_CURSOR_VERSION = "ct1"
 #: search.
 ATTESTATION_REVOCATIONS_CURSOR_VERSION = "ar1"
 
+#: Marker for cursors that page through the global content-relation search.
+CONTENT_RELATIONS_CURSOR_VERSION = "rl1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -689,6 +692,53 @@ ATTESTATION_REVOCATIONS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_attestation_revocations_claims,
+)
+
+
+def _validate_content_relations_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null) or non-empty strings;
+    # matching is case- and whitespace-sensitive, so the raw value is bound.
+    _optional_nonempty_str(claims, "relation_id")
+    _optional_nonempty_str(claims, "content_id")
+    _optional_nonempty_str(claims, "parent_content_id")
+    # The type filter is absent (null) or one of the two README relation
+    # literals; no other spelling is valid.
+    relation_type = claims["relation_type"]
+    if relation_type is not None and relation_type not in (
+        "version_of",
+        "derived_from",
+    ):
+        raise InvalidCursorError("cursor relation_type is invalid")
+    # The time bounds are absent (null) or canonical RFC 3339 UTC strings.
+    for field in ("from", "to"):
+        value = claims[field]
+        if value is not None and (
+            not isinstance(value, str) or parse_rfc3339_utc(value) is None
+        ):
+            raise InvalidCursorError(f"cursor {field} is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/content-relations``.
+CONTENT_RELATIONS_CURSOR = CursorKind(
+    version=CONTENT_RELATIONS_CURSOR_VERSION,
+    claim_fields=(
+        "relation_id",
+        "content_id",
+        "parent_content_id",
+        "relation_type",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_content_relations_claims,
 )
 
 
