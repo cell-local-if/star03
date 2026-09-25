@@ -3007,6 +3007,48 @@ def get_revocation_impact_import(
     return record
 
 
+# Impact-import receipt search paging bounds.
+DEFAULT_IMPACT_IMPORTS_LIMIT = 50
+MIN_IMPACT_IMPORTS_LIMIT = 1
+MAX_IMPACT_IMPORTS_LIMIT = 100
+
+_IMPACT_IMPORT_ORDER = (
+    ImpactImportRecord.created_at.asc(),
+    ImpactImportRecord.seq.asc(),
+)
+
+
+def list_revocation_impact_imports(
+    session: Session,
+    checkpoint_version: str | None = None,
+    impacts_digest_hex: str | None = None,
+    impact_count: int | None = None,
+) -> list[ImpactImportRecord]:
+    """Return impact-import receipts in stable creation order, optionally filtered.
+
+    ``checkpoint_version`` and ``impacts_digest_hex`` are exact, case- and
+    whitespace-sensitive string matches; ``impact_count`` is an exact
+    non-negative integer match. The three combine as logical AND; an absent
+    filter imposes no restriction. Results follow the receipts' stable
+    creation order (``created_at`` with the monotonic ``seq`` tiebreaker).
+    The function is strictly read-only: it writes no resource and no audit
+    event.
+    """
+    stmt = select(ImpactImportRecord)
+    if checkpoint_version is not None:
+        stmt = stmt.where(
+            ImpactImportRecord.checkpoint_version == checkpoint_version
+        )
+    if impacts_digest_hex is not None:
+        stmt = stmt.where(
+            ImpactImportRecord.impacts_digest_hex == impacts_digest_hex
+        )
+    if impact_count is not None:
+        stmt = stmt.where(ImpactImportRecord.impact_count == impact_count)
+    stmt = stmt.order_by(*_IMPACT_IMPORT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 # Exchange-import receipt search paging bounds.
 DEFAULT_EXCHANGE_IMPORTS_LIMIT = 50
 MIN_EXCHANGE_IMPORTS_LIMIT = 1

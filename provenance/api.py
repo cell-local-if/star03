@@ -63,6 +63,7 @@ from provenance.schemas import (
     RevocationImpactResponse,
     RevocationImpactCheckpointResponse,
     RevocationImpactImportCreate,
+    RevocationImpactImportPageResponse,
     RevocationImpactImportReconciliationResponse,
     RevocationImpactImportResponse,
     RevocationImpactPackageResponse,
@@ -2603,6 +2604,29 @@ def _parse_nonempty_filter(raw, field: str) -> str | None:
     return value
 
 
+_NONNEGATIVE_INTEGER_RE = re.compile(r"[0-9]+")
+
+
+def _parse_nonnegative_int_param(raw, field: str) -> int | None:
+    """Parse an optional non-negative decimal integer filter, at most once."""
+    value = _parse_once(raw, field)
+    if value is None:
+        return None
+    if not value.strip():
+        raise _query_validation_error(
+            field, f"{field} must not be empty", "value_error"
+        )
+    if not _NONNEGATIVE_INTEGER_RE.fullmatch(value):
+        # Signs, decimals, whitespace padding, and non-numeric values are
+        # rejected rather than coerced.
+        raise _query_validation_error(
+            field,
+            f"{field} must be a non-negative integer",
+            "value_error.integer",
+        )
+    return int(value)
+
+
 @router.get(
     "/contents/{content_id}/evidence-bundles",
     response_model=EvidenceBundlePageResponse,
@@ -3357,6 +3381,144 @@ async def import_revocation_impacts(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return _impact_import_response(record)
+
+
+_IMPACT_IMPORTS_PARAMS = frozenset(
+    {
+        "checkpoint_version",
+        "impacts_digest_hex",
+        "impact_count",
+        "limit",
+        "cursor",
+    }
+)
+
+
+@router.get("/impact-imports")
+async def list_revocation_impact_imports(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only reviewer search over the registered impact-import receipts.
+    # The GET request body must be empty: carrying any bytes (even
+    # whitespace or malformed JSON) is a 422 validated before any parameter
+    # or receipt is read. Raw multi-values are inspected deliberately: a
+    # repeated scalar is rejected instead of silently taking the last value,
+    # undeclared parameters are rejected rather than ignored, and a blank
+    # filter/limit is never coerced to a default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _IMPACT_IMPORTS_PARAMS
+    if unknown:
+        # A typo (e.g. ``checkpoint_versions``) never silently changes the
+        # search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    checkpoint_version = _parse_nonempty_filter(raw, "checkpoint_version")
+    impacts_digest_hex = _parse_nonempty_filter(raw, "impacts_digest_hex")
+    impact_count = _parse_nonnegative_int_param(raw, "impact_count")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_IMPACT_IMPORTS_LIMIT,
+        service.MIN_IMPACT_IMPORTS_LIMIT,
+        service.MAX_IMPACT_IMPORTS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.impact_imports_cursor_secret,
+                pagination.IMPACT_IMPORTS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered) and the effective limit must match
+        # exactly. A cursor minted by another endpoint family already fails
+        # decoding above.
+        expected = {
+            "checkpoint_version": checkpoint_version,
+            "impacts_digest_hex": impacts_digest_hex,
+            "impact_count": impact_count,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no receipt, resource, or audit
+    # event. The total is the filtered count covering every page. Filter
+    # values are never resolved for existence, so an unknown or nonexistent
+    # value is an empty collection rather than a 404. Each item is exactly
+    # the single-receipt public view; the impacts array and every raw
+    # impact, signature, payload, content, or evidence datum are never
+    # persisted and so can never be echoed.
+    items = service.list_revocation_impact_imports(
+        session, checkpoint_version, impacts_digest_hex, impact_count
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.impact_imports_cursor_secret,
+                pagination.IMPACT_IMPORTS_CURSOR,
+                {
+                    "checkpoint_version": checkpoint_version,
+                    "impacts_digest_hex": impacts_digest_hex,
+                    "impact_count": impact_count,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = RevocationImpactImportPageResponse(
+        items=[_impact_import_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated by
+    # exactly one newline; members appear as items, count, next_cursor.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 @router.get(
@@ -4513,28 +4675,6 @@ _CHECKPOINT_IMPORTS_PARAMS = frozenset(
     }
 )
 
-_NONNEGATIVE_INTEGER_RE = re.compile(r"[0-9]+")
-
-
-def _parse_event_count_param(raw, field: str) -> int | None:
-    """Parse an optional non-negative decimal integer filter, at most once."""
-    value = _parse_once(raw, field)
-    if value is None:
-        return None
-    if not value.strip():
-        raise _query_validation_error(
-            field, f"{field} must not be empty", "value_error"
-        )
-    if not _NONNEGATIVE_INTEGER_RE.fullmatch(value):
-        # Signs, decimals, whitespace padding, and non-numeric values are
-        # rejected rather than coerced.
-        raise _query_validation_error(
-            field,
-            f"{field} must be a non-negative integer",
-            "value_error.integer",
-        )
-    return int(value)
-
 
 @router.get(
     "/audit-events/checkpoint-imports",
@@ -4566,7 +4706,7 @@ def list_audit_events_checkpoint_imports(
 
     checkpoint_version = _parse_nonempty_filter(raw, "checkpoint_version")
     events_digest_hex = _parse_nonempty_filter(raw, "events_digest_hex")
-    event_count = _parse_event_count_param(raw, "event_count")
+    event_count = _parse_nonnegative_int_param(raw, "event_count")
 
     page_limit = _parse_int_param(
         raw,

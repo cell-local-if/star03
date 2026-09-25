@@ -96,6 +96,9 @@ CONTENT_COVERAGE_SEARCH_CURSOR_VERSION = "cc1"
 #: search.
 REVOCATION_IMPACTS_CURSOR_VERSION = "ri1"
 
+#: Marker for cursors that page through impact-import receipts.
+IMPACT_IMPORTS_CURSOR_VERSION = "ii1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -822,6 +825,41 @@ REVOCATION_IMPACTS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_revocation_impacts_claims,
+)
+
+
+def _validate_impact_imports_claims(claims: dict[str, Any]) -> None:
+    # The exact-match string filters are either absent (null) or non-empty
+    # strings; matching is case- and whitespace-sensitive, so the raw value
+    # is bound. The impact-count filter is absent (null) or a non-negative
+    # integer.
+    _optional_nonempty_str(claims, "checkpoint_version")
+    _optional_nonempty_str(claims, "impacts_digest_hex")
+    impact_count = claims["impact_count"]
+    if impact_count is not None and (
+        not _is_int(impact_count) or impact_count < 0
+    ):
+        raise InvalidCursorError("cursor impact_count is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/impact-imports``.
+IMPACT_IMPORTS_CURSOR = CursorKind(
+    version=IMPACT_IMPORTS_CURSOR_VERSION,
+    claim_fields=(
+        "checkpoint_version",
+        "impacts_digest_hex",
+        "impact_count",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_impact_imports_claims,
 )
 
 
