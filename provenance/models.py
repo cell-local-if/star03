@@ -50,6 +50,7 @@ EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
 EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 EVENT_AUDIT_CHECKPOINT_IMPORTED = "audit.checkpoint_imported"
+EVENT_REVOCATION_IMPACT_IMPORTED = "revocation_impact.imported"
 EVENT_CONTENT_EXPORT_JOB_CREATED = "content_export_job.created"
 EVENT_CONTENT_EXPORT_JOB_RUN = "content_export_job.run"
 EVENT_ACTOR_TRUST_POLICY_CREATED = "actor_trust_policy.created"
@@ -804,6 +805,60 @@ class CheckpointImportRecord(Base):
     event_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
     #: The SHA-256 events digest the received event array was verified against.
     events_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+
+class RevocationImpactImportRecord(Base):
+    """An immutable receipt for one offline-verified revocation-impact checkpoint.
+
+    The record is the controlled-import counterpart of the stateless
+    impact-verification route: a checkpoint whose digest matches the
+    canonical SHA-256 of the received impacts array under the existing
+    checkpoint rules, with exactly the claimed impact count, is registered
+    exactly once. The receipt stores only the receiving identity -- the
+    fixed checkpoint version, the impact count, and the impacts digest --
+    never the impacts array itself and never any raw impact data; the full
+    impacts must be re-presented on a retry. Verification never depends on
+    whether the described revocations exist locally (they are never
+    created, modified, or queried), so no foreign keys and no local
+    revocation lookup participate in the decision.
+
+    Records are append-only and immutable; there is deliberately no update
+    or delete path. The identity triple is unique, so a retried submission
+    for the same checkpoint returns the original record without another
+    audit event.
+    """
+
+    __tablename__ = "revocation_impact_imports"
+    __table_args__ = (
+        UniqueConstraint(
+            "checkpoint_version",
+            "impact_count",
+            "impacts_digest_hex",
+            name="uq_impact_imports_identity",
+        ),
+        Index(
+            "ix_impact_imports_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable receipt identifier ("rii_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: Fixed checkpoint format version committed to by the request.
+    checkpoint_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The number of impacts the checkpoint commits to.
+    impact_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: The SHA-256 impacts digest the received impacts array was verified
+    #: against.
+    impacts_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, nullable=False, default=utc_now
     )

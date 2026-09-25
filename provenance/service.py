@@ -35,6 +35,7 @@ from provenance.errors import (
     EvidenceBundleExchangeImportNotFoundError,
     EvidenceBundleNotFoundError,
     ProtectedAccessValidationError,
+    RevocationImpactImportNotFoundError,
     UnknownActorError,
 )
 from provenance.models import (
@@ -61,6 +62,7 @@ from provenance.models import (
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
+    EVENT_REVOCATION_IMPACT_IMPORTED,
     Actor,
     ActorTrustPolicy,
     Attestation,
@@ -77,6 +79,7 @@ from provenance.models import (
     ContentRelation,
     EvidenceBundle,
     ExchangeImportRecord,
+    RevocationImpactImportRecord,
 )
 from provenance.schemas import (
     ActorCreate,
@@ -95,6 +98,7 @@ from provenance.schemas import (
     EvidenceBundleExchangeImportCreate,
     EvidenceBundleCreate,
     EvidenceBundleImportCreate,
+    RevocationImpactImportCreate,
 )
 from provenance.time_utils import utc_now
 
@@ -2845,6 +2849,100 @@ def get_audit_checkpoint_import(
     ).scalar_one_or_none()
     if record is None:
         raise AuditCheckpointImportNotFoundError(import_id)
+    return record
+
+
+def _impact_import_identity_select(
+    checkpoint_version: str, impact_count: int, impacts_digest_hex: str
+):
+    return select(RevocationImpactImportRecord).where(
+        RevocationImpactImportRecord.checkpoint_version == checkpoint_version,
+        RevocationImpactImportRecord.impact_count == impact_count,
+        RevocationImpactImportRecord.impacts_digest_hex == impacts_digest_hex,
+    )
+
+
+def create_revocation_impact_import(
+    session: Session,
+    payload: RevocationImpactImportCreate,
+) -> tuple[RevocationImpactImportRecord, bool]:
+    """Register one offline-verified impact checkpoint, returning ``(record, created)``.
+
+    The caller has already verified the checkpoint: the request parses under
+    the existing checkpoint structure, its impact count matches the array,
+    and the impacts digest matches the canonical SHA-256 of the received
+    impacts array exactly as received. This function performs no such
+    verification and no local-revocation lookup: the described impacts are
+    never queried, created, or modified, so whether they exist locally
+    never changes the outcome.
+
+    The receiving identity is ``(checkpoint_version, impact_count,
+    impacts_digest_hex)``; the impacts array itself is never stored. A
+    first submission writes the receipt row and its
+    ``revocation_impact.imported`` audit event in a single transaction. A
+    retried submission for the same identity returns the existing record
+    with ``created=False`` and writes nothing -- no second row and no
+    second audit event.
+    """
+    checkpoint = payload.checkpoint
+    checkpoint_version = checkpoint.checkpoint_version
+    impact_count = checkpoint.impact_count
+    impacts_digest_hex = checkpoint.impacts_digest_hex
+
+    existing = session.execute(
+        _impact_import_identity_select(
+            checkpoint_version, impact_count, impacts_digest_hex
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    while True:
+        record = RevocationImpactImportRecord(
+            id=ids.revocation_impact_import_id(
+                checkpoint_version, impact_count, impacts_digest_hex
+            ),
+            checkpoint_version=checkpoint_version,
+            impact_count=impact_count,
+            impacts_digest_hex=impacts_digest_hex,
+        )
+        session.add(record)
+        session.add(
+            AuditEvent(
+                event_type=EVENT_REVOCATION_IMPACT_IMPORTED,
+                resource_id=record.id,
+            )
+        )
+        try:
+            session.commit()
+        except IntegrityError:
+            # A concurrent import registered this identity first: roll back
+            # and return that record instead of duplicating it or writing a
+            # second audit event.
+            session.rollback()
+            raced = session.execute(
+                _impact_import_identity_select(
+                    checkpoint_version, impact_count, impacts_digest_hex
+                )
+            ).scalar_one_or_none()
+            if raced is None:  # pragma: no cover - defensive
+                raise
+            return raced, False
+        session.refresh(record)
+        return record, True
+
+
+def get_revocation_impact_import(
+    session: Session, import_id: str
+) -> RevocationImpactImportRecord:
+    """Return an impact-import receipt by id or raise the 404 domain error."""
+    record = session.execute(
+        select(RevocationImpactImportRecord).where(
+            RevocationImpactImportRecord.id == import_id
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        raise RevocationImpactImportNotFoundError(import_id)
     return record
 
 

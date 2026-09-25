@@ -1521,6 +1521,59 @@ class RevocationImpactVerificationResponse(BaseModel):
     computed_digest_hex: str | None = None
 
 
+class RevocationImpactImportCreate(RevocationImpactVerificationCreate):
+    """A controlled import of one offline-verified impact checkpoint.
+
+    Exactly the existing two-member verification structure: ``checkpoint``
+    carries the claimed four-field impact checkpoint and ``impacts``
+    carries the impact sequence it commits to, with exactly
+    ``checkpoint.impact_count`` elements. The digest match itself is
+    enforced at the route, over the raw received JSON so array order and
+    datetime spellings participate exactly as on the stateless
+    verification route; a mismatch is a 422 and writes nothing.
+
+    Registration is a pure function of the request body that never
+    resolves any revocation, attestation, or resource id against local
+    state: the described impacts are not created, modified, or queried,
+    and they need not exist locally.
+    """
+
+
+class RevocationImpactImportResponse(BaseModel):
+    """The public immutable receipt for one registered impact import.
+
+    Exactly the stable ``rii_`` receipt id, the three receiving-identity
+    fields (checkpoint version, impact count, impacts digest), and the UTC
+    ``received_at`` instant. The impacts array itself is deliberately not
+    part of the receipt: it is neither copied into the record nor echoed
+    here.
+    """
+
+    id: str
+    checkpoint_version: str
+    impact_count: int
+    impacts_digest_hex: str
+    received_at: datetime
+
+
+class RevocationImpactImportReconResponse(BaseModel):
+    """A read-only reconciliation of one impact-import receipt with local state.
+
+    Exactly three members: the receipt's ``import_id``, the four-field
+    checkpoint computed over the current, complete, unfiltered local
+    revocation-impact set under the existing checkpoint rules
+    (``local_checkpoint``), and ``matches`` -- true only when the receipt's
+    ``checkpoint_version``, ``impact_count``, and ``impacts_digest_hex``
+    all equal the corresponding local checkpoint fields. The imported
+    impacts array is never read (it is not persisted) or echoed; no
+    material beyond the receipt identity participates in the verdict.
+    """
+
+    import_id: str
+    local_checkpoint: RevocationImpactCheckpointResponse
+    matches: bool
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.
