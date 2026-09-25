@@ -212,6 +212,25 @@ class ContentExportJobConflictError(DomainError):
         super().__init__(details={"job_id": job_id, "status": status})
 
 
+class ActorTrustPolicyConflictError(DomainError):
+    """A subject naming a threshold different from its existing policy.
+
+    A subject registers at most one immutable policy. Repeating the same
+    subject and threshold is an idempotent ``200``; the same subject with a
+    different threshold is a conflict that writes no policy and no audit
+    event.
+    """
+
+    status_code = 409
+    code = "actor_trust_policy_conflict"
+    message = (
+        "The subject already has an immutable policy with a different threshold."
+    )
+
+    def __init__(self, subject_actor_id: str):
+        super().__init__(details={"subject_actor_id": subject_actor_id})
+
+
 class ClaimSupersessionNotFoundError(DomainError):
     status_code = 404
     code = "claim_supersession_not_found"

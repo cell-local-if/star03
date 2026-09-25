@@ -109,6 +109,9 @@ from provenance.schemas import (
     ExchangeManifestVerificationCreate,
     ExchangeManifestVerificationResponse,
     TrustEvaluationResponse,
+    TrustDecisionResponse,
+    TrustPolicyCreate,
+    TrustPolicyResponse,
 )
 
 router = APIRouter(prefix="/v1")
@@ -2658,6 +2661,139 @@ def evaluate_trust(
         session, target_type, target_id, threshold
     )
     return TrustEvaluationResponse(**result)
+
+
+def _compact_json_response(result, status_code: int = 200) -> Response:
+    """Render a response model as compact UTF-8 JSON with one trailing newline.
+
+    Integral numbers stay integral (no negative zero or non-finite values
+    can be produced from the response models), booleans and null use their
+    JSON literals, and the body is terminated by exactly one newline.
+    """
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(
+        content=body, media_type="application/json", status_code=status_code
+    )
+
+
+def _trust_policy_response(policy) -> TrustPolicyResponse:
+    # The ORM column is ``subject_actor_id``; the wire view names the
+    # subject ``subject_id``.
+    return TrustPolicyResponse(
+        id=policy.id,
+        subject_id=policy.subject_actor_id,
+        threshold=policy.threshold,
+        enabled=policy.enabled,
+        created_at=policy.created_at,
+    )
+
+
+@router.post("/trust-policies")
+async def create_trust_policy(
+    request: Request,
+    payload: TrustPolicyCreate,
+    session: DbSession,
+) -> Response:
+    # Protected write under the same X-PA/X-PT/X-PS contract as the other
+    # protected routes: every credential failure is a 422. The signature
+    # covers the exact bytes on the wire; FastAPI's parsed model is built
+    # from the same cached body, so body_sha256 matches what the client
+    # signed. The caller authenticated by the signature is the policy's
+    # subject.
+    raw_body = await request.body()
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    policy, created = service.create_trust_policy(session, payload, caller)
+    # First registration -> 201; a retried submission for the same subject
+    # and threshold -> 200 with the original immutable policy, no duplicate
+    # row, no new audit event, and no new id. The same subject with a
+    # different threshold is a 409 actor_trust_policy_conflict.
+    return _compact_json_response(
+        _trust_policy_response(policy),
+        status_code=(
+            status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        ),
+    )
+
+
+_TRUST_DECISION_PARAMS = frozenset({"target_type", "target_id"})
+
+
+@router.get("/trust-decisions")
+async def decide_trust(
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # The calling subject's protected authorization decision for one target.
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and blank values are
+    # never coerced. Query validation precedes authentication, so a
+    # malformed request is a 422 rather than the opaque 404 below.
+    raw = request.query_params
+
+    unknown = set(raw) - _TRUST_DECISION_PARAMS
+    if unknown:
+        # A typo never silently changes the decision.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    target_type = _parse_once(raw, "target_type")
+    if target_type is None:
+        raise _query_validation_error(
+            "target_type", "Field required", "value_error.missing"
+        )
+    if target_type not in ATTESTATION_TARGET_TYPES:
+        # Covers missing values, whitespace/blank strings, casing variants,
+        # and anything other than the two literal target types.
+        raise _query_validation_error(
+            "target_type",
+            "target_type must be 'claim' or 'evidence_bundle'",
+            "value_error",
+        )
+
+    target_id = _parse_once(raw, "target_id")
+    if target_id is None:
+        raise _query_validation_error(
+            "target_id", "Field required", "value_error.missing"
+        )
+    if not target_id.strip():
+        # A blank identifier is invalid rather than a lookup of the empty
+        # string (which would merely render as a missing target).
+        raise _query_validation_error(
+            "target_id", "target_id must not be empty", "value_error"
+        )
+
+    # A GET carries no body; the signed body_sha256 is therefore the digest
+    # of zero bytes, exactly as on the other protected read route. Missing
+    # or unauthenticated credentials collapse into the same opaque 404 as a
+    # missing target; malformed credentials stay 422.
+    raw_body = await request.body()
+    subject = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+
+    # Only the calling subject's current policy governs the decision. With
+    # no policy the target is never looked up, so its existence cannot be
+    # revealed; the answer is 200 untrusted/policy_missing with null policy
+    # id and threshold. With a policy, an unknown claim or evidence bundle
+    # is the specific 404 matched by the declared type, and the two target
+    # tables never cross-match. The decision is strictly read-only.
+    result = service.evaluate_trust_decision(
+        session, target_type, target_id, subject
+    )
+    return _compact_json_response(TrustDecisionResponse(**result))
 
 
 _AUDIT_EVENTS_PARAMS = frozenset(

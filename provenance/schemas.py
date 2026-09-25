@@ -1500,6 +1500,88 @@ class TrustEvaluationResponse(BaseModel):
     decision: Literal["trusted", "untrusted"]
 
 
+#: Signer-threshold bounds for a subject's immutable trust policy.
+TRUST_POLICY_MIN_THRESHOLD = 1
+TRUST_POLICY_MAX_THRESHOLD = 100
+
+
+class TrustPolicyCreate(BaseModel):
+    """Protected creation of one subject's immutable signer-threshold policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The subject registering the policy; the authenticated caller must be
+    #: this same actor.
+    subject_id: str = Field(..., min_length=1, max_length=255)
+    #: Plain decimal integer number of distinct qualified signers required
+    #: for a trusted decision. Only an actual JSON integer in 1..100 is
+    #: accepted: no string, float (including ``1.0``), boolean, sign, or
+    #: out-of-range value is coerced or normalized.
+    threshold: int
+
+    @field_validator("subject_id")
+    @classmethod
+    def _subject_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "subject_id")
+
+    @field_validator("threshold", mode="before")
+    @classmethod
+    def _threshold_is_plain_decimal_int(cls, v: Any) -> int:
+        # ``bool`` is an ``int`` subclass in Python but a JSON ``true`` is
+        # never a threshold; reject it explicitly alongside every non-int
+        # JSON type. Nothing is coerced: "1" and 1.0 stay invalid.
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError(
+                "threshold must be a plain decimal integer"
+            )
+        if not (TRUST_POLICY_MIN_THRESHOLD <= v <= TRUST_POLICY_MAX_THRESHOLD):
+            raise ValueError(
+                f"threshold must be between {TRUST_POLICY_MIN_THRESHOLD} and "
+                f"{TRUST_POLICY_MAX_THRESHOLD}"
+            )
+        return v
+
+
+class TrustPolicyResponse(BaseModel):
+    """Public view of one subject's immutable trust policy."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    #: Stable ``atp_`` policy identifier.
+    id: str
+    #: The subject whose decisions this policy governs.
+    subject_id: str
+    #: Distinct qualified signers required for a trusted decision.
+    threshold: int
+    #: Always true: a policy is enabled at creation and never disabled.
+    enabled: bool
+    created_at: datetime
+
+
+class TrustDecisionResponse(BaseModel):
+    """The calling subject's live authorization decision for one target.
+
+    Only the calling subject's current policy is consulted. When the
+    subject has no policy, the target is never looked up and both
+    ``policy_id`` and ``threshold`` are null.
+    """
+
+    target_type: Literal["claim", "evidence_bundle"]
+    target_id: str
+    #: The governing policy id, or null when the subject has no policy.
+    policy_id: str | None
+    #: The governing threshold, or null when the subject has no policy.
+    threshold: int | None
+    #: Distinct verified, non-revoked signing subjects on the exact target.
+    qualified_signer_count: int
+    decision: Literal["trusted", "untrusted"]
+    #: ``threshold_met`` (trusted), ``below_threshold`` (untrusted, policy
+    #: present), or ``policy_missing`` (untrusted, no policy for subject).
+    reason: Literal[
+        "threshold_met", "below_threshold", "policy_missing"
+    ]
+
+
 class AuthenticationKeyRotationCreate(BaseModel):
     # A rotation carries exactly its declared verification material. There
     # is deliberately no field capable of carrying a private key or a raw
