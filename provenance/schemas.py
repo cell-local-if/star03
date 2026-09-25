@@ -1237,6 +1237,55 @@ class AttestationRevocationPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class RevocationImpactResponse(BaseModel):
+    """One revocation's cross-content evidence-coverage impact.
+
+    Reuses the single-revocation public view and adds the content its
+    attested target belongs to, the target type, the proof's signing
+    subject, and the content's qualified-signer count and coverage status
+    immediately before and after this revocation. Counts only; no claim
+    payload, evidence byte, raw signature, or key material can appear.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    attestation_id: str
+    revoker_actor_id: str
+    reason: str
+    created_at: datetime
+    #: The content the revoked proof's target (a claim, or the claim an
+    #: attested evidence bundle is attached to) directly asserts.
+    content_id: str
+    #: The revoked attestation's target type ("claim" or "evidence_bundle").
+    target_type: Literal["claim", "evidence_bundle"]
+    #: The revoked proof's signing subject.
+    signer_actor_id: str
+    #: Distinct qualified signers of the content when only this revocation
+    #: is disregarded (all other revocations stay in effect).
+    before_qualified_signer_count: int
+    #: Distinct qualified signers under the current set of revocations.
+    after_qualified_signer_count: int
+    #: ``before - after``: always 0 (the subject stays qualified through
+    #: another non-revoked proof) or 1 (this revocation removed the
+    #: subject's last qualifying proof).
+    qualified_signer_count_delta: int
+    #: Coverage status of the content immediately before this revocation.
+    before_coverage_status: Literal["uncovered", "partial", "covered"]
+    #: Coverage status of the content immediately after this revocation.
+    after_coverage_status: Literal["uncovered", "partial", "covered"]
+
+
+class RevocationImpactPageResponse(BaseModel):
+    """A cursor-paginated page of revocation-impact views."""
+
+    items: list[RevocationImpactResponse]
+    #: Total number of revocations after filtering, independent of pagination.
+    count: int
+    #: Opaque continuation token; null on the final (or past-the-end) page.
+    next_cursor: str | None = None
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.

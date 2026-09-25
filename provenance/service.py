@@ -1321,6 +1321,244 @@ def list_attestation_revocations_page(
     return page, int(total)
 
 
+# Cross-content revocation-impact search paging bounds.
+DEFAULT_REVOCATION_IMPACTS_LIMIT = 50
+MIN_REVOCATION_IMPACTS_LIMIT = 1
+MAX_REVOCATION_IMPACTS_LIMIT = 100
+
+
+def list_revocation_impacts_page(
+    session: Session,
+    attestation_id: str | None = None,
+    revoker_actor_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+    limit: int = DEFAULT_REVOCATION_IMPACTS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """Return one page of revocation impacts and the filtered total.
+
+    Each result corresponds to one existing revocation record (same
+    filters, logical-AND combination, inclusive ``from``/``to`` UTC bounds,
+    and stable creation order as the plain revocation search) and adds the
+    cross-content evidence-coverage impact of that single revocation:
+
+    * ``content_id`` -- the content the revoked proof's target belongs to:
+      the directly asserted content for a claim target, or the content the
+      bundle's claim asserts for an evidence-bundle target;
+    * ``target_type`` and ``signer_actor_id`` -- the revoked attestation's
+      target type and signing subject;
+    * ``before_qualified_signer_count`` -- distinct signing subjects with a
+      verified non-revoked proof of the content's claims/bundles when only
+      this one revocation is disregarded (every other revocation stays in
+      effect);
+    * ``after_qualified_signer_count`` -- the same count under the current
+      set of revocations, i.e. the content evidence-coverage summary's
+      ``qualified_signer_count``;
+    * ``qualified_signer_count_delta`` -- ``before - after``, always 0 or 1;
+    * ``before_coverage_status``/``after_coverage_status`` -- the content's
+      coverage status (``uncovered``/``partial``/``covered``) immediately
+      before and after this revocation.
+
+    Filter values are never resolved for existence, so an unknown id or
+    reason is an empty result rather than a missing resource. The retrieval
+    is strictly read-only: it writes no resource, snapshot, audit event, or
+    log.
+    """
+    filters = []
+    if attestation_id is not None:
+        filters.append(AttestationRevocation.attestation_id == attestation_id)
+    if revoker_actor_id is not None:
+        filters.append(
+            AttestationRevocation.revoker_actor_id == revoker_actor_id
+        )
+    if reason is not None:
+        filters.append(AttestationRevocation.reason == reason)
+    if from_dt is not None:
+        filters.append(AttestationRevocation.created_at >= from_dt)
+    if to_dt is not None:
+        filters.append(AttestationRevocation.created_at <= to_dt)
+
+    total = session.execute(
+        select(func.count())
+        .select_from(AttestationRevocation)
+        .where(*filters)
+    ).scalar_one()
+
+    page_stmt = (
+        select(AttestationRevocation)
+        .where(*filters)
+        .order_by(*_ATTESTATION_REVOCATION_ORDER)
+        .limit(limit)
+        .offset(offset)
+    )
+    revocations = list(session.execute(page_stmt).scalars().all())
+    if not revocations:
+        return [], int(total)
+
+    # Resolve each page revocation's attestation (target + signing subject).
+    page_attestation_ids = {rev.attestation_id for rev in revocations}
+    att_by_id: dict[str, tuple[str, str, str]] = {}
+    claim_target_ids: set[str] = set()
+    bundle_target_ids: set[str] = set()
+    for att_id, target_type, target_id, signer_actor_id in session.execute(
+        select(
+            Attestation.id,
+            Attestation.target_type,
+            Attestation.target_id,
+            Attestation.signer_actor_id,
+        ).where(Attestation.id.in_(page_attestation_ids))
+    ).all():
+        att_by_id[att_id] = (target_type, target_id, signer_actor_id)
+        if target_type == signing.TARGET_CLAIM:
+            claim_target_ids.add(target_id)
+        elif target_type == signing.TARGET_EVIDENCE_BUNDLE:
+            bundle_target_ids.add(target_id)
+
+    # Map each page attestation's target to its content.
+    content_by_target: dict[tuple[str, str], str] = {}
+    for claim_id, content_id in session.execute(
+        select(Claim.id, Claim.content_id).where(Claim.id.in_(claim_target_ids))
+    ).all():
+        content_by_target[(signing.TARGET_CLAIM, claim_id)] = content_id
+    if bundle_target_ids:
+        # A bundle target reaches the content through the bundle's claim.
+        for bundle_id, content_id in session.execute(
+            select(EvidenceBundle.id, Claim.content_id)
+            .join(Claim, EvidenceBundle.claim_id == Claim.id)
+            .where(EvidenceBundle.id.in_(bundle_target_ids))
+        ).all():
+            content_by_target[
+                (signing.TARGET_EVIDENCE_BUNDLE, bundle_id)
+            ] = content_id
+
+    content_ids = {
+        content_id
+        for target_type, target_id, _ in att_by_id.values()
+        if (content_id := content_by_target.get((target_type, target_id)))
+        is not None
+    }
+    if not content_ids:  # pragma: no cover - defensive against orphan history
+        return [], int(total)
+
+    # Every direct claim of the affected contents (counts and the target set).
+    claim_ids_by_content: dict[str, set[str]] = {
+        content_id: set() for content_id in content_ids
+    }
+    content_by_claim: dict[str, str] = {}
+    for claim_id, content_id in session.execute(
+        select(Claim.id, Claim.content_id).where(
+            Claim.content_id.in_(content_ids)
+        )
+    ).all():
+        claim_ids_by_content[content_id].add(claim_id)
+        content_by_claim[claim_id] = content_id
+
+    # Every distinct bundle attached to those claims (the other target set).
+    content_by_bundle: dict[str, str] = {}
+    for bundle_id, content_id in session.execute(
+        select(EvidenceBundle.id, Claim.content_id)
+        .join(Claim, EvidenceBundle.claim_id == Claim.id)
+        .where(Claim.content_id.in_(content_ids))
+    ).all():
+        content_by_bundle.setdefault(bundle_id, content_id)
+
+    # Every attestation targeting the affected contents' claims or bundles.
+    target_filter = or_(
+        (Attestation.target_type == signing.TARGET_CLAIM)
+        & Attestation.target_id.in_(list(content_by_claim)),
+        (Attestation.target_type == signing.TARGET_EVIDENCE_BUNDLE)
+        & Attestation.target_id.in_(list(content_by_bundle)),
+    )
+    content_attestations: list[tuple[str, str, str]] = []
+    for att_id, target_type, target_id, signer_actor_id in session.execute(
+        select(
+            Attestation.id,
+            Attestation.target_type,
+            Attestation.target_id,
+            Attestation.signer_actor_id,
+        ).where(target_filter)
+    ).all():
+        if target_type == signing.TARGET_CLAIM:
+            resolved = content_by_claim.get(target_id)
+        else:
+            resolved = content_by_bundle.get(target_id)
+        if resolved is not None:
+            content_attestations.append((att_id, resolved, signer_actor_id))
+
+    # How many revocations each such attestation currently carries.
+    revocation_counts: dict[str, int] = {}
+    if content_attestations:
+        all_att_ids = [att_id for att_id, _, _ in content_attestations]
+        for att_id, counted in session.execute(
+            select(
+                AttestationRevocation.attestation_id, func.count()
+            )
+            .where(AttestationRevocation.attestation_id.in_(all_att_ids))
+            .group_by(AttestationRevocation.attestation_id)
+        ).all():
+            revocation_counts[att_id] = int(counted)
+
+    # Current ("after") qualified signers per content: subjects with at
+    # least one attestation carrying no revocation at all.
+    after_signers: dict[str, set[str]] = {
+        content_id: set() for content_id in content_ids
+    }
+    for att_id, content_id, signer_actor_id in content_attestations:
+        if revocation_counts.get(att_id, 0) == 0:
+            after_signers[content_id].add(signer_actor_id)
+
+    results: list[dict] = []
+    for rev in revocations:
+        target_type, target_id, signer_actor_id = att_by_id[rev.attestation_id]
+        content_id = content_by_target.get((target_type, target_id))
+        if content_id is None:  # pragma: no cover - integrity-guaranteed
+            continue
+        after_set = after_signers[content_id]
+        after_count = len(after_set)
+        # "Before" disregards only this revocation: its attestation
+        # requalifies its signer precisely when it carries no other
+        # revocation and the signer is not already qualified otherwise.
+        sole_revocation = (
+            revocation_counts.get(rev.attestation_id, 0) == 1
+        )
+        requalified = sole_revocation and signer_actor_id not in after_set
+        before_count = after_count + (1 if requalified else 0)
+
+        claim_count = len(claim_ids_by_content[content_id])
+        after_status = (
+            COVERAGE_UNCOVERED
+            if claim_count == 0
+            else COVERAGE_COVERED
+            if after_count >= 1
+            else COVERAGE_PARTIAL
+        )
+        before_status = (
+            COVERAGE_UNCOVERED
+            if claim_count == 0
+            else COVERAGE_COVERED
+            if before_count >= 1
+            else COVERAGE_PARTIAL
+        )
+
+        results.append(
+            {
+                "revocation": rev,
+                "content_id": content_id,
+                "target_type": target_type,
+                "signer_actor_id": signer_actor_id,
+                "before_qualified_signer_count": before_count,
+                "after_qualified_signer_count": after_count,
+                "qualified_signer_count_delta": before_count - after_count,
+                "before_coverage_status": before_status,
+                "after_coverage_status": after_status,
+            }
+        )
+    return results, int(total)
+
+
+
 def _grant_identity_select(payload: AttestationAccessGrantCreate):
     return select(AttestationAccessGrant).where(
         AttestationAccessGrant.attestation_id == payload.attestation_id,
