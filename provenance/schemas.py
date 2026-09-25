@@ -1237,6 +1237,64 @@ class AttestationRevocationPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class RevocationImpactResponse(BaseModel):
+    """One revocation's cross-content evidence-coverage impact.
+
+    The item reuses the existing revocation public view (``id``,
+    ``attestation_id``, ``revoker_actor_id``, ``reason``, UTC
+    ``created_at``) and adds the content its revoked proof belongs to (the
+    content directly asserted by the attestation's target claim), the
+    attestation target type and signing subject, and the qualified-signer
+    count and coverage status of that content immediately after the
+    revocation and immediately before it. The "before" counts ignore only
+    this one revocation (every other revocation still applies), so the
+    signer-count delta is always zero or one. No raw signature, key,
+    payload, or byte is ever carried.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    # --- Existing revocation public view ---------------------------------
+    id: str
+    attestation_id: str
+    revoker_actor_id: str
+    reason: str
+    created_at: datetime
+    # --- Content association of the revoked proof ------------------------
+    #: The content the revoked attestation's target belongs to (the claim's
+    #: content for a claim target; the content of the bundle's claim for a
+    #: bundle target).
+    content_id: str
+    #: The revoked attestation's target type: "claim" or "evidence_bundle".
+    target_type: Literal["claim", "evidence_bundle"]
+    #: The signing subject of the revoked attestation.
+    signer_actor_id: str
+    # --- Coverage immediately after the revocation ------------------------
+    #: Distinct verified non-revoked signers of the content under the current
+    #: evidence-coverage summary rules.
+    qualified_signer_count_after: int
+    #: ``uncovered``/``partial``/``covered`` status after the revocation.
+    coverage_status_after: Literal["uncovered", "partial", "covered"]
+    # --- Coverage immediately before the revocation -----------------------
+    #: Distinct verified signers of the content when only this one revocation
+    #: is ignored; every other revocation still applies.
+    qualified_signer_count_before: int
+    #: Coverage status with only this revocation ignored.
+    coverage_status_before: Literal["uncovered", "partial", "covered"]
+    #: ``before - after``; always zero or one.
+    qualified_signer_count_delta: int
+
+
+class RevocationImpactPageResponse(BaseModel):
+    """A cursor-paginated page of revocation impact items."""
+
+    items: list[RevocationImpactResponse]
+    #: Total number of impact items after filtering, independent of pagination.
+    count: int
+    #: Opaque continuation token; null on the final (or past-the-end) page.
+    next_cursor: str | None = None
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.

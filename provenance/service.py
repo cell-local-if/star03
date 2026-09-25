@@ -1321,6 +1321,233 @@ def list_attestation_revocations_page(
     return page, int(total)
 
 
+# Revocation-impact search paging bounds.
+DEFAULT_REVOCATION_IMPACTS_LIMIT = 50
+MIN_REVOCATION_IMPACTS_LIMIT = 1
+MAX_REVOCATION_IMPACTS_LIMIT = 100
+
+
+def list_revocation_impacts_page(
+    session: Session,
+    attestation_id: str | None = None,
+    revoker_actor_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+    limit: int = DEFAULT_REVOCATION_IMPACTS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """Return one page of cross-content revocation impacts plus the total.
+
+    The filtered set, ordering, and total are exactly those of
+    :func:`list_attestation_revocations_page` (stable revocation creation
+    order); each page row is enriched with the content the revoked proof
+    belongs to, its target type and signing subject, and the content's
+    qualified-signer count and coverage status after the revocation and
+    before it.
+
+    Counts follow the content evidence-coverage summary caliber: distinct
+    signing actors with a verified, non-revoked attestation targeting a
+    claim that directly asserts the content or a bundle attached to such a
+    claim. The "after" counts apply every stored revocation; the "before"
+    counts ignore only the page row's own revocation while every other
+    revocation still applies, so the before/after delta is always zero or
+    one. Coverage statuses use the same ``uncovered``/``partial``/``covered``
+    rules as the summary. Strictly read-only.
+    """
+    page, total = list_attestation_revocations_page(
+        session,
+        attestation_id,
+        revoker_actor_id,
+        reason,
+        from_dt,
+        to_dt,
+        limit,
+        offset,
+    )
+    if not page:
+        return [], total
+
+    # The revoked attestations (foreign keys guarantee they exist).
+    page_attestation_ids = list({rev.attestation_id for rev in page})
+    attestations = {
+        att.id: att
+        for att in session.execute(
+            select(Attestation).where(Attestation.id.in_(page_attestation_ids))
+        )
+        .scalars()
+        .all()
+    }
+
+    # Resolve the impacted content of each revoked proof: directly for a
+    # claim target, through the bundle's claim for a bundle target.
+    claim_target_ids = {
+        att.target_id
+        for att in attestations.values()
+        if att.target_type == signing.TARGET_CLAIM
+    }
+    bundle_target_ids = {
+        att.target_id
+        for att in attestations.values()
+        if att.target_type == signing.TARGET_EVIDENCE_BUNDLE
+    }
+    claim_content: dict[str, str] = {}
+    if claim_target_ids:
+        claim_content = dict(
+            session.execute(
+                select(Claim.id, Claim.content_id).where(
+                    Claim.id.in_(claim_target_ids)
+                )
+            ).all()
+        )
+    bundle_claim: dict[str, str] = {}
+    if bundle_target_ids:
+        bundle_claim = dict(
+            session.execute(
+                select(EvidenceBundle.id, EvidenceBundle.claim_id).where(
+                    EvidenceBundle.id.in_(bundle_target_ids)
+                )
+            ).all()
+        )
+        missing = set(bundle_claim.values()) - set(claim_content)
+        if missing:
+            for claim_id, content_id in session.execute(
+                select(Claim.id, Claim.content_id).where(Claim.id.in_(missing))
+            ).all():
+                claim_content[claim_id] = content_id
+
+    content_of_attestation: dict[str, str] = {}
+    for att in attestations.values():
+        if att.target_type == signing.TARGET_CLAIM:
+            content_of_attestation[att.id] = claim_content[att.target_id]
+        else:
+            content_of_attestation[att.id] = claim_content[
+                bundle_claim[att.target_id]
+            ]
+    content_ids = set(content_of_attestation.values())
+
+    # Build the same per-content target maps the coverage summary uses:
+    # claims directly asserting each content, then their distinct bundles.
+    claim_ids_by_content: dict[str, list[str]] = {
+        content_id: [] for content_id in content_ids
+    }
+    content_by_claim: dict[str, str] = {}
+    for claim_id, content_id in session.execute(
+        select(Claim.id, Claim.content_id)
+        .where(Claim.content_id.in_(content_ids))
+        .order_by(*_CLAIM_ORDER)
+    ).all():
+        claim_ids_by_content[content_id].append(claim_id)
+        content_by_claim[claim_id] = content_id
+
+    bundle_ids_by_content: dict[str, list[str]] = {
+        content_id: [] for content_id in content_ids
+    }
+    content_by_bundle: dict[str, str] = {}
+    for bundle_id, content_id in session.execute(
+        select(EvidenceBundle.id, Claim.content_id)
+        .join(Claim, EvidenceBundle.claim_id == Claim.id)
+        .where(Claim.content_id.in_(content_ids))
+        .order_by(*_EVIDENCE_BUNDLE_ORDER)
+    ).all():
+        if bundle_id not in content_by_bundle:
+            content_by_bundle[bundle_id] = content_id
+            bundle_ids_by_content[content_id].append(bundle_id)
+
+    # Every attestation of those targets, grouped back to its content.
+    attestations_by_content: dict[str, list[Attestation]] = {
+        content_id: [] for content_id in content_ids
+    }
+    if content_by_claim or content_by_bundle:
+        target_filter = or_(
+            (Attestation.target_type == signing.TARGET_CLAIM)
+            & Attestation.target_id.in_(list(content_by_claim)),
+            (Attestation.target_type == signing.TARGET_EVIDENCE_BUNDLE)
+            & Attestation.target_id.in_(list(content_by_bundle)),
+        )
+        for att in session.execute(
+            select(Attestation).where(target_filter)
+        ).scalars().all():
+            if att.target_type == signing.TARGET_CLAIM:
+                content_id = content_by_claim.get(att.target_id)
+            else:
+                content_id = content_by_bundle.get(att.target_id)
+            if content_id is not None:
+                attestations_by_content[content_id].append(att)
+
+    # Revocation multiplicity per relevant attestation: zero means the proof
+    # qualifies; the before view treats the page row's own revocation as
+    # absent, so only a proof with exactly one revocation can requalify.
+    relevant_attestation_ids = {
+        att.id
+        for atts in attestations_by_content.values()
+        for att in atts
+    }
+    revocation_counts: dict[str, int] = {}
+    if relevant_attestation_ids:
+        for attestation_id_, revocation_count in session.execute(
+            select(
+                AttestationRevocation.attestation_id, func.count()
+            )
+            .where(AttestationRevocation.attestation_id.in_(
+                relevant_attestation_ids
+            ))
+            .group_by(AttestationRevocation.attestation_id)
+        ).all():
+            revocation_counts[attestation_id_] = int(revocation_count)
+
+    def _coverage_status(claim_count: int, signer_count: int) -> str:
+        if claim_count == 0:
+            return COVERAGE_UNCOVERED
+        if signer_count >= 1:
+            return COVERAGE_COVERED
+        return COVERAGE_PARTIAL
+
+    results: list[dict] = []
+    for revocation in page:
+        revoked_attestation = attestations[revocation.attestation_id]
+        content_id = content_of_attestation[revoked_attestation.id]
+        content_attestations = attestations_by_content[content_id]
+
+        signers_after: set[str] = set()
+        signers_before: set[str] = set()
+        for att in content_attestations:
+            count = revocation_counts.get(att.id, 0)
+            if count == 0:
+                signers_after.add(att.signer_actor_id)
+                signers_before.add(att.signer_actor_id)
+            elif (
+                att.id == revoked_attestation.id
+                and count == 1
+            ):
+                # The before view ignores this one revocation; any other
+                # revocation still disqualifies the proof.
+                signers_before.add(att.signer_actor_id)
+
+        count_after = len(signers_after)
+        count_before = len(signers_before)
+        claim_count = len(claim_ids_by_content[content_id])
+        results.append(
+            {
+                "revocation": revocation,
+                "content_id": content_id,
+                "target_type": revoked_attestation.target_type,
+                "signer_actor_id": revoked_attestation.signer_actor_id,
+                "qualified_signer_count_after": count_after,
+                "qualified_signer_count_before": count_before,
+                "qualified_signer_count_delta": count_before - count_after,
+                "coverage_status_after": _coverage_status(
+                    claim_count, count_after
+                ),
+                "coverage_status_before": _coverage_status(
+                    claim_count, count_before
+                ),
+            }
+        )
+    return results, total
+
+
+
 def _grant_identity_select(payload: AttestationAccessGrantCreate):
     return select(AttestationAccessGrant).where(
         AttestationAccessGrant.attestation_id == payload.attestation_id,
