@@ -1557,6 +1557,16 @@ class RevocationImpactImportResponse(BaseModel):
     received_at: datetime
 
 
+class RevocationImpactImportPageResponse(BaseModel):
+    """A cursor-paginated page of impact-import receipt public views."""
+
+    items: list[RevocationImpactImportResponse]
+    #: Total number of receipts after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class RevocationImpactImportReconciliationResponse(BaseModel):
     """A read-only reconciliation of one impact-import receipt with local state.
 

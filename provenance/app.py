@@ -64,6 +64,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         secrets.token_bytes(32)
     )
     app.state.checkpoint_imports_cursor_secret = secrets.token_bytes(32)
+    app.state.impact_imports_cursor_secret = secrets.token_bytes(32)
     app.state.checkpoint_import_reconciliations_cursor_secret = (
         secrets.token_bytes(32)
     )
