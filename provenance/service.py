@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 from typing import Callable
 
-from sqlalchemy import exists, func, literal_column, or_, select, update as sa_update
+from sqlalchemy import exists, func, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -101,11 +101,11 @@ from provenance.time_utils import utc_now
 # Stable creation order: timestamp first, with the monotonic sequence as a
 # deterministic tiebreaker.
 _CONTENT_ORDER = (Content.created_at.asc(), Content.seq.asc())
-# Actors predate the monotonic ``seq`` surrogate used by the other tables:
-# their persistent insertion order is the database rowid (stable across
-# restarts on the SQLite target, and actors are never deleted or VACUUMed),
-# which breaks same-timestamp ties without a schema migration.
-_ACTOR_ORDER = (Actor.created_at.asc(), literal_column("rowid").asc())
+# Actors carry an explicit, migrated persistence-order column: timestamp
+# first, with ``display_seq`` (dense in original insertion order) breaking
+# same-timestamp ties entirely in SQL. The ordering is stable across restarts
+# and independent of any in-memory state.
+_ACTOR_ORDER = (Actor.created_at.asc(), Actor.display_seq.asc())
 _CLAIM_ORDER = (Claim.created_at.asc(), Claim.seq.asc())
 _CLAIM_SUPERSESSION_ORDER = (
     ClaimSupersession.created_at.asc(),
@@ -173,31 +173,49 @@ MIN_ACTORS_LIMIT = 1
 MAX_ACTORS_LIMIT = 100
 
 
-def list_actors(
+def list_actors_page(
     session: Session,
     actor_id: str | None = None,
     name: str | None = None,
     actor_type: str | None = None,
-) -> list[Actor]:
-    """Return actors in stable creation order, optionally exact-filtered.
+    limit: int = DEFAULT_ACTORS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[Actor], int]:
+    """Return one actor page and the filtered total, both computed in SQL.
 
     ``actor_id``, ``name``, and ``actor_type`` are non-empty, case- and
     whitespace-sensitive exact matches that combine as logical AND; ``None``
     means unfiltered. Filter values are never resolved for existence, so an
     unknown id/name/type is an empty result rather than a missing resource.
-    Results follow stable creation order (``created_at`` with the persistent
-    rowid tiebreaker). The retrieval is strictly read-only: it writes no
-    actor, resource, or audit event.
+
+    The total is a SQL ``COUNT`` over the filtered set (independent of the
+    page) and the page is a SQL ``LIMIT``/``OFFSET`` window of that set in
+    stable creation order (``created_at`` then the explicit
+    ``display_seq``), so ordering and paging never depend on in-memory
+    sorting. The retrieval is strictly read-only: it writes no actor,
+    migration record, resource, or audit event.
     """
-    stmt = select(Actor)
+    filters = []
     if actor_id is not None:
-        stmt = stmt.where(Actor.id == actor_id)
+        filters.append(Actor.id == actor_id)
     if name is not None:
-        stmt = stmt.where(Actor.name == name)
+        filters.append(Actor.name == name)
     if actor_type is not None:
-        stmt = stmt.where(Actor.type == actor_type)
-    stmt = stmt.order_by(*_ACTOR_ORDER)
-    return list(session.execute(stmt).scalars().all())
+        filters.append(Actor.type == actor_type)
+
+    total = session.execute(
+        select(func.count()).select_from(Actor).where(*filters)
+    ).scalar_one()
+
+    page_stmt = (
+        select(Actor)
+        .where(*filters)
+        .order_by(*_ACTOR_ORDER)
+        .limit(limit)
+        .offset(offset)
+    )
+    page = list(session.execute(page_stmt).scalars().all())
+    return page, int(total)
 
 
 def create_content(

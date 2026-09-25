@@ -20,6 +20,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -80,6 +81,9 @@ class Actor(Base):
     """A provenance subject (person, organization, device, software, ...)."""
 
     __tablename__ = "actors"
+    __table_args__ = (
+        Index("ix_actors_created_order", "created_at", "display_seq"),
+    )
 
     #: Client-supplied stable identifier.
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
@@ -87,6 +91,13 @@ class Actor(Base):
     type: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, nullable=False, default=utc_now
+    )
+    #: Explicit persistence order, dense from 1 in original insertion order.
+    #: Backfilled from SQLite rowid for pre-existing actors and stamped by an
+    #: AFTER INSERT trigger for new ones; breaks same-created_at ties in SQL.
+    #: Never part of the public view.
+    display_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
     )
 
     contents: Mapped[list["Content"]] = relationship(

@@ -213,13 +213,18 @@ async def list_actors(request: Request, session: DbSession) -> Response:
             )
         offset = claims["offset"]
 
-    # Strictly read-only: the retrieval writes no actor, resource, or audit
-    # event. Filter values are never resolved for existence, so an unknown or
-    # nonexistent id/name/type is an empty collection rather than a 404. The
-    # actor public view carries only id/name/type/created_at: no private key,
-    # raw signature, payload, content, or byte can ever be echoed.
-    items = service.list_actors(session, actor_id, name, actor_type)
-    total = len(items)
+    # Strictly read-only: the retrieval writes no actor, migration record,
+    # resource, or audit event. The total is a SQL COUNT over the filtered
+    # set and the page is a SQL LIMIT/OFFSET window ordered in SQL by
+    # created_at then the explicit persistence-order column, so neither value
+    # depends on in-memory sorting. Filter values are never resolved for
+    # existence, so an unknown or nonexistent id/name/type is an empty
+    # collection rather than a 404. The actor public view carries only
+    # id/name/type/created_at: no private key, raw signature, payload,
+    # content, ordering column, or byte can ever be echoed.
+    page, total = service.list_actors_page(
+        session, actor_id, name, actor_type, page_limit, offset
+    )
 
     next_cursor: str | None = None
     if offset >= total:
@@ -227,7 +232,6 @@ async def list_actors(request: Request, session: DbSession) -> Response:
         # and no further cursor can be issued.
         page = []
     else:
-        page = items[offset : offset + page_limit]
         next_offset = offset + len(page)
         if next_offset < total:
             next_cursor = pagination.encode_typed_cursor(

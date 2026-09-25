@@ -79,8 +79,20 @@ def make_session_factory(engine) -> sessionmaker[Session]:
 
 
 def init_db(engine) -> None:
-    """Create all tables. Safe and idempotent on a fresh or existing database."""
-    # Import models so they are registered on ``Base.metadata`` before create.
+    """Create or migrate all tables. Safe and idempotent on a fresh or
+    existing database.
+
+    A fresh database is created at the latest schema and baselined in the
+    migration ledger; a database created by an earlier build is upgraded by
+    the versioned migrations (which add the explicit actor ordering column
+    and backfill its values) without changing existing actor fields. A final
+    ``create_all`` is a harmless no-op when every table already exists.
+    """
+    from provenance.migrations import run_migrations
+
+    # Import models so they are registered on ``Base.metadata`` before the
+    # migration runner compiles the current schema.
     from provenance import models  # noqa: F401
 
+    run_migrations(engine)
     Base.metadata.create_all(bind=engine)
