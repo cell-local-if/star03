@@ -480,6 +480,39 @@ class ContentEvidenceCoverageResponse(BaseModel):
     coverage_status: Literal["uncovered", "partial", "covered"]
 
 
+class ContentCoverageSearchItem(ContentResponse):
+    """A content in the cross-content coverage search.
+
+    The full public content view plus the same four coverage counts and
+    coverage status the single-content summary serves. Counts only; no claim
+    payload, evidence byte, raw signature, or key material can appear.
+    """
+
+    #: Claims that directly assert this exact content.
+    claim_count: int
+    #: Distinct evidence bundles attached to those claims.
+    bundle_count: int
+    #: Attestations targeting those claims or bundles; revoked proofs are
+    #: retained and still counted.
+    attestation_count: int
+    #: Distinct signing actors with a verified, non-revoked attestation of
+    #: those claims or bundles.
+    qualified_signer_count: int
+    #: ``uncovered`` with no claims, ``partial`` with claims but no qualified
+    #: signer, ``covered`` once one qualified signer exists.
+    coverage_status: Literal["uncovered", "partial", "covered"]
+
+
+class ContentCoverageSearchPageResponse(BaseModel):
+    """A cursor-paginated page of content coverage search items."""
+
+    items: list[ContentCoverageSearchItem]
+    #: Total number of items after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None
+
+
 class ContentExportJobCreate(BaseModel):
     """A request to register one asynchronous content export job.
 

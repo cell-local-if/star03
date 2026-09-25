@@ -1905,6 +1905,141 @@ def get_content_evidence_coverage(
     }
 
 
+# Content coverage search paging bounds.
+DEFAULT_CONTENT_COVERAGE_SEARCH_LIMIT = 50
+MIN_CONTENT_COVERAGE_SEARCH_LIMIT = 1
+MAX_CONTENT_COVERAGE_SEARCH_LIMIT = 100
+
+
+def list_content_coverage(
+    session: Session,
+    actor_id: str | None = None,
+    media_type: str | None = None,
+    coverage_status: str | None = None,
+) -> list[tuple[Content, dict]]:
+    """Return every filtered content with its evidence-coverage summary.
+
+    ``actor_id`` and ``media_type`` are non-empty, case- and
+    whitespace-sensitive exact matches on the content identity that combine
+    as logical AND; ``None`` means unfiltered. Filter values are never
+    resolved for existence, so an unknown value is an empty result rather
+    than a missing resource. ``coverage_status`` is one of the three
+    existing coverage literals and keeps only contents whose computed status
+    equals it; ``None`` means unfiltered.
+
+    Each returned pair is the content (in stable creation order:
+    ``created_at`` then the monotonic ``seq`` tiebreaker, so the order
+    survives a restart) together with the same four counts and status the
+    single-content summary computes: only claims directly asserting the
+    content, their distinct bundles, attestations targeting those claims or
+    bundles (revoked proofs retained), and distinct verified non-revoked
+    signing actors. No lineage is traversed. The search is strictly
+    read-only: it writes no resource, snapshot, audit event, or log.
+    """
+    filters = []
+    if actor_id is not None:
+        filters.append(Content.actor_id == actor_id)
+    if media_type is not None:
+        filters.append(Content.media_type == media_type)
+    contents = list(
+        session.execute(
+            select(Content).where(*filters).order_by(*_CONTENT_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    if not contents:
+        return []
+    content_ids = [content.id for content in contents]
+
+    # Claims directly asserting each content, mapped back to their content.
+    claim_ids_by_content: dict[str, list[str]] = {
+        content_id: [] for content_id in content_ids
+    }
+    content_by_claim: dict[str, str] = {}
+    for claim_id, content_id in session.execute(
+        select(Claim.id, Claim.content_id).where(
+            Claim.content_id.in_(content_ids)
+        )
+    ).all():
+        claim_ids_by_content[content_id].append(claim_id)
+        content_by_claim[claim_id] = content_id
+
+    # Distinct bundles attached to those claims, mapped back likewise.
+    bundle_ids_by_content: dict[str, list[str]] = {
+        content_id: [] for content_id in content_ids
+    }
+    content_by_bundle: dict[str, str] = {}
+    for bundle_id, content_id in session.execute(
+        select(EvidenceBundle.id, Claim.content_id).join(
+            Claim, EvidenceBundle.claim_id == Claim.id
+        ).where(Claim.content_id.in_(content_ids))
+    ).all():
+        if bundle_id not in content_by_bundle:
+            content_by_bundle[bundle_id] = content_id
+            bundle_ids_by_content[content_id].append(bundle_id)
+
+    attestation_count_by_content = {content_id: 0 for content_id in content_ids}
+    qualified_signers_by_content: dict[str, set[str]] = {
+        content_id: set() for content_id in content_ids
+    }
+    if content_by_claim or content_by_bundle:
+        target_filter = or_(
+            (Attestation.target_type == signing.TARGET_CLAIM)
+            & Attestation.target_id.in_(content_by_claim),
+            (Attestation.target_type == signing.TARGET_EVIDENCE_BUNDLE)
+            & Attestation.target_id.in_(content_by_bundle),
+        )
+        revoked = exists().where(
+            AttestationRevocation.attestation_id == Attestation.id
+        )
+        for target_type, target_id, signer_actor_id, active in session.execute(
+            select(
+                Attestation.target_type,
+                Attestation.target_id,
+                Attestation.signer_actor_id,
+                ~revoked,
+            ).where(target_filter)
+        ).all():
+            if target_type == signing.TARGET_CLAIM:
+                content_id = content_by_claim.get(target_id)
+            else:
+                content_id = content_by_bundle.get(target_id)
+            if content_id is None:
+                continue
+            attestation_count_by_content[content_id] += 1
+            if active:
+                qualified_signers_by_content[content_id].add(signer_actor_id)
+
+    results: list[tuple[Content, dict]] = []
+    for content in contents:
+        claim_count = len(claim_ids_by_content[content.id])
+        qualified_signer_count = len(qualified_signers_by_content[content.id])
+        if claim_count == 0:
+            status = COVERAGE_UNCOVERED
+        elif qualified_signer_count >= 1:
+            status = COVERAGE_COVERED
+        else:
+            status = COVERAGE_PARTIAL
+        if coverage_status is not None and status != coverage_status:
+            continue
+        results.append(
+            (
+                content,
+                {
+                    "claim_count": claim_count,
+                    "bundle_count": len(bundle_ids_by_content[content.id]),
+                    "attestation_count": attestation_count_by_content[
+                        content.id
+                    ],
+                    "qualified_signer_count": qualified_signer_count,
+                    "coverage_status": status,
+                },
+            )
+        )
+    return results
+
+
 #: Builds the stored export result for one content: the wire-shaped
 #: ``{"content", "claims"}`` snapshot served by the read-only export route.
 #: Injected by the API layer so the service stays free of response schemas
