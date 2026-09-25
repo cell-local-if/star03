@@ -655,6 +655,16 @@ class ContentRelationListResponse(BaseModel):
     count: int
 
 
+class ContentRelationPageResponse(BaseModel):
+    """A cursor-paginated page of relation public views."""
+
+    items: list[ContentRelationResponse]
+    #: Total number of relations after filtering, independent of pagination.
+    count: int
+    #: Opaque continuation token; null on the final (or past-the-end) page.
+    next_cursor: str | None = None
+
+
 class AttestationCreate(BaseModel):
     # Attestation requests carry exactly the declared verification material;
     # undeclared fields are rejected rather than silently discarded.
