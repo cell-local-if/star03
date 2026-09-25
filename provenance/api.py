@@ -90,7 +90,7 @@ from provenance.schemas import (
     ContentExportVerificationResponse,
     ContentLineageItem,
     ContentLineageResponse,
-    ContentListResponse,
+    ContentPageResponse,
     ContentRelationCreate,
     ContentRelationListResponse,
     ContentRelationResponse,
@@ -284,15 +284,142 @@ def get_content(content_id: str, session: DbSession) -> ContentResponse:
     return ContentResponse.model_validate(content)
 
 
-@router.get("/contents", response_model=ContentListResponse)
-def list_contents(
-    session: DbSession, actor_id: str | None = None
-) -> ContentListResponse:
-    items = service.list_contents(session, actor_id)
-    return ContentListResponse(
-        items=[ContentResponse.model_validate(item) for item in items],
-        count=len(items),
+_CONTENTS_PARAMS = frozenset(
+    {"actor_id", "digest_algorithm", "digest_hex", "media_type", "limit", "cursor"}
+)
+
+
+@router.get("/contents")
+async def list_contents(request: Request, session: DbSession) -> Response:
+    # Read-only reviewer retrieval of registered content identities. The GET
+    # request body must be empty: carrying any bytes (even whitespace or
+    # malformed JSON) is a 422 validated before any parameter or content is
+    # read. Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _CONTENTS_PARAMS
+    if unknown:
+        # A typo (e.g. ``algorithm``) never silently changes the retrieval.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    actor_id = _parse_nonempty_filter(raw, "actor_id")
+    digest_algorithm = _parse_nonempty_filter(raw, "digest_algorithm")
+    digest_hex = _parse_digest_hex_param(raw, "digest_hex")
+    media_type = _parse_nonempty_filter(raw, "media_type")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CONTENTS_LIMIT,
+        service.MIN_CONTENTS_LIMIT,
+        service.MAX_CONTENTS_LIMIT,
     )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.contents_cursor_secret,
+                pagination.CONTENTS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered) and the effective limit must match
+        # exactly. A cursor minted by another endpoint family already fails
+        # decoding above.
+        expected = {
+            "actor_id": actor_id,
+            "digest_algorithm": digest_algorithm,
+            "digest_hex": digest_hex,
+            "media_type": media_type,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the retrieval writes no content, resource, or audit
+    # event. The total is a SQL COUNT over the filtered set and the page is a
+    # SQL LIMIT/OFFSET window ordered in SQL by created_at then the explicit
+    # persistence-order column, so neither value depends on in-memory
+    # sorting. Filter values are never resolved for existence, so an unknown
+    # actor/algorithm/digest/media type is an empty collection rather than a
+    # 404. The content public view carries only id, digest algorithm/value,
+    # media type, title, actor id, and UTC created_at: no raw material or
+    # ordering column can ever be echoed.
+    page, total = service.list_contents_page(
+        session,
+        actor_id,
+        digest_algorithm,
+        digest_hex,
+        media_type,
+        page_limit,
+        offset,
+    )
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.contents_cursor_secret,
+                pagination.CONTENTS_CURSOR,
+                {
+                    "actor_id": actor_id,
+                    "digest_algorithm": digest_algorithm,
+                    "digest_hex": digest_hex,
+                    "media_type": media_type,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = ContentPageResponse(
+        items=[ContentResponse.model_validate(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated by
+    # exactly one newline; members appear as items, count, next_cursor.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 @router.post("/content-relations", response_model=ContentRelationResponse)

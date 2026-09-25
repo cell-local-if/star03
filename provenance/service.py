@@ -289,6 +289,60 @@ def list_contents(session: Session, actor_id: str | None = None) -> list[Content
     return list(session.execute(stmt).scalars().all())
 
 
+# Content retrieval paging bounds.
+DEFAULT_CONTENTS_LIMIT = 50
+MIN_CONTENTS_LIMIT = 1
+MAX_CONTENTS_LIMIT = 100
+
+
+def list_contents_page(
+    session: Session,
+    actor_id: str | None = None,
+    digest_algorithm: str | None = None,
+    digest_hex: str | None = None,
+    media_type: str | None = None,
+    limit: int = DEFAULT_CONTENTS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[Content], int]:
+    """Return one content page and the filtered total, both computed in SQL.
+
+    ``actor_id``, ``digest_algorithm``, ``digest_hex``, and ``media_type``
+    are non-empty, case- and whitespace-sensitive exact matches that combine
+    as logical AND; ``None`` means unfiltered. Filter values are never
+    resolved for existence, so an unknown value is an empty result rather
+    than a missing resource.
+
+    The total is a SQL ``COUNT`` over the filtered set (independent of the
+    page) and the page is a SQL ``LIMIT``/``OFFSET`` window of that set in
+    stable creation order (``created_at`` then the explicit ``seq``), so
+    ordering and paging never depend on in-memory sorting. The retrieval is
+    strictly read-only: it writes no content, resource, or audit event.
+    """
+    filters = []
+    if actor_id is not None:
+        filters.append(Content.actor_id == actor_id)
+    if digest_algorithm is not None:
+        filters.append(Content.digest_algorithm == digest_algorithm)
+    if digest_hex is not None:
+        filters.append(Content.digest_hex == digest_hex)
+    if media_type is not None:
+        filters.append(Content.media_type == media_type)
+
+    total = session.execute(
+        select(func.count()).select_from(Content).where(*filters)
+    ).scalar_one()
+
+    page_stmt = (
+        select(Content)
+        .where(*filters)
+        .order_by(*_CONTENT_ORDER)
+        .limit(limit)
+        .offset(offset)
+    )
+    page = list(session.execute(page_stmt).scalars().all())
+    return page, int(total)
+
+
 def _claim_identity_select(payload: ClaimCreate, digest_hex: str):
     return select(Claim).where(
         Claim.content_id == payload.content_id,
