@@ -76,6 +76,9 @@ CLAIM_SUPERSESSION_LINEAGE_CURSOR_VERSION = "sl1"
 #: Marker for cursors that page through the trust-policy retrieval.
 TRUST_POLICIES_CURSOR_VERSION = "tp1"
 
+#: Marker for cursors that page through the reviewer actor retrieval.
+ACTORS_CURSOR_VERSION = "ac1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -578,6 +581,30 @@ TRUST_POLICIES_CURSOR = CursorKind(
     version=TRUST_POLICIES_CURSOR_VERSION,
     claim_fields=("actor_id", "limit", "offset"),
     validate=_validate_trust_policies_claims,
+)
+
+
+def _validate_actors_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null, meaning unfiltered) or
+    # non-empty strings; matching is case- and whitespace-sensitive, so the
+    # raw value is bound.
+    _optional_nonempty_str(claims, "actor_id")
+    _optional_nonempty_str(claims, "name")
+    _optional_nonempty_str(claims, "actor_type")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/actors``.
+ACTORS_CURSOR = CursorKind(
+    version=ACTORS_CURSOR_VERSION,
+    claim_fields=("actor_id", "name", "actor_type", "limit", "offset"),
+    validate=_validate_actors_claims,
 )
 
 

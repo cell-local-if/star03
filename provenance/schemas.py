@@ -93,6 +93,16 @@ class ActorResponse(BaseModel):
     created_at: datetime
 
 
+class ActorPageResponse(BaseModel):
+    """A cursor-paginated page of actor public views."""
+
+    items: list[ActorResponse]
+    #: Total number of actors after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class ContentCreate(BaseModel):
     digest_algorithm: str = Field(..., min_length=1, max_length=32)
     digest_hex: str = Field(..., min_length=1, max_length=128)

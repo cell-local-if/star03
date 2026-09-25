@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 from typing import Callable
 
-from sqlalchemy import exists, func, or_, select, update as sa_update
+from sqlalchemy import exists, func, literal_column, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -101,6 +101,11 @@ from provenance.time_utils import utc_now
 # Stable creation order: timestamp first, with the monotonic sequence as a
 # deterministic tiebreaker.
 _CONTENT_ORDER = (Content.created_at.asc(), Content.seq.asc())
+# Actors predate the monotonic ``seq`` surrogate used by the other tables:
+# their persistent insertion order is the database rowid (stable across
+# restarts on the SQLite target, and actors are never deleted or VACUUMed),
+# which breaks same-timestamp ties without a schema migration.
+_ACTOR_ORDER = (Actor.created_at.asc(), literal_column("rowid").asc())
 _CLAIM_ORDER = (Claim.created_at.asc(), Claim.seq.asc())
 _CLAIM_SUPERSESSION_ORDER = (
     ClaimSupersession.created_at.asc(),
@@ -160,6 +165,39 @@ def create_actor(session: Session, payload: ActorCreate) -> Actor:
         raise ActorAlreadyExistsError(payload.id) from None
     session.refresh(actor)
     return actor
+
+
+# Actor retrieval paging bounds.
+DEFAULT_ACTORS_LIMIT = 50
+MIN_ACTORS_LIMIT = 1
+MAX_ACTORS_LIMIT = 100
+
+
+def list_actors(
+    session: Session,
+    actor_id: str | None = None,
+    name: str | None = None,
+    actor_type: str | None = None,
+) -> list[Actor]:
+    """Return actors in stable creation order, optionally exact-filtered.
+
+    ``actor_id``, ``name``, and ``actor_type`` are non-empty, case- and
+    whitespace-sensitive exact matches that combine as logical AND; ``None``
+    means unfiltered. Filter values are never resolved for existence, so an
+    unknown id/name/type is an empty result rather than a missing resource.
+    Results follow stable creation order (``created_at`` with the persistent
+    rowid tiebreaker). The retrieval is strictly read-only: it writes no
+    actor, resource, or audit event.
+    """
+    stmt = select(Actor)
+    if actor_id is not None:
+        stmt = stmt.where(Actor.id == actor_id)
+    if name is not None:
+        stmt = stmt.where(Actor.name == name)
+    if actor_type is not None:
+        stmt = stmt.where(Actor.type == actor_type)
+    stmt = stmt.order_by(*_ACTOR_ORDER)
+    return list(session.execute(stmt).scalars().all())
 
 
 def create_content(
