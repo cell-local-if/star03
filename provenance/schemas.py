@@ -1585,6 +1585,41 @@ class RevocationImpactImportReconciliationResponse(BaseModel):
     matches: bool
 
 
+class RevocationImpactImportReconciliationItem(BaseModel):
+    """One receipt's current local reconciliation in a list page.
+
+    Carries the existing single-receipt public view exactly (``id``,
+    ``checkpoint_version``, ``impact_count``, ``impacts_digest_hex``,
+    ``received_at``) plus ``local_available`` -- true when the current local
+    revocation-impact set is non-empty (an empty set still yields a
+    deterministic checkpoint) --, ``local_checkpoint`` -- the four-field
+    checkpoint computed over the complete, unfiltered local revocation-impact
+    set under the existing checkpoint rules --, and ``matches``, true only
+    when the receipt's ``checkpoint_version``, ``impact_count``, and
+    ``impacts_digest_hex`` all equal that local checkpoint. The imported
+    impacts array is never echoed.
+    """
+
+    id: str
+    checkpoint_version: str
+    impact_count: int
+    impacts_digest_hex: str
+    received_at: datetime
+    local_available: bool
+    local_checkpoint: RevocationImpactCheckpointResponse
+    matches: bool
+
+
+class RevocationImpactImportReconciliationPageResponse(BaseModel):
+    """A cursor-paginated page of impact-import receipt reconciliations."""
+
+    items: list[RevocationImpactImportReconciliationItem]
+    #: Total number of receipts after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.

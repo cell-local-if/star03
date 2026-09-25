@@ -3049,6 +3049,29 @@ def list_revocation_impact_imports(
     return list(session.execute(stmt).scalars().all())
 
 
+# Impact-import reconciliation listing paging bounds.
+DEFAULT_IMPACT_IMPORT_RECONCILIATIONS_LIMIT = 50
+MIN_IMPACT_IMPORT_RECONCILIATIONS_LIMIT = 1
+MAX_IMPACT_IMPORT_RECONCILIATIONS_LIMIT = 100
+
+
+def list_revocation_impact_import_reconciliations(
+    session: Session,
+) -> list[ImpactImportRecord]:
+    """Return every impact-import receipt in stable creation order.
+
+    The reconciliation collection filters on read-time computed fields, so
+    the service layer returns the complete receipt set; each receipt's
+    current local reconciliation is computed by the caller against the
+    complete, unfiltered local revocation-impact set. Results follow the
+    receipts' stable creation order (``created_at`` with the monotonic
+    ``seq`` tiebreaker). The function is strictly read-only: it writes no
+    resource and no audit event.
+    """
+    stmt = select(ImpactImportRecord).order_by(*_IMPACT_IMPORT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 # Exchange-import receipt search paging bounds.
 DEFAULT_EXCHANGE_IMPORTS_LIMIT = 50
 MIN_EXCHANGE_IMPORTS_LIMIT = 1
