@@ -107,6 +107,10 @@ IMPACT_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "iir1"
 #: exchange-import receipts.
 IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR_VERSION = "rx1"
 
+#: Marker for cursors that page through signed audit exchange-import
+#: receipts.
+AUDIT_EXCHANGE_IMPORTS_CURSOR_VERSION = "ax1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -937,6 +941,40 @@ IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_impact_recon_exchange_imports_claims,
+)
+
+
+def _validate_audit_exchange_imports_claims(
+    claims: dict[str, Any],
+) -> None:
+    # The exact-match text filters are either absent (null) or non-empty
+    # strings; matching is case- and whitespace-sensitive, so the raw value
+    # is bound. The public-key filter binds the exact Base64 spelling.
+    _optional_nonempty_str(claims, "signature_version")
+    _optional_nonempty_str(claims, "signer_subject")
+    _optional_nonempty_str(claims, "public_key")
+    _optional_nonempty_str(claims, "package_digest_hex")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/audit-exchanges``.
+AUDIT_EXCHANGE_IMPORTS_CURSOR = CursorKind(
+    version=AUDIT_EXCHANGE_IMPORTS_CURSOR_VERSION,
+    claim_fields=(
+        "signature_version",
+        "signer_subject",
+        "public_key",
+        "package_digest_hex",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_audit_exchange_imports_claims,
 )
 
 

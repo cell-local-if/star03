@@ -50,6 +50,7 @@ EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
 EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 EVENT_AUDIT_CHECKPOINT_IMPORTED = "audit.checkpoint_imported"
+EVENT_AUDIT_EXCHANGE_IMPORTED = "audit.exchange_imported"
 EVENT_REVOCATION_IMPACT_IMPORTED = "revocation_impact.imported"
 EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED = (
     "revocation_impact.exchange_imported"
@@ -808,6 +809,83 @@ class CheckpointImportRecord(Base):
     event_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
     #: The SHA-256 events digest the received event array was verified against.
     events_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+
+class AuditExchangeImportRecord(Base):
+    """An immutable receipt for one signed, offline-verified audit package.
+
+    The record is the controlled cross-system counterpart of the stateless
+    audit checkpoint verification rules: a package whose checkpoint count
+    and events digest pass the existing checkpoint rules, and whose
+    ``signature_metadata`` carries an Ed25519 signature verified over the
+    canonical array binding the fixed exchange version, the signing subject,
+    the package digest algorithm, and the whole-package digest, is
+    registered exactly once. The receipt stores only the package identity
+    and the accepted signature's claims -- the signature version, the
+    signing subject, the signer's 32-byte public key, both digest
+    algorithms/values, and the SHA-256 digest of the verified signature --
+    never the package itself, the raw signature, or any private key; the
+    full package and signature must be re-presented on a retry. The
+    signature is checked but its raw bytes are never persisted.
+    Verification never depends on whether the described events exist
+    locally (they are never queried, created, or modified), so no foreign
+    keys and no local audit-event lookup participate in the decision.
+
+    Records are append-only and immutable; there is deliberately no update
+    or delete path. The package identity tuple is unique, so a verified
+    package is registered exactly once: a retried submission with the same
+    identity and signature returns the original record without another
+    audit event, while a different subject, key, or signature for the same
+    package is refused with the original record untouched.
+    """
+
+    __tablename__ = "audit_exchange_imports"
+    __table_args__ = (
+        UniqueConstraint(
+            "signature_version",
+            "package_digest_hex",
+            name="uq_audit_exchange_imports_identity",
+        ),
+        Index(
+            "ix_audit_exchange_imports_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable receipt identifier ("acx_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: Fixed signature-exchange format version committed to by the metadata.
+    signature_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The signing subject named by the accepted signature metadata (an
+    #: opaque reference, never a local actor lookup key at import time).
+    signer_subject: Mapped[str] = mapped_column(Text, nullable=False)
+    #: The 32 raw Ed25519 public-key bytes of the accepted signing subject
+    #: (standard Base64 on the wire).
+    public_key: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    #: The package digest algorithm named by the signature metadata.
+    package_digest_algorithm: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    #: The SHA-256 package digest the received package was verified against
+    #: and the signature was checked over.
+    package_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: Digest algorithm of the signature digest ("sha256").
+    signature_digest_algorithm: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    #: SHA-256 hex digest of the submitted signature; the raw signature is
+    #: never stored or echoed back.
+    signature_digest_hex: Mapped[str] = mapped_column(
+        String(128), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, nullable=False, default=utc_now
     )

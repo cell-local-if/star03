@@ -270,6 +270,38 @@ def checkpoint_import_id(
     return "aci_" + hashlib.sha256(material).hexdigest()
 
 
+def audit_exchange_import_id(
+    signature_version: str,
+    package_digest_hex: str,
+) -> str:
+    """Return a stable ``acx_``-prefixed receipt id for an audit exchange import.
+
+    The identity is exactly the exchanged package as named by the spec:
+    the pinned signature exchange version and the whole-package SHA-256
+    digest (the package digest algorithm is pinned to sha256, so it adds
+    no distinguishing dimension). One verified package maps to exactly one
+    receipt no matter which signing subject presents it, so a retried
+    submission for the same package always resolves to this id; a package
+    presented by a different subject (or with a different signature) is a
+    422 conflict against the existing receipt rather than a second id. The
+    package itself, the raw signature, and the signing subject never enter
+    the material -- only the verified package digest -- so no package or
+    signature bytes are persisted. The material is a canonical JSON array
+    so fields containing separators cannot collide with different field
+    splits.
+    """
+    material = json.dumps(
+        [
+            "audit_exchange_import",
+            signature_version,
+            package_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "acx_" + hashlib.sha256(material).hexdigest()
+
+
 def impact_import_id(
     checkpoint_version: str,
     impact_count: int,

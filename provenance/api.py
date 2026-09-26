@@ -23,6 +23,8 @@ from provenance import (
 from provenance.access_signing import AccessAuthError
 from provenance.errors import (
     AuditCheckpointImportValidationError,
+    AuditExchangeImportValidationError,
+    AuditSignatureVerificationError,
     EvidenceBundleExchangeImportValidationError,
     ImpactImportValidationError,
     ImpactReconExchangeImportValidationError,
@@ -111,6 +113,9 @@ from provenance.schemas import (
     AuditEventCheckpointResponse,
     AuditEventItem,
     AuditEventPageResponse,
+    AuditExchangeImportCreate,
+    AuditExchangeImportPageResponse,
+    AuditExchangeImportResponse,
     AuthenticationKeyRotationCreate,
     AuthenticationKeyRotationPageResponse,
     AuthenticationKeyRotationResponse,
@@ -5886,3 +5891,257 @@ def list_audit_events_checkpoint_import_reconciliations(
         count=total,
         next_cursor=next_cursor,
     )
+
+
+# --- Signed audit checkpoint exchange imports -------------------------------------
+
+
+_AUDIT_EXCHANGE_POST_PATH = "/audit-exchanges"
+
+
+def _audit_exchange_import_response(record) -> dict:
+    """Build the compact public receipt dict for one audit exchange import."""
+    return AuditExchangeImportResponse(
+        id=record.id,
+        signature_version=record.signature_version,
+        signer_subject=record.signer_subject,
+        public_key=base64.b64encode(record.public_key).decode("ascii"),
+        package_digest_hex=record.package_digest_hex,
+        signature_digest_hex=record.signature_digest_hex,
+        received_at=record.created_at,
+    ).model_dump(mode="json")
+
+
+@router.post(_AUDIT_EXCHANGE_POST_PATH)
+async def import_audit_exchange(
+    payload: AuditExchangeImportCreate,
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # The import route accepts no query parameters: any (or repeated)
+    # parameter is a 422 validation_error before the package is read.
+    _reject_any_query_param(request)
+
+    # Structure, the fixed checkpoint version/algorithm, the claimed event
+    # count, the strict event fields and timestamps, the signature metadata
+    # fields, standard Base64 key/signature lengths, and the
+    # 64-lowercase-hex digest spelling have all passed request validation.
+    # The digest bindings are enforced here over the raw received JSON, so
+    # root/array order and datetime spellings participate exactly as
+    # received; every mismatch is a 422 validation_error and writes
+    # nothing.
+    body = await request.json()
+    raw_package = body["package"]
+    metadata = payload.signature_metadata
+
+    # 1. The events array digest under the existing checkpoint rules: the
+    #    received array order participates in the recomputation unchanged.
+    computed_events_digest_hex = canonical.audit_events_digest_hex(
+        raw_package["events"]
+    )
+    if computed_events_digest_hex != payload.package.checkpoint.events_digest_hex:
+        raise AuditExchangeImportValidationError(
+            "events_digest_mismatch",
+            details={"computed_digest_hex": computed_events_digest_hex},
+        )
+
+    # 2. The full package digest: root members (checkpoint, events) and the
+    #    events array keep their received order; nested object keys sort by
+    #    Unicode code point under the package canonical rules.
+    computed_package_digest_hex = canonical.audit_checkpoint_package_digest_hex(
+        raw_package
+    )
+    if computed_package_digest_hex != metadata.package_digest_hex:
+        raise AuditExchangeImportValidationError(
+            "package_digest_mismatch",
+            details={"computed_digest_hex": computed_package_digest_hex},
+        )
+
+    # 3. The Ed25519 signature binds, in order, the fixed exchange version,
+    #    the signing subject, the package digest algorithm, and the
+    #    whole-package digest -- over the exact UTF-8 compact JSON array.
+    #    Only now, after every structural and digest check, is verification
+    #    attempted; a failure is its own distinct 422 code and writes
+    #    nothing.
+    message = signing.audit_exchange_message_bytes(
+        metadata.signer_subject,
+        metadata.package_digest_algorithm,
+        metadata.package_digest_hex,
+    )
+    if not ed25519.verify(
+        metadata.public_key, message, metadata.signature
+    ):
+        raise AuditSignatureVerificationError(
+            details={"reason": "signature_verification_failed"}
+        )
+
+    # Only the SHA-256 digest of the signature is ever passed on for
+    # storage; the raw signature and the package are not persisted.
+    signature_digest_hex = hashlib.sha256(metadata.signature).hexdigest()
+
+    # Verification is decided entirely by the request body: no described
+    # event is ever resolved against local state, so whether the events
+    # exist locally cannot change the receipt, and no local resource is
+    # queried or created.
+    record, created = service.create_audit_exchange_import(
+        session, payload, signature_digest_hex
+    )
+    # First registration of this package identity -> 201; an exact retried
+    # submission (same subject, key, and signature) -> 200 with the
+    # original receipt and no new audit event. A different subject, key, or
+    # signature for the same package is a 422 from the service with the
+    # original record untouched.
+    status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _render_compact_json(
+        _audit_exchange_import_response(record),
+        status_code=status_code,
+    )
+
+
+_AUDIT_EXCHANGES_PARAMS = frozenset(
+    {
+        "signature_version",
+        "signer_subject",
+        "public_key",
+        "package_digest_hex",
+        "limit",
+        "cursor",
+    }
+)
+
+
+@router.get(_AUDIT_EXCHANGE_POST_PATH)
+async def list_audit_exchanges(
+    request: Request, session: DbSession
+) -> Response:
+    # The GET request body must be empty: carrying any bytes (even
+    # whitespace, arbitrary bytes, or malformed JSON) is a 422 validated
+    # before any query parameter or receipt is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _AUDIT_EXCHANGES_PARAMS
+    if unknown:
+        # A typo never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    signature_version = _parse_nonempty_filter(raw, "signature_version")
+    signer_subject = _parse_nonempty_filter(raw, "signer_subject")
+    public_key = _parse_nonempty_filter(raw, "public_key")
+    package_digest_hex = _parse_nonempty_filter(raw, "package_digest_hex")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_AUDIT_EXCHANGE_IMPORTS_LIMIT,
+        service.MIN_AUDIT_EXCHANGE_IMPORTS_LIMIT,
+        service.MAX_AUDIT_EXCHANGE_IMPORTS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.audit_exchange_imports_cursor_secret,
+                pagination.AUDIT_EXCHANGE_IMPORTS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter and the effective limit must match exactly.
+        expected = {
+            "signature_version": signature_version,
+            "signer_subject": signer_subject,
+            "public_key": public_key,
+            "package_digest_hex": package_digest_hex,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no receipt, resource, or audit
+    # event. Filter values are never resolved for existence, so an unknown
+    # value is an empty collection rather than a 404. Each item is exactly
+    # the single-receipt public view; the package, the raw signature, and
+    # every private key are never persisted and so can never be echoed.
+    items = service.list_audit_exchange_imports(
+        session,
+        signature_version,
+        signer_subject,
+        public_key,
+        package_digest_hex,
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.audit_exchange_imports_cursor_secret,
+                pagination.AUDIT_EXCHANGE_IMPORTS_CURSOR,
+                {
+                    "signature_version": signature_version,
+                    "signer_subject": signer_subject,
+                    "public_key": public_key,
+                    "package_digest_hex": package_digest_hex,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = AuditExchangeImportPageResponse(
+        items=[_audit_exchange_import_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated
+    # by exactly one newline; members appear as items, count, next_cursor.
+    return _render_compact_json(result.model_dump(mode="json"))
+
+
+@router.get("/audit-exchanges/{import_id}")
+def get_audit_exchange(
+    import_id: str, request: Request, session: DbSession
+) -> Response:
+    # The receipt read takes no query parameters: any (or repeated)
+    # parameter is a 422 before the receipt lookup. PUT/PATCH/DELETE and
+    # every other non-GET method on this path is the framework's 405
+    # method_not_allowed.
+    _reject_any_query_param(request)
+    # Strictly read-only: a receipt read writes no resource and no audit
+    # event. An unknown id is an explicit, specific 404.
+    record = service.get_audit_exchange_import(session, import_id)
+    return _render_compact_json(_audit_exchange_import_response(record))

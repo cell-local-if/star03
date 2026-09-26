@@ -373,3 +373,25 @@ def test_verification_writes_and_queries_nothing(client, db_session):
     db_session.expire_all()
     assert _receipt_count(db_session) == 0
     assert _audit_count(db_session) == 0
+
+
+# --- Identifier length bounds removed ----------------------------------------------
+
+
+def test_long_identifiers_have_no_upper_length_bound(client):
+    # The previous arbitrary upper bounds (id 80, signer_subject/public_key
+    # 255) are removed: non-empty identifiers of any length verify as long
+    # as the structure, types, and recomputed digest agree.
+    long_id = "irx_" + "a" * 512
+    long_subject = "subject-" + "x" * 512
+    long_public_key = "k" * 512
+    entries = [
+        _entry(
+            id=long_id,
+            signer_subject=long_subject,
+            public_key=long_public_key,
+        )
+    ]
+    resp = _verify(client, _request_body(entries=entries))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"valid": True}
