@@ -35,6 +35,8 @@ from provenance.errors import (
     EvidenceBundleExchangeImportNotFoundError,
     EvidenceBundleNotFoundError,
     ImpactImportNotFoundError,
+    ImpactReconExchangeImportNotFoundError,
+    ImpactReconExchangeImportValidationError,
     ProtectedAccessValidationError,
     UnknownActorError,
 )
@@ -62,6 +64,7 @@ from provenance.models import (
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
+    EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED,
     EVENT_REVOCATION_IMPACT_IMPORTED,
     Actor,
     ActorTrustPolicy,
@@ -80,6 +83,7 @@ from provenance.models import (
     EvidenceBundle,
     ExchangeImportRecord,
     ImpactImportRecord,
+    ImpactReconExchangeImportRecord,
 )
 from provenance.schemas import (
     ActorCreate,
@@ -98,6 +102,7 @@ from provenance.schemas import (
     EvidenceBundleExchangeImportCreate,
     EvidenceBundleCreate,
     EvidenceBundleImportCreate,
+    ImpactReconExchangeImportCreate,
     RevocationImpactImportCreate,
 )
 from provenance.time_utils import utc_now
@@ -3004,6 +3009,133 @@ def get_revocation_impact_import(
     ).scalar_one_or_none()
     if record is None:
         raise ImpactImportNotFoundError(import_id)
+    return record
+
+
+def _impact_recon_exchange_import_identity_select(
+    signature_version: str,
+    package_digest_algorithm: str,
+    package_digest_hex: str,
+):
+    return select(ImpactReconExchangeImportRecord).where(
+        ImpactReconExchangeImportRecord.signature_version
+        == signature_version,
+        ImpactReconExchangeImportRecord.package_digest_algorithm
+        == package_digest_algorithm,
+        ImpactReconExchangeImportRecord.package_digest_hex
+        == package_digest_hex,
+    )
+
+
+def create_impact_recon_exchange_import(
+    session: Session,
+    payload: ImpactReconExchangeImportCreate,
+    signature_digest_hex: str,
+) -> tuple[ImpactReconExchangeImportRecord, bool]:
+    """Register one signed, offline-verified recon package.
+
+    The caller has already verified the package under the existing
+    stateless impact-recon rules (structure, counts, canonical entries
+    digest) and verified the Ed25519 signature over the canonical
+    ``[version, subject, algorithm, digest]`` array. This function
+    performs no such verification and no local-resource lookup: every id
+    named by the package is an opaque reference, so whether the
+    referenced resources exist locally never changes the outcome.
+
+    The receiving identity is ``(signature_version,
+    package_digest_algorithm, package_digest_hex)`` -- the exchanged
+    package; the package itself and the raw signature are never stored.
+    A first submission writes the receipt row and its
+    ``revocation_impact.exchange_imported`` audit event in a single
+    transaction. A retried submission for the same identity with the same
+    signing subject, public key, and signature digest returns the
+    existing record with ``created=False`` and writes nothing. A
+    submission for the same package identity with a different signing
+    subject, public key, or signature is a 422 validation error and leaves
+    the original record (and audit trail) untouched.
+    """
+    metadata = payload.signature_metadata
+    signature_version = metadata.signature_version
+    package_digest_algorithm = metadata.package_digest_algorithm
+    package_digest_hex = metadata.package_digest_hex
+
+    existing = session.execute(
+        _impact_recon_exchange_import_identity_select(
+            signature_version, package_digest_algorithm, package_digest_hex
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        # The same package is already registered. An exact retry (same
+        # subject, key, and signature) is idempotent; a different signing
+        # identity or signature conflicts with the stored receipt and is
+        # refused without changing it.
+        if (
+            existing.signer_subject == metadata.signer_subject
+            and existing.public_key == metadata.public_key
+            and existing.signature_digest_hex == signature_digest_hex
+        ):
+            return existing, False
+        raise ImpactReconExchangeImportValidationError(
+            "exchange_import_identity_conflict"
+        )
+
+    record = ImpactReconExchangeImportRecord(
+        id=ids.impact_recon_exchange_import_id(
+            signature_version, package_digest_algorithm, package_digest_hex
+        ),
+        signature_version=signature_version,
+        signer_subject=metadata.signer_subject,
+        public_key=metadata.public_key,
+        package_digest_algorithm=package_digest_algorithm,
+        package_digest_hex=package_digest_hex,
+        signature_digest_algorithm=canonical.CANONICAL_DIGEST_ALGORITHM,
+        signature_digest_hex=signature_digest_hex,
+    )
+    session.add(record)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED,
+            resource_id=record.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent import registered this package identity first. An
+        # exact concurrent retry resolves to that record; a different
+        # signing identity or signature conflicts with it.
+        session.rollback()
+        raced = session.execute(
+            _impact_recon_exchange_import_identity_select(
+                signature_version, package_digest_algorithm, package_digest_hex
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if (
+            raced.signer_subject == metadata.signer_subject
+            and raced.public_key == metadata.public_key
+            and raced.signature_digest_hex == signature_digest_hex
+        ):
+            return raced, False
+        raise ImpactReconExchangeImportValidationError(
+            "exchange_import_identity_conflict"
+        ) from None
+    session.refresh(record)
+    return record, True
+
+
+def get_impact_recon_exchange_import(
+    session: Session, import_id: str
+) -> ImpactReconExchangeImportRecord:
+    """Return a signed exchange-import receipt by id or raise the 404."""
+    record = session.execute(
+        select(ImpactReconExchangeImportRecord).where(
+            ImpactReconExchangeImportRecord.id == import_id
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        raise ImpactReconExchangeImportNotFoundError(import_id)
     return record
 
 

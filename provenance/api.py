@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import re
@@ -11,12 +12,21 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
-from provenance import access_signing, canonical, pagination, service
+from provenance import (
+    access_signing,
+    canonical,
+    ed25519,
+    pagination,
+    service,
+    signing,
+)
 from provenance.access_signing import AccessAuthError
 from provenance.errors import (
     AuditCheckpointImportValidationError,
     EvidenceBundleExchangeImportValidationError,
     ImpactImportValidationError,
+    ImpactReconExchangeImportValidationError,
+    ImpactReconSignatureVerificationError,
     LineageValidationError,
     ProtectedAccessValidationError,
     ProtectedResourceNotFoundError,
@@ -75,6 +85,8 @@ from provenance.schemas import (
     RevocationImpactVerificationResponse,
     ImpactReconCheckpointResponse,
     ImpactReconEntryResponse,
+    ImpactReconExchangeImportCreate,
+    ImpactReconExchangeImportResponse,
     ImpactReconPackageResponse,
     ImpactReconVerificationCreate,
     ImpactReconVerificationResponse,
@@ -3945,6 +3957,146 @@ async def verify_impact_recon_package(
         + "\n"
     ).encode("utf-8")
     return Response(content=data, media_type="application/json")
+
+
+_TRUST_EVALUATION_PARAMS = frozenset(
+    {"target_type", "target_id", "min_signers"}
+)
+
+
+def _impact_recon_exchange_import_response(record) -> dict:
+    """Build the compact public receipt dict for one exchange import."""
+    return ImpactReconExchangeImportResponse(
+        id=record.id,
+        signature_version=record.signature_version,
+        signer_subject=record.signer_subject,
+        public_key=base64.b64encode(record.public_key).decode("ascii"),
+        package_digest_hex=record.package_digest_hex,
+        signature_digest_hex=record.signature_digest_hex,
+        received_at=record.created_at,
+    ).model_dump(mode="json")
+
+
+def _render_compact_json(payload: dict, status_code: int = 200) -> Response:
+    # Compact UTF-8 JSON, null/boolean literals, integral numbers only,
+    # terminated by exactly one newline. The status code is set on the
+    # returned Response itself (a manually built Response does not inherit
+    # the injected response's status).
+    data = (
+        json.dumps(
+            payload,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(
+        content=data, media_type="application/json", status_code=status_code
+    )
+
+
+@router.post("/impact-recon-exchange-imports")
+async def import_impact_recon_exchange(
+    payload: ImpactReconExchangeImportCreate,
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # The import route accepts no query parameters: any (or repeated)
+    # parameter is a 422 validation_error before the package is read.
+    _reject_any_query_param(request)
+
+    # Structure, the fixed package/version algorithm, the claimed entry
+    # count, the strict entry fields and timestamps, the signature
+    # metadata fields, standard Base64 key/signature lengths, and the
+    # 64-lowercase-hex digest spellings have all passed request
+    # validation. The digest bindings are enforced here over the raw
+    # received JSON, so root/array order and datetime spellings
+    # participate exactly as on the stateless verification route; every
+    # mismatch is a 422 validation_error and writes nothing.
+    body = await request.json()
+    raw_package = body["package"]
+    metadata = payload.signature_metadata
+
+    # 1. The entries array digest under the existing checkpoint rules.
+    computed_entries_digest_hex = canonical.impact_recon_entries_digest_hex(
+        raw_package["entries"]
+    )
+    if computed_entries_digest_hex != payload.package.checkpoint.entries_digest_hex:
+        raise ImpactReconExchangeImportValidationError(
+            "entries_digest_mismatch",
+            details={"computed_digest_hex": computed_entries_digest_hex},
+        )
+
+    # 2. The full package digest: root members (checkpoint, entries) and
+    # arrays keep their received order; nested object keys sort by Unicode
+    # code point under the existing package/snapshot canonical rules.
+    computed_package_digest_hex = canonical.impact_recon_package_digest_hex(
+        raw_package
+    )
+    if computed_package_digest_hex != metadata.package_digest_hex:
+        raise ImpactReconExchangeImportValidationError(
+            "package_digest_mismatch",
+            details={"computed_digest_hex": computed_package_digest_hex},
+        )
+
+    # 3. The Ed25519 signature binds, in order, the fixed version, the
+    #    signing subject, the digest algorithm, and the package digest --
+    #    over the exact UTF-8 compact JSON array. Only now, after every
+    #    structural and digest check, is verification attempted; a failure
+    #    is its own distinct 422 code and writes nothing.
+    message = signing.impact_recon_exchange_message_bytes(
+        metadata.signer_subject,
+        metadata.package_digest_algorithm,
+        metadata.package_digest_hex,
+    )
+    if not ed25519.verify(
+        metadata.public_key, message, metadata.signature
+    ):
+        raise ImpactReconSignatureVerificationError(
+            details={"reason": "signature_verification_failed"}
+        )
+
+    # Only the SHA-256 digest of the signature is ever passed on for
+    # storage; the raw signature and the package are not persisted.
+    signature_digest_hex = hashlib.sha256(metadata.signature).hexdigest()
+
+    # Verification is decided entirely by the request body: no resource id
+    # named by the package is ever resolved against local state, so
+    # whether the referenced receipts or impacts exist locally cannot
+    # change the receipt, and no local resource is queried or created.
+    record, created = service.create_impact_recon_exchange_import(
+        session, payload, signature_digest_hex
+    )
+    # First registration of this package identity -> 201; an exact retried
+    # submission (same subject, key, and signature) -> 200 with the
+    # original receipt and no new audit event. A different subject, key,
+    # or signature for the same package is a 422 from the service with the
+    # original record untouched.
+    status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _render_compact_json(
+        _impact_recon_exchange_import_response(record),
+        status_code=status_code,
+    )
+
+
+@router.get("/impact-recon-exchange-imports/{import_id}")
+def get_impact_recon_exchange_import(
+    import_id: str, request: Request, session: DbSession
+) -> Response:
+    # The receipt read takes no query parameters: any (or repeated)
+    # parameter is a 422 before the receipt lookup. PUT/PATCH/DELETE and
+    # every other non-GET method on this path is the framework's 405
+    # method_not_allowed.
+    _reject_any_query_param(request)
+    # Strictly read-only: a receipt read writes no resource and no audit
+    # event. An unknown id is an explicit, specific 404.
+    record = service.get_impact_recon_exchange_import(session, import_id)
+    return _render_compact_json(
+        _impact_recon_exchange_import_response(record)
+    )
 
 
 _TRUST_EVALUATION_PARAMS = frozenset(

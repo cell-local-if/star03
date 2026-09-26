@@ -33,3 +33,38 @@ def attestation_message_bytes(
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
+
+#: Domain-separation prefix and protocol version of a signed impact-recon
+#: exchange package.
+IMPACT_RECON_EXCHANGE_MESSAGE_PREFIX = (
+    "provenance-impact-recon-exchange-v1"
+)
+
+
+def impact_recon_exchange_message_bytes(
+    signer_subject: str,
+    package_digest_algorithm: str,
+    package_digest_hex: str,
+) -> bytes:
+    """Return the exact canonical bytes an exchange signature is over.
+
+    The signature binds, in order, the fixed exchange version, the signing
+    subject, the package digest algorithm, and the package digest value:
+
+        ["provenance-impact-recon-exchange-v1", subject, "sha256", digest]
+
+    The bytes are a UTF-8 compact JSON array (compact separators, non-ASCII
+    emitted unescaped), identical regardless of which client produced the
+    signature.
+    """
+    return json.dumps(
+        [
+            IMPACT_RECON_EXCHANGE_MESSAGE_PREFIX,
+            signer_subject,
+            package_digest_algorithm,
+            package_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
