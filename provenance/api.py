@@ -17,6 +17,7 @@ from provenance.errors import (
     AuditCheckpointImportValidationError,
     EvidenceBundleExchangeImportValidationError,
     ImpactImportValidationError,
+    ImpactReconExchangeImportValidationError,
     LineageValidationError,
     ProtectedAccessValidationError,
     ProtectedResourceNotFoundError,
@@ -75,6 +76,8 @@ from provenance.schemas import (
     RevocationImpactVerificationResponse,
     ImpactReconCheckpointResponse,
     ImpactReconEntryResponse,
+    ImpactReconExchangeImportCreate,
+    ImpactReconExchangeImportResponse,
     ImpactReconPackageResponse,
     ImpactReconVerificationCreate,
     ImpactReconVerificationResponse,
@@ -3945,6 +3948,109 @@ async def verify_impact_recon_package(
         + "\n"
     ).encode("utf-8")
     return Response(content=data, media_type="application/json")
+
+
+def _impact_recon_exchange_import_body(record, status_code: int) -> Response:
+    """Render one exchange-import receipt as compact newline-terminated JSON.
+
+    Exactly the seven-field public view (id, signature_version, subject,
+    public_key, entries_digest_hex, package_digest_hex, received_at); the
+    package, the raw signature, and any private key are never persisted
+    and so can never be echoed.
+    """
+    view = ImpactReconExchangeImportResponse(
+        id=record.id,
+        signature_version=record.signature_version,
+        subject=record.subject,
+        public_key=record.public_key,
+        entries_digest_hex=record.entries_digest_hex,
+        package_digest_hex=record.package_digest_hex,
+        received_at=record.created_at,
+    )
+    body = (
+        json.dumps(
+            view.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(
+        content=body, status_code=status_code, media_type="application/json"
+    )
+
+
+@router.post(
+    "/impact-recon-exchange-imports",
+    response_model=ImpactReconExchangeImportResponse,
+)
+async def import_impact_recon_exchange(
+    payload: ImpactReconExchangeImportCreate,
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # Structure, fixed versions/algorithms, strict digest spellings, the
+    # entry fields and timestamps, the claimed entry count, and the
+    # Base64 key/signature shapes have all passed request validation
+    # exactly as on the stateless verification route. Both digest matches
+    # are enforced here over the raw received JSON, so root member order,
+    # array order, and datetime spellings participate exactly as received;
+    # a mismatch is a 422 and writes nothing.
+    body = await request.json()
+    computed_entries_digest_hex = canonical.impact_recon_entries_digest_hex(
+        body["package"]["entries"]
+    )
+    if (
+        computed_entries_digest_hex
+        != payload.package.checkpoint.entries_digest_hex
+    ):
+        raise ImpactReconExchangeImportValidationError(
+            "entries_digest_mismatch",
+            details={"computed_digest_hex": computed_entries_digest_hex},
+        )
+    computed_package_digest_hex = canonical.impact_recon_package_digest_hex(
+        body["package"]
+    )
+    if (
+        computed_package_digest_hex
+        != payload.signature_metadata.package_digest_hex
+    ):
+        raise ImpactReconExchangeImportValidationError(
+            "package_digest_mismatch",
+            details={"computed_digest_hex": computed_package_digest_hex},
+        )
+
+    # Registration is decided entirely by the request body: the service
+    # never resolves any id named by the package against local resources,
+    # so whether they exist locally cannot change the receipt. The
+    # signature is verified before anything is written; the package, the
+    # raw signature, and any private key are never persisted.
+    record, created = service.create_impact_recon_exchange_import(
+        session, payload
+    )
+    # First registration of this package digest -> 201; a retried
+    # submission carrying the identical signature metadata -> 200 with the
+    # original record and no new audit event.
+    return _impact_recon_exchange_import_body(
+        record, status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+
+
+@router.get(
+    "/impact-recon-exchange-imports/{import_id}",
+    response_model=ImpactReconExchangeImportResponse,
+)
+def get_impact_recon_exchange_import(
+    import_id: str, request: Request, session: DbSession
+) -> Response:
+    # The receipt read takes no query parameters: any (or repeated)
+    # parameter is a 422 before the receipt lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only: a receipt read writes no resource and no audit
+    # event. An unknown id is an explicit, specific 404.
+    record = service.get_impact_recon_exchange_import(session, import_id)
+    return _impact_recon_exchange_import_body(record, status.HTTP_200_OK)
 
 
 _TRUST_EVALUATION_PARAMS = frozenset(

@@ -298,6 +298,37 @@ def impact_import_id(
     return "rii_" + hashlib.sha256(material).hexdigest()
 
 
+def impact_recon_exchange_import_id(
+    signature_version: str,
+    subject: str,
+    public_key_b64: str,
+    package_digest_hex: str,
+) -> str:
+    """Return a stable ``irx_``-prefixed receipt id for an exchange import.
+
+    The identity is exactly the receiving identity: the signature version,
+    the signing subject, the signer's public key, and the verified
+    whole-package SHA-256 digest. The package itself and the raw signature
+    never enter the material -- only the verified digests participate -- so
+    the same offline-verified signed package always maps to the same
+    receipt id even though no package or signature bytes are persisted. The
+    material is a canonical JSON array so fields containing separators
+    cannot collide with different field splits.
+    """
+    material = json.dumps(
+        [
+            "impact_recon_exchange_import",
+            signature_version,
+            subject,
+            public_key_b64,
+            package_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "irx_" + hashlib.sha256(material).hexdigest()
+
+
 def content_export_job_id(content_id: str, request_id: str) -> str:
     """Return a stable ``cxj_``-prefixed id for a content export job.
 

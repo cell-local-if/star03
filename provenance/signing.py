@@ -9,6 +9,10 @@ identical regardless of which language or client produced the signature::
 
 Only Ed25519 signatures over these exact bytes are accepted; see
 :mod:`provenance.ed25519`.
+
+The impact-recon exchange import signs an analogous array binding the
+signature version, signing subject, package digest algorithm, and package
+digest; see :func:`impact_recon_exchange_message_bytes`.
 """
 
 from __future__ import annotations
@@ -30,6 +34,35 @@ def attestation_message_bytes(
     """Return the exact canonical bytes the signer's signature is over."""
     return json.dumps(
         [ATTESTATION_MESSAGE_PREFIX, target_type, target_id, signer_actor_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+#: Domain-separation prefix and protocol version of the signed exchange
+#: array; identical to the signature metadata's ``signature_version``.
+IMPACT_RECON_EXCHANGE_MESSAGE_PREFIX = "provenance-impact-recon-exchange-v1"
+
+
+def impact_recon_exchange_message_bytes(
+    subject: str, digest_algorithm: str, package_digest_hex: str
+) -> bytes:
+    """Return the exact canonical bytes an exchange signature is over.
+
+    The signed message is a UTF-8 compact JSON array binding, in order,
+    the signature version, the signing subject, the package digest
+    algorithm, and the package digest::
+
+        ["provenance-impact-recon-exchange-v1", subject,
+         digest_algorithm, package_digest_hex]
+    """
+    return json.dumps(
+        [
+            IMPACT_RECON_EXCHANGE_MESSAGE_PREFIX,
+            subject,
+            digest_algorithm,
+            package_digest_hex,
+        ],
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")

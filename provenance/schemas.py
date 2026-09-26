@@ -1852,6 +1852,113 @@ class ImpactReconVerificationResponse(BaseModel):
     computed_digest_hex: str | None = None
 
 
+#: Fixed signature format version for impact-recon exchange imports.
+IMPACT_RECON_EXCHANGE_SIGNATURE_VERSION = "provenance-impact-recon-exchange-v1"
+
+
+class ImpactReconExchangeSignatureMetadata(BaseModel):
+    """The signature exchange metadata bound to one impact-recon package.
+
+    Exactly six members: the fixed ``signature_version``
+    ("provenance-impact-recon-exchange-v1"), the signing ``subject`` (an
+    opaque cross-system identifier, never resolved against local actors),
+    the signer's ``public_key`` and ``signature`` (canonical standard
+    Base64 decoding to exactly 32 and 64 bytes), the fixed package
+    ``digest_algorithm`` ("sha256"), and ``package_digest_hex`` -- exactly
+    64 lowercase hexadecimal characters. Undeclared members are rejected
+    rather than ignored. The raw signature is verified and discarded --
+    it is never persisted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signature_version: Literal[IMPACT_RECON_EXCHANGE_SIGNATURE_VERSION]
+    subject: str = Field(..., min_length=1, max_length=255)
+    #: Base64 Ed25519 public key; must decode to exactly 32 bytes.
+    public_key: bytes
+    #: Base64 Ed25519 signature; must decode to exactly 64 bytes. The raw
+    #: signature is verified and discarded -- it is never persisted.
+    signature: bytes
+    digest_algorithm: Literal["sha256"]
+    package_digest_hex: str
+
+    @field_validator("subject")
+    @classmethod
+    def _subject_nonempty(cls, v: str) -> str:
+        # Non-empty, non-whitespace; nothing is trimmed or normalized, so
+        # the signed message binds the subject exactly as received.
+        if not v.strip():
+            raise ValueError("subject must not be empty")
+        return v
+
+    @field_validator("public_key", mode="before")
+    @classmethod
+    def _public_key_is_32_bytes(cls, v: Any) -> bytes:
+        return _decode_base64(v, "public_key", PUBLIC_KEY_LENGTH)
+
+    @field_validator("signature", mode="before")
+    @classmethod
+    def _signature_is_64_bytes(cls, v: Any) -> bytes:
+        return _decode_base64(v, "signature", SIGNATURE_LENGTH)
+
+    @field_validator("package_digest_hex")
+    @classmethod
+    def _package_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "package_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class ImpactReconExchangeImportCreate(BaseModel):
+    """A controlled import of one signed impact-recon exchange package.
+
+    Exactly two members: ``package`` is exactly the stateless
+    impact-recon verification structure (``checkpoint`` plus ``entries``,
+    with exactly ``checkpoint.entry_count`` elements) and
+    ``signature_metadata`` carries the six-field signature exchange
+    metadata. The entries digest and the whole-package digest are
+    enforced at the route over the raw received JSON, so member order,
+    array order, and timestamp spellings participate exactly as received;
+    a mismatch is a 422 and writes nothing.
+
+    Registration is a pure function of the request body that never
+    resolves any receipt, impact, actor, content, or bundle id against
+    local state: nothing described by the package is created, modified,
+    or queried, and it need not exist locally.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    package: ImpactReconVerificationCreate
+    signature_metadata: ImpactReconExchangeSignatureMetadata
+
+
+class ImpactReconExchangeImportResponse(BaseModel):
+    """The public immutable receipt for one registered exchange import.
+
+    Exactly the stable ``irx_`` receipt id, the signature version, the
+    signing subject, the signer's public key (canonical standard Base64),
+    the two verified digests (the entries digest and the whole-package
+    digest), and the UTC ``received_at`` instant. The package itself and
+    the raw signature are deliberately not part of the receipt: they are
+    neither copied into the record nor echoed here.
+    """
+
+    id: str
+    signature_version: str
+    subject: str
+    #: Canonical standard Base64 of the 32-byte Ed25519 public key.
+    public_key: str
+    entries_digest_hex: str
+    package_digest_hex: str
+    received_at: datetime
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.

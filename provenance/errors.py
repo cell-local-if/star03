@@ -199,6 +199,48 @@ class ImpactImportValidationError(DomainError):
         super().__init__(details=merged)
 
 
+class ImpactReconExchangeImportNotFoundError(DomainError):
+    status_code = 404
+    code = "impact_recon_exchange_import_not_found"
+    message = "The requested impact recon exchange import does not exist."
+
+    def __init__(self, import_id: str):
+        super().__init__(details={"import_id": import_id})
+
+
+class ImpactReconExchangeImportValidationError(DomainError):
+    """A structurally valid exchange-import request that fails verification.
+
+    An entries digest or whole-package digest that does not match the
+    canonical SHA-256 recomputed from the received package, or a
+    resubmission whose signer identity or signature differs from the
+    registered record, renders with the same ``validation_error`` code and
+    422 status as a malformed payload: the package is refused before any
+    receipt or audit row is written, and the original record is unchanged.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str, details: dict | None = None):
+        merged = {"reason": reason}
+        if details:
+            merged.update(details)
+        super().__init__(details=merged)
+
+
+class ImpactReconSignatureVerificationError(DomainError):
+    """A well-formed exchange import whose Ed25519 signature does not verify."""
+
+    status_code = 422
+    code = "impact_recon_signature_verification_failed"
+    message = "The impact recon exchange signature could not be verified."
+
+    def __init__(self, details: dict | None = None):
+        super().__init__(details=details)
+
+
 class ContentExportJobNotFoundError(DomainError):
     status_code = 404
     code = "content_export_job_not_found"

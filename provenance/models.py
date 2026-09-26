@@ -51,6 +51,7 @@ EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
 EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 EVENT_AUDIT_CHECKPOINT_IMPORTED = "audit.checkpoint_imported"
 EVENT_REVOCATION_IMPACT_IMPORTED = "revocation_impact.imported"
+EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED = "revocation_impact.exchange_imported"
 EVENT_CONTENT_EXPORT_JOB_CREATED = "content_export_job.created"
 EVENT_CONTENT_EXPORT_JOB_RUN = "content_export_job.run"
 EVENT_ACTOR_TRUST_POLICY_CREATED = "actor_trust_policy.created"
@@ -859,6 +860,73 @@ class ImpactImportRecord(Base):
     impact_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
     #: The SHA-256 impacts digest the received impacts array was verified against.
     impacts_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+
+class ImpactReconExchangeImportRecord(Base):
+    """An immutable receipt for one offline-verified signed recon package.
+
+    The record is the controlled-import counterpart of the stateless
+    impact-recon verification route: a package whose checkpoint matches the
+    canonical SHA-256 of the received entries array under the existing
+    checkpoint rules, whose whole-package digest matches the signature
+    metadata's claimed digest under the existing canonical JSON rules, and
+    whose Ed25519 signature verifies over the exchange message, is
+    registered exactly once. The receipt stores only the receiving identity
+    -- the signature version, the signing subject, the signer's public key,
+    the entries digest, the package digest, and the SHA-256 digest of the
+    signature -- never the package itself and never the raw signature (and
+    never any private key); the full signed package must be re-presented on
+    a retry. Verification never depends on whether any referenced resource
+    exists locally, so no foreign keys and no local resource lookup
+    participate in the decision.
+
+    Records are append-only and immutable; there is deliberately no update
+    or delete path. The package digest is unique: a retried submission
+    carrying the identical signature metadata returns the original record
+    without another audit event, while a submission whose signer identity
+    or signature differs from the registered record is refused and changes
+    nothing.
+    """
+
+    __tablename__ = "impact_recon_exchange_imports"
+    __table_args__ = (
+        UniqueConstraint(
+            "package_digest_hex",
+            name="uq_impact_recon_exchange_imports_package",
+        ),
+        Index(
+            "ix_impact_recon_exchange_imports_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable receipt identifier ("irx_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: Fixed exchange signature format version committed to by the metadata.
+    signature_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The signing subject named by the signature metadata (an opaque
+    #: cross-system identifier, never a local actor lookup key).
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: Canonical standard Base64 of the 32-byte Ed25519 public key.
+    public_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The SHA-256 entries digest the received entries array was verified
+    #: against (the package checkpoint's ``entries_digest_hex``).
+    entries_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: The SHA-256 whole-package digest the signature commits to.
+    package_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: SHA-256 digest of the raw signature; the raw signature itself is
+    #: never persisted. Never part of the public receipt view.
+    signature_digest_hex: Mapped[str] = mapped_column(
+        String(128), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, nullable=False, default=utc_now
     )

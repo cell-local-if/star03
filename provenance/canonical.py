@@ -129,6 +129,19 @@ def revocation_impacts_digest_hex(impacts: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(impacts)).hexdigest()
 
 
+def impact_recon_package_digest_hex(package: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical whole-package bytes.
+
+    The package object (``checkpoint`` plus ``entries``) is canonicalized
+    under the same rules as :func:`canonical_json_bytes`: every object
+    member is sorted recursively by Unicode code point, arrays keep their
+    element order, separators are compact, non-ASCII is emitted unescaped,
+    and the encoding is UTF-8 -- so the digest is reproducible offline
+    from the received ``package`` member alone.
+    """
+    return hashlib.sha256(canonical_json_bytes(package)).hexdigest()
+
+
 def impact_recon_entries_digest_hex(entries: Any) -> str:
     """Return the SHA-256 hex digest of the canonical recon-entries bytes.
 
