@@ -127,3 +127,18 @@ def revocation_impacts_digest_hex(impacts: Any) -> str:
     (the digest of ``[]``).
     """
     return hashlib.sha256(canonical_json_bytes(impacts)).hexdigest()
+
+
+def impact_recon_entries_digest_hex(entries: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical recon-entries bytes.
+
+    The entries array keeps its element order exactly as exported (the
+    receipts' stable creation order); each entry object's members are
+    sorted recursively by Unicode code point (including the nested
+    ``local_checkpoint``), with compact separators, non-ASCII emitted
+    unescaped, and UTF-8 encoding -- the same canonical form as
+    :func:`revocation_impacts_digest_hex`, so the digest is reproducible
+    offline from the exported ``entries`` member alone, including an empty
+    array (the digest of ``[]``).
+    """
+    return hashlib.sha256(canonical_json_bytes(entries)).hexdigest()
