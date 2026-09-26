@@ -1803,6 +1803,74 @@ def list_revocations_for_access_grant(
     return list(session.execute(stmt).scalars().all())
 
 
+# Global access-grant-revocation search paging bounds.
+DEFAULT_ATTESTATION_ACCESS_GRANT_REVOCATIONS_LIMIT = 50
+MIN_ATTESTATION_ACCESS_GRANT_REVOCATIONS_LIMIT = 1
+MAX_ATTESTATION_ACCESS_GRANT_REVOCATIONS_LIMIT = 100
+
+
+def list_attestation_access_grant_revocations_page(
+    session: Session,
+    grant_id: str | None = None,
+    revoker_actor_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+    limit: int = DEFAULT_ATTESTATION_ACCESS_GRANT_REVOCATIONS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[AttestationAccessGrantRevocation], int]:
+    """Return one revocation page and the filtered total, both in SQL.
+
+    ``grant_id``, ``revoker_actor_id``, and ``reason`` are non-empty, case-
+    and whitespace-sensitive exact matches that combine as logical AND;
+    ``None`` means unfiltered. ``from_dt``/``to_dt`` are timezone-aware UTC
+    instants applied as inclusive ``created_at`` bounds. Filter values are
+    never resolved for existence, so an unknown grant id, revoker id, or
+    reason is an empty result rather than a missing resource.
+
+    The total is a SQL ``COUNT`` over the filtered set (independent of the
+    page) and the page is a SQL ``LIMIT``/``OFFSET`` window of that set in
+    stable creation order (``created_at`` then the monotonic ``seq``
+    tiebreaker), so ordering and paging never depend on in-memory sorting and
+    stay stable across restarts. The retrieval is strictly read-only: it
+    writes no revocation, grant, resource, or audit event.
+    """
+    filters = []
+    if grant_id is not None:
+        filters.append(AttestationAccessGrantRevocation.grant_id == grant_id)
+    if revoker_actor_id is not None:
+        filters.append(
+            AttestationAccessGrantRevocation.revoker_actor_id
+            == revoker_actor_id
+        )
+    if reason is not None:
+        filters.append(AttestationAccessGrantRevocation.reason == reason)
+    if from_dt is not None:
+        filters.append(
+            AttestationAccessGrantRevocation.created_at >= from_dt
+        )
+    if to_dt is not None:
+        filters.append(
+            AttestationAccessGrantRevocation.created_at <= to_dt
+        )
+
+    total = session.execute(
+        select(func.count())
+        .select_from(AttestationAccessGrantRevocation)
+        .where(*filters)
+    ).scalar_one()
+
+    page_stmt = (
+        select(AttestationAccessGrantRevocation)
+        .where(*filters)
+        .order_by(*_ATTESTATION_ACCESS_GRANT_REVOCATION_ORDER)
+        .limit(limit)
+        .offset(offset)
+    )
+    page = list(session.execute(page_stmt).scalars().all())
+    return page, int(total)
+
+
 def get_accessible_attestation(
     session: Session, attestation_id: str, actor_id: str
 ) -> Attestation | None:

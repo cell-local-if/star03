@@ -655,9 +655,12 @@ def test_revocation_body_validation_failures_are_422_and_write_nothing(
 # --- Append-only immutability ---------------------------------------------------
 
 
-def test_revocation_collection_rejects_non_post_methods(client):
+def test_revocation_collection_rejects_non_get_post_methods(client):
+    # POST remains the authenticated creation route and GET is the read-only
+    # cross-grant revocation search; only PUT/PATCH/DELETE are 405.
     _world(client)
-    for method in ("get", "put", "patch", "delete"):
+    assert client.get(REVOCATIONS_PATH).status_code == 200
+    for method in ("put", "patch", "delete"):
         resp = getattr(client, method)(REVOCATIONS_PATH)
         assert resp.status_code == 405, method
         assert resp.json()["error"]["code"] == "method_not_allowed"

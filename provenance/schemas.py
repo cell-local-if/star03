@@ -2272,6 +2272,16 @@ class AttestationAccessGrantRevocationListResponse(BaseModel):
     count: int
 
 
+class AttestationAccessGrantRevocationPageResponse(BaseModel):
+    """A cursor-paginated page of access-grant-revocation public views."""
+
+    items: list[AttestationAccessGrantRevocationResponse]
+    #: Total number of revocations after filtering, independent of pagination.
+    count: int
+    #: Opaque continuation token; null on the final (or past-the-end) page.
+    next_cursor: str | None
+
+
 class AuditEventItem(BaseModel):
     """Public audit-event view: type, resource, and UTC timestamp only."""
 
