@@ -667,6 +667,40 @@ def list_claim_supersessions_page(
     return page, int(total)
 
 
+def list_claim_supersessions(
+    session: Session,
+    supersession_id: str | None = None,
+    superseded_claim_id: str | None = None,
+    replacement_claim_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[ClaimSupersession]:
+    """Return every filtered claim supersession in stable creation order.
+
+    The unpaginated counterpart of :func:`list_claim_supersessions_page`:
+    the same filters (non-empty exact-match strings combined as logical
+    AND, inclusive timezone-aware UTC ``created_at`` bounds), the same
+    stable creation order (``created_at`` then the monotonic ``seq``
+    tiebreaker), but with no LIMIT/OFFSET window so the correction
+    checkpoint package export can snapshot the entire filtered set in
+    one read. Strictly read-only: it writes no supersession, claim,
+    resource, or audit event.
+    """
+    page, _total = list_claim_supersessions_page(
+        session,
+        supersession_id,
+        superseded_claim_id,
+        replacement_claim_id,
+        reason,
+        from_dt,
+        to_dt,
+        limit=None,
+        offset=0,
+    )
+    return page
+
+
 # Reviewer claim search paging bounds.
 DEFAULT_CLAIMS_LIMIT = 50
 MIN_CLAIMS_LIMIT = 1

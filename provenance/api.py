@@ -56,6 +56,8 @@ from provenance.schemas import (
     IMPACT_RECON_DIGEST_ALGORITHM,
     REVOCATION_IMPACT_CHECKPOINT_VERSION,
     REVOCATION_IMPACT_DIGEST_ALGORITHM,
+    CSP_CHECKPOINT_VERSION,
+    CSP_DIGEST_ALGORITHM,
     ActorCreate,
     ActorPageResponse,
     ActorResponse,
@@ -130,6 +132,10 @@ from provenance.schemas import (
     ClaimSupersessionPageResponse,
     ClaimSupersessionResponse,
     ClaimSupersessionLineageItem,
+    ClaimSupersessionCorrectionCheckpointResponse,
+    ClaimSupersessionCorrectionPackageResponse,
+    CspVerificationCreate,
+    CspVerificationResponse,
     ClaimSupersessionLineageResponse,
     ContentCreate,
     ContentCoverageSearchItem,
@@ -1295,6 +1301,202 @@ async def list_claim_supersessions(
         + "\n"
     ).encode("utf-8")
     return Response(content=body, media_type="application/json")
+
+
+_CSP_PACKAGE_PARAMS = frozenset(
+    {
+        "id",
+        "superseded_claim_id",
+        "replacement_claim_id",
+        "reason",
+        "from",
+        "to",
+    }
+)
+
+
+def _csp_package_filters(request: Request):
+    """Parse and validate the correction checkpoint package filters.
+
+    The package route shares the supersession search's parameter contract
+    minus pagination: only id/superseded_claim_id/replacement_claim_id/
+    reason/from/to are accepted, so limit/cursor and every other
+    undeclared parameter are rejected rather than ignored, a repeated
+    scalar is rejected instead of silently taking the last value, and
+    blank or malformed values are never coerced. Returns
+    ``(supersession_id, superseded_claim_id, replacement_claim_id,
+    reason, from_dt, to_dt)``.
+    """
+    raw = request.query_params
+
+    unknown = set(raw) - _CSP_PACKAGE_PARAMS
+    if unknown:
+        # A typo or a pagination parameter never silently changes the
+        # snapshot.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    supersession_id = _parse_nonempty_filter(raw, "id")
+    superseded_claim_id = _parse_nonempty_filter(raw, "superseded_claim_id")
+    replacement_claim_id = _parse_nonempty_filter(
+        raw, "replacement_claim_id"
+    )
+    reason = _parse_nonempty_filter(raw, "reason")
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    return (
+        supersession_id,
+        superseded_claim_id,
+        replacement_claim_id,
+        reason,
+        from_dt,
+        to_dt,
+    )
+
+
+@router.get("/csp/package")
+async def export_csp_package(request: Request, session: DbSession) -> Response:
+    # Read-only export of the whole filtered immutable-declaration
+    # correction (claim supersession) snapshot together with its auditable
+    # checkpoint. The GET request body must be empty, exactly as on the
+    # supersession search: carrying any bytes (even whitespace, arbitrary
+    # bytes, or malformed JSON) is a 422 validated before any query
+    # parameter or correction record is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Same filter contract as GET /v1/claim-supersessions, but no limit
+    # and no cursor: the package always snapshots every matching
+    # correction in one read. Undeclared (including limit/cursor), blank,
+    # repeated, or malformed parameters and a from later than to are all
+    # 422 before any correction is read.
+    (
+        supersession_id,
+        superseded_claim_id,
+        replacement_claim_id,
+        reason,
+        from_dt,
+        to_dt,
+    ) = _csp_package_filters(request)
+
+    # Strictly read-only, and both halves come from the same state read:
+    # every matching correction is read once in the supersessions' stable
+    # creation order, the corrections member renders those existing public
+    # views, and the checkpoint digests exactly that same array, so the two
+    # can never disagree. No resource, record, or audit event is written;
+    # an empty match set yields "corrections": [] with correction_count 0
+    # and the digest of the empty array. Filter values are never resolved
+    # for existence, so an unknown value is an empty snapshot, not a 404.
+    corrections = service.list_claim_supersessions(
+        session,
+        supersession_id,
+        superseded_claim_id,
+        replacement_claim_id,
+        reason,
+        from_dt,
+        to_dt,
+    )
+    correction_views = [
+        _claim_supersession_response(record) for record in corrections
+    ]
+    # mode="json" yields exactly the wire view served in this response's
+    # corrections member (UTC datetimes as RFC 3339 strings), so the
+    # checkpoint binds to exactly those corrections and is reproducible by
+    # an external verifier from the package body alone.
+    correction_payloads = [
+        view.model_dump(mode="json") for view in correction_views
+    ]
+    package = ClaimSupersessionCorrectionPackageResponse(
+        checkpoint=ClaimSupersessionCorrectionCheckpointResponse(
+            checkpoint_version=CSP_CHECKPOINT_VERSION,
+            digest_algorithm=CSP_DIGEST_ALGORITHM,
+            correction_count=len(correction_payloads),
+            corrections_digest_hex=(
+                canonical.claim_supersession_corrections_digest_hex(
+                    correction_payloads
+                )
+            ),
+        ),
+        corrections=correction_views,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated
+    # by exactly one newline; root members appear as checkpoint,
+    # corrections.
+    body = (
+        json.dumps(
+            package.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
+
+
+@router.post(
+    "/csp/verify",
+    response_model=CspVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_csp_package(
+    payload: CspVerificationCreate, request: Request
+) -> Response:
+    # The route accepts no query parameters: any (or repeated) parameter is
+    # a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no resource, audit row, or log is written.
+    # Verification uses the request body alone; no supersession or claim id
+    # is ever resolved against local state, so unknown resources, repeated
+    # requests, and differing local state verify identically. Malformed
+    # JSON and every structural, field, type, count, timestamp, or
+    # digest-input failure are rejected by the request model as a 422
+    # before this body runs.
+    body = await request.json()
+    # The digest commits to the corrections array exactly as received: the
+    # raw JSON values (array order, datetime spellings), not any parsed or
+    # re-serialized form. The array keeps its order; nested object keys
+    # sort by Unicode code point under the checkpoint canonical rules.
+    computed_digest_hex = (
+        canonical.claim_supersession_corrections_digest_hex(
+            body["corrections"]
+        )
+    )
+    if computed_digest_hex == payload.checkpoint.corrections_digest_hex:
+        result = {"valid": True}
+    else:
+        result = {
+            "valid": False,
+            "computed_digest_hex": computed_digest_hex,
+        }
+    # Compact UTF-8 JSON, boolean literals, terminated by exactly one
+    # newline; a match carries no field besides valid.
+    data = (
+        json.dumps(
+            result,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=data, media_type="application/json")
 
 
 @router.get(

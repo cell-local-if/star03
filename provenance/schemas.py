@@ -322,6 +322,170 @@ class ClaimSupersessionLineageItem(ClaimResponse):
     depth: int
 
 
+#: Fixed checkpoint format version emitted for the immutable-declaration
+#: correction (claim supersession) checkpoint package.
+CSP_CHECKPOINT_VERSION = "provenance-csp-checkpoint-v1"
+#: The sole digest algorithm used for correction checkpoints.
+CSP_DIGEST_ALGORITHM = "sha256"
+
+
+class ClaimSupersessionCorrectionCheckpointResponse(BaseModel):
+    """A read-only integrity checkpoint over a filtered correction snapshot.
+
+    Exactly four members: the fixed ``checkpoint_version`` and
+    ``digest_algorithm``, the number of corrections in the filtered
+    snapshot, and the SHA-256 hex digest of the canonical corrections
+    array. The checkpoint is derived purely from the existing
+    supersession records: it introduces no resource, record, or audit
+    event, and its value is stable for unchanged persisted state --
+    including the empty snapshot.
+    """
+
+    checkpoint_version: Literal[CSP_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[CSP_DIGEST_ALGORITHM]
+    correction_count: int
+    corrections_digest_hex: str
+
+
+class ClaimSupersessionCorrectionPackageResponse(BaseModel):
+    """One read returning a filtered correction snapshot with its checkpoint.
+
+    Exactly two members: ``checkpoint`` is the four-field correction
+    checkpoint for the effective filter and ``corrections`` lists, in the
+    supersessions' stable creation order, the existing correction public
+    views matched by that same filter (each exactly the existing
+    five-field supersession public view). The checkpoint digest is
+    computed over exactly the ``corrections`` array returned in this
+    response under the checkpoint canonical rules (array order kept,
+    nested object keys sorted by Unicode code point, compact separators,
+    unescaped non-ASCII, UTF-8); both derive from a single read-only
+    state read, so they can never disagree. The package introduces no
+    resource, record, or audit event; an empty match yields
+    ``"corrections": []`` together with the digest of the empty array.
+    """
+
+    checkpoint: ClaimSupersessionCorrectionCheckpointResponse
+    corrections: list[ClaimSupersessionResponse]
+
+
+class CspVerificationCorrection(BaseModel):
+    """One correction under stateless verification: exactly the public view.
+
+    The structure must match the exported correction public view field for
+    field -- ``id``, both endpoint claim ids, ``reason``, and a strict
+    RFC 3339 UTC ``created_at`` -- with no undeclared member (so no claim
+    payload, signature, content, or evidence byte can enter the request).
+    ``created_at`` is kept as the raw string so the digest commits to the
+    timestamp exactly as spelled on the wire. Verification never resolves
+    any id against local state: fabricated but structurally consistent
+    identifiers verify exactly like known ones.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=80)
+    superseded_claim_id: str = Field(..., min_length=1, max_length=80)
+    replacement_claim_id: str = Field(..., min_length=1, max_length=80)
+    reason: str = Field(..., min_length=1, max_length=4096)
+    created_at: str
+
+    @field_validator("id", "superseded_claim_id", "replacement_claim_id")
+    @classmethod
+    def _identifier_nonempty(cls, v: str) -> str:
+        # Every identifier is a non-empty, non-whitespace string; nothing
+        # is trimmed or normalized.
+        if not v.strip():
+            raise ValueError("identifier must not be empty")
+        return v
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("reason must not be empty")
+        return v
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_strict_rfc3339_utc(cls, v: str) -> str:
+        if parse_rfc3339_utc(v) is None:
+            raise ValueError(
+                "created_at must be a strict RFC 3339 UTC timestamp"
+            )
+        return v
+
+
+class CspVerificationCheckpoint(BaseModel):
+    """The claimed checkpoint under stateless correction verification.
+
+    Exactly the four-field checkpoint structure the export serves: the
+    fixed ``checkpoint_version`` and ``digest_algorithm``, the claimed
+    correction count, and the claimed corrections digest. Undeclared
+    members are rejected rather than ignored, exactly as on the package
+    export.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_version: Literal[CSP_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[CSP_DIGEST_ALGORITHM]
+    #: Non-negative integer count the submitted corrections array must match.
+    correction_count: StrictInt = Field(..., ge=0)
+    corrections_digest_hex: str
+
+    @field_validator("corrections_digest_hex")
+    @classmethod
+    def _corrections_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "corrections_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class CspVerificationCreate(BaseModel):
+    """A stateless correction checkpoint verification request.
+
+    Exactly two members: ``checkpoint`` carries the claimed four-field
+    correction checkpoint and ``corrections`` carries the correction
+    sequence it commits to, with exactly ``checkpoint.correction_count``
+    elements, each exactly the exported correction public view.
+    Verification is pure: it reads and writes no server state, so no
+    supersession, claim, or other resource id is ever resolved against
+    local state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint: CspVerificationCheckpoint
+    corrections: list[CspVerificationCorrection]
+
+    @model_validator(mode="after")
+    def _corrections_match_claimed_count(self):
+        if len(self.corrections) != self.checkpoint.correction_count:
+            raise ValueError(
+                "corrections must contain exactly"
+                " checkpoint.correction_count elements"
+            )
+        return self
+
+
+class CspVerificationResponse(BaseModel):
+    """The stateless correction verification verdict.
+
+    ``computed_digest_hex`` is present only on a mismatch, so a matching
+    checkpoint renders exactly ``{"valid": true}``.
+    """
+
+    valid: bool
+    #: The digest computed from the submitted corrections array under the
+    #: checkpoint canonical rules; omitted when it matches the claim.
+    computed_digest_hex: str | None = None
+
+
 class ClaimSupersessionLineageResponse(BaseModel):
     items: list[ClaimSupersessionLineageItem]
     #: Total number of items after the minimum-depth filter, independent of
