@@ -1959,6 +1959,38 @@ class ImpactReconExchangeImportResponse(BaseModel):
     received_at: datetime
 
 
+class ImpactReconExchangeImportPageResponse(BaseModel):
+    """A cursor-paginated page of signed exchange-import receipt views."""
+
+    items: list[ImpactReconExchangeImportResponse]
+    #: Total number of receipts after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
+class ImpactReconExchangeImportReconResponse(BaseModel):
+    """A read-only reconciliation of one signed exchange-import receipt.
+
+    Exactly four members: the receipt's ``import_id``; ``local_available``
+    -- true only when the current, complete, unfiltered local impact-recon
+    package carries at least one reconciliation entry (an empty state
+    still yields a deterministic package digest); the current
+    ``local_package_digest_hex`` -- the SHA-256 package digest recomputed
+    at read time over the unfiltered local impact-recon package under the
+    existing package canonical rules; and ``matches`` -- true only when
+    that current digest equals the receipt's ``package_digest_hex``
+    character for character. The package, the raw signature, and any
+    private key are never read back or echoed, and no digest is ever
+    resolved in reverse to a resource.
+    """
+
+    import_id: str
+    local_available: bool
+    local_package_digest_hex: str
+    matches: bool
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.

@@ -103,6 +103,10 @@ IMPACT_IMPORTS_CURSOR_VERSION = "ii1"
 #: reconciliations.
 IMPACT_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "iir1"
 
+#: Marker for cursors that page through signed impact-recon
+#: exchange-import receipts.
+IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR_VERSION = "rx1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -890,6 +894,49 @@ IMPACT_IMPORT_RECONCILIATIONS_CURSOR = CursorKind(
     version=IMPACT_IMPORT_RECONCILIATIONS_CURSOR_VERSION,
     claim_fields=("local_available", "matches", "limit", "offset"),
     validate=_validate_impact_import_reconciliations_claims,
+)
+
+
+def _validate_impact_recon_exchange_imports_claims(
+    claims: dict[str, Any],
+) -> None:
+    # The exact-match text filters are either absent (null) or non-empty
+    # strings; matching is case- and whitespace-sensitive, so the raw value
+    # is bound. The public-key filter binds the exact Base64 spelling.
+    _optional_nonempty_str(claims, "signature_version")
+    _optional_nonempty_str(claims, "signer_subject")
+    _optional_nonempty_str(claims, "public_key")
+    _optional_nonempty_str(claims, "package_digest_hex")
+    # The time bounds are absent (null) or canonical RFC 3339 UTC strings.
+    for field in ("from", "to"):
+        value = claims[field]
+        if value is not None and (
+            not isinstance(value, str) or parse_rfc3339_utc(value) is None
+        ):
+            raise InvalidCursorError(f"cursor {field} is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/impact-recon-exchange-imports``.
+IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR = CursorKind(
+    version=IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR_VERSION,
+    claim_fields=(
+        "signature_version",
+        "signer_subject",
+        "public_key",
+        "package_digest_hex",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_impact_recon_exchange_imports_claims,
 )
 
 

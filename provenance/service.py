@@ -7,6 +7,7 @@ adds no audit event.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from typing import Callable
 
@@ -3137,6 +3138,78 @@ def get_impact_recon_exchange_import(
     if record is None:
         raise ImpactReconExchangeImportNotFoundError(import_id)
     return record
+
+
+# Signed impact-recon exchange-import receipt search paging bounds.
+DEFAULT_IMPACT_RECON_EXCHANGE_IMPORTS_LIMIT = 50
+MIN_IMPACT_RECON_EXCHANGE_IMPORTS_LIMIT = 1
+MAX_IMPACT_RECON_EXCHANGE_IMPORTS_LIMIT = 100
+
+_IMPACT_RECON_EXCHANGE_IMPORT_ORDER = (
+    ImpactReconExchangeImportRecord.created_at.asc(),
+    ImpactReconExchangeImportRecord.seq.asc(),
+)
+
+
+def list_impact_recon_exchange_imports(
+    session: Session,
+    signature_version: str | None = None,
+    signer_subject: str | None = None,
+    public_key: str | None = None,
+    package_digest_hex: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[ImpactReconExchangeImportRecord]:
+    """Return signed exchange-import receipts in stable creation order, filtered.
+
+    ``signature_version``, ``signer_subject``, and ``package_digest_hex``
+    are exact, case- and whitespace-sensitive string matches against the
+    stored receipt fields; ``public_key`` is an exact, case- and
+    whitespace-sensitive match against the receipt's standard-Base64
+    public view (never decoded or normalized, so a non-canonical spelling
+    simply matches nothing). ``from_dt``/``to_dt`` are inclusive UTC
+    bounds on the receipt's ``created_at``. All filters combine as
+    logical AND; an absent filter imposes no restriction, and a filter
+    value that names nothing yields an empty list rather than an error.
+    Results follow the receipts' stable creation order (``created_at``
+    with the monotonic ``seq`` tiebreaker). The function is strictly
+    read-only: it writes no resource and no audit event.
+    """
+    stmt = select(ImpactReconExchangeImportRecord)
+    if signature_version is not None:
+        stmt = stmt.where(
+            ImpactReconExchangeImportRecord.signature_version
+            == signature_version
+        )
+    if signer_subject is not None:
+        stmt = stmt.where(
+            ImpactReconExchangeImportRecord.signer_subject == signer_subject
+        )
+    if package_digest_hex is not None:
+        stmt = stmt.where(
+            ImpactReconExchangeImportRecord.package_digest_hex
+            == package_digest_hex
+        )
+    if from_dt is not None:
+        stmt = stmt.where(
+            ImpactReconExchangeImportRecord.created_at >= from_dt
+        )
+    if to_dt is not None:
+        stmt = stmt.where(
+            ImpactReconExchangeImportRecord.created_at <= to_dt
+        )
+    stmt = stmt.order_by(*_IMPACT_RECON_EXCHANGE_IMPORT_ORDER)
+    rows = list(session.execute(stmt).scalars().all())
+    if public_key is not None:
+        # The filter binds the exact Base64 spelling served on the public
+        # view; the stored raw key bytes are rendered, never the other way
+        # around, so a non-canonical spelling matches nothing.
+        rows = [
+            row
+            for row in rows
+            if base64.b64encode(row.public_key).decode("ascii") == public_key
+        ]
+    return rows
 
 
 # Impact-import receipt search paging bounds.

@@ -86,6 +86,8 @@ from provenance.schemas import (
     ImpactReconCheckpointResponse,
     ImpactReconEntryResponse,
     ImpactReconExchangeImportCreate,
+    ImpactReconExchangeImportPageResponse,
+    ImpactReconExchangeImportReconResponse,
     ImpactReconExchangeImportResponse,
     ImpactReconPackageResponse,
     ImpactReconVerificationCreate,
@@ -3810,6 +3812,56 @@ def _impact_recon_package_item(
     )
 
 
+def _unfiltered_impact_recon_entry_views(
+    session: Session,
+) -> list[ImpactReconEntryResponse]:
+    """Every current reconciliation entry view, complete and unfiltered.
+
+    Exactly the global reconciliation listing's read: receipts in stable
+    creation order, the current local impact set read once complete and
+    unfiltered (identical for every entry), and each entry's match verdict
+    computed at this read. Strictly read-only.
+    """
+    records = service.list_revocation_impact_import_reconciliations(session)
+    local_checkpoint = _local_revocation_impact_checkpoint(session)
+    available = local_checkpoint.impact_count > 0
+    entry_views: list[ImpactReconEntryResponse] = []
+    for record in records:
+        record_matches = (
+            record.checkpoint_version == local_checkpoint.checkpoint_version
+            and record.impact_count == local_checkpoint.impact_count
+            and record.impacts_digest_hex == local_checkpoint.impacts_digest_hex
+        )
+        entry_views.append(
+            _impact_recon_package_item(
+                record, available, local_checkpoint, record_matches
+            )
+        )
+    return entry_views
+
+
+def _impact_recon_package_from_views(
+    entry_views: list[ImpactReconEntryResponse],
+) -> ImpactReconPackageResponse:
+    """Assemble the wire package (checkpoint + entries) over entry views."""
+    # mode="json" yields exactly the wire view served in a package
+    # response's entries member (UTC datetimes as RFC 3339 strings), so
+    # the checkpoint binds to exactly those entries and is reproducible by
+    # an external verifier from the package body alone.
+    entry_payloads = [view.model_dump(mode="json") for view in entry_views]
+    return ImpactReconPackageResponse(
+        checkpoint=ImpactReconCheckpointResponse(
+            checkpoint_version=IMPACT_RECON_CHECKPOINT_VERSION,
+            digest_algorithm=IMPACT_RECON_DIGEST_ALGORITHM,
+            entry_count=len(entry_payloads),
+            entries_digest_hex=canonical.impact_recon_entries_digest_hex(
+                entry_payloads
+            ),
+        ),
+        entries=entry_views,
+    )
+
+
 @router.get("/impact-recon-package")
 async def export_impact_recon_package(
     request: Request, session: DbSession
@@ -3855,46 +3907,16 @@ async def export_impact_recon_package(
     # resource, receipt, or audit event is written; an empty match set
     # yields "entries": [] with entry_count 0 and the digest of the empty
     # array.
-    records = service.list_revocation_impact_import_reconciliations(session)
-    local_checkpoint = _local_revocation_impact_checkpoint(session)
-    available = local_checkpoint.impact_count > 0
-
-    entry_views: list[ImpactReconEntryResponse] = []
-    for record in records:
-        record_matches = (
-            record.checkpoint_version == local_checkpoint.checkpoint_version
-            and record.impact_count == local_checkpoint.impact_count
-            and record.impacts_digest_hex == local_checkpoint.impacts_digest_hex
-        )
+    entry_views = [
+        view
+        for view in _unfiltered_impact_recon_entry_views(session)
         if (
-            local_available_filter is not None
-            and available != local_available_filter
-        ):
-            continue
-        if matches_filter is not None and record_matches != matches_filter:
-            continue
-        entry_views.append(
-            _impact_recon_package_item(
-                record, available, local_checkpoint, record_matches
-            )
+            local_available_filter is None
+            or view.local_available == local_available_filter
         )
-
-    # mode="json" yields exactly the wire view served in this response's
-    # entries member (UTC datetimes as RFC 3339 strings), so the
-    # checkpoint binds to exactly those entries and is reproducible by an
-    # external verifier from the package body alone.
-    entry_payloads = [view.model_dump(mode="json") for view in entry_views]
-    package = ImpactReconPackageResponse(
-        checkpoint=ImpactReconCheckpointResponse(
-            checkpoint_version=IMPACT_RECON_CHECKPOINT_VERSION,
-            digest_algorithm=IMPACT_RECON_DIGEST_ALGORITHM,
-            entry_count=len(entry_payloads),
-            entries_digest_hex=canonical.impact_recon_entries_digest_hex(
-                entry_payloads
-            ),
-        ),
-        entries=entry_views,
-    )
+        and (matches_filter is None or view.matches == matches_filter)
+    ]
+    package = _impact_recon_package_from_views(entry_views)
     # Compact UTF-8 JSON, null/boolean literals, integral numbers only
     # (never a negative zero or non-finite number), terminated by exactly
     # one newline; root members appear as checkpoint, entries.
@@ -4097,6 +4119,203 @@ def get_impact_recon_exchange_import(
     return _render_compact_json(
         _impact_recon_exchange_import_response(record)
     )
+
+
+_IMPACT_RECON_EXCHANGE_IMPORTS_PARAMS = frozenset(
+    {
+        "signature_version",
+        "signer_subject",
+        "public_key",
+        "package_digest_hex",
+        "from",
+        "to",
+        "limit",
+        "cursor",
+    }
+)
+
+
+@router.get("/impact-recon-exchange-imports")
+async def list_impact_recon_exchange_imports(
+    request: Request, session: DbSession
+) -> Response:
+    # The GET request body must be empty: carrying any bytes (even
+    # whitespace, arbitrary bytes, or malformed JSON) is a 422 validated
+    # before any query parameter or receipt is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _IMPACT_RECON_EXCHANGE_IMPORTS_PARAMS
+    if unknown:
+        # A typo never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    signature_version = _parse_nonempty_filter(raw, "signature_version")
+    signer_subject = _parse_nonempty_filter(raw, "signer_subject")
+    public_key = _parse_nonempty_filter(raw, "public_key")
+    package_digest_hex = _parse_nonempty_filter(raw, "package_digest_hex")
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_IMPACT_RECON_EXCHANGE_IMPORTS_LIMIT,
+        service.MIN_IMPACT_RECON_EXCHANGE_IMPORTS_LIMIT,
+        service.MAX_IMPACT_RECON_EXCHANGE_IMPORTS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.impact_recon_exchange_imports_cursor_secret,
+                pagination.IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered; the time claims canonicalize "Z"
+        # and "+00:00" to the same instant) and the effective limit must
+        # match exactly. A cursor minted by another endpoint family already
+        # fails decoding above.
+        expected = {
+            "signature_version": signature_version,
+            "signer_subject": signer_subject,
+            "public_key": public_key,
+            "package_digest_hex": package_digest_hex,
+            "from": _audit_time_claim(from_dt),
+            "to": _audit_time_claim(to_dt),
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no receipt, resource, or audit
+    # event. The total is the filtered count covering every page. Filter
+    # values are never resolved for existence, so an unknown value is an
+    # empty collection rather than a 404. Each item is exactly the
+    # single-receipt public view; the package, the raw signature, and every
+    # private key are never persisted and so can never be echoed.
+    items = service.list_impact_recon_exchange_imports(
+        session,
+        signature_version,
+        signer_subject,
+        public_key,
+        package_digest_hex,
+        from_dt,
+        to_dt,
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.impact_recon_exchange_imports_cursor_secret,
+                pagination.IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR,
+                {
+                    "signature_version": signature_version,
+                    "signer_subject": signer_subject,
+                    "public_key": public_key,
+                    "package_digest_hex": package_digest_hex,
+                    "from": _audit_time_claim(from_dt),
+                    "to": _audit_time_claim(to_dt),
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = ImpactReconExchangeImportPageResponse(
+        items=[_impact_recon_exchange_import_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated
+    # by exactly one newline; members appear as items, count, next_cursor.
+    return _render_compact_json(result.model_dump(mode="json"))
+
+
+@router.get("/impact-recon-exchange-imports/{import_id}/recon")
+async def reconcile_impact_recon_exchange_import(
+    import_id: str, request: Request, session: DbSession
+) -> Response:
+    # The GET request body must be empty: any bytes are a 422 validated
+    # before any query parameter, receipt, or local state is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    # Same boundary as the receipt read route: any (or repeated) query
+    # parameter is a 422 before the receipt lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only: the reconciliation writes no resource, receipt,
+    # or audit event. An unknown receipt id is the existing
+    # impact_recon_exchange_import_not_found 404 and changes nothing.
+    record = service.get_impact_recon_exchange_import(session, import_id)
+
+    # The current local recon package is always read complete and
+    # unfiltered under exactly the package export's rules, so the digest
+    # is reproducible by an external verifier from a fresh
+    # GET /v1/impact-recon-package body alone -- including the empty
+    # state, which still yields a deterministic digest. The verdict is
+    # computed at this read and compares character for character; no
+    # digest is ever resolved in reverse to a resource, and the package,
+    # the raw signature, and any private key are never read back or
+    # echoed.
+    entry_views = _unfiltered_impact_recon_entry_views(session)
+    package = _impact_recon_package_from_views(entry_views)
+    local_package_digest_hex = canonical.impact_recon_package_digest_hex(
+        package.model_dump(mode="json")
+    )
+    result = ImpactReconExchangeImportReconResponse(
+        import_id=record.id,
+        local_available=len(entry_views) > 0,
+        local_package_digest_hex=local_package_digest_hex,
+        matches=local_package_digest_hex == record.package_digest_hex,
+    )
+    return _render_compact_json(result.model_dump(mode="json"))
 
 
 _TRUST_EVALUATION_PARAMS = frozenset(

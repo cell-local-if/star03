@@ -634,7 +634,9 @@ def test_non_get_methods_on_detail_are_405(client, method):
 
 
 def test_non_get_methods_on_collection_are_405(client):
-    for method in ("get", "put", "patch", "delete"):
+    # GET is the receipt retrieval route on the same collection path; the
+    # remaining non-POST methods stay rejected.
+    for method in ("put", "patch", "delete"):
         response = getattr(client, method)(POST_PATH)
         assert response.status_code == 405
         assert response.json()["error"]["code"] == "method_not_allowed"
