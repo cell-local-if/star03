@@ -869,6 +869,37 @@ class ContentExportJobSummaryResponse(BaseModel):
     oldest_pending_wait_seconds: int | None
 
 
+class ObservabilityAuditStatus(BaseModel):
+    """The audit-trail portion of the read-only running-state summary.
+
+    Exactly two members: the total number of existing audit events and the
+    UTC time of the most recent one (``null`` when the trail is empty -- a
+    determined empty state rather than a missing-resource error).
+    """
+
+    event_count: int
+    latest_event_at: datetime | None
+
+
+class ObservabilitySummaryResponse(BaseModel):
+    """Read-only running-state summary for operations.
+
+    Exactly six members in fixed order: the service status (``ok`` or
+    ``degraded``), the database status (``ready`` or ``unavailable``), the
+    ten existing-resource counts, the four content-export-job lifecycle
+    counts, the audit status (event total and latest UTC time), and the
+    current UTC check time. Every number is an integer; no raw resource,
+    task, claim payload, signature, content, or evidence byte appears.
+    """
+
+    service_status: Literal["ok", "degraded"]
+    database_status: Literal["ready", "unavailable"]
+    resource_counts: dict[str, int]
+    task_counts: dict[str, int]
+    audit_status: ObservabilityAuditStatus
+    checked_at: datetime
+
+
 class EvidenceBundleExchangeResponse(BaseModel):
     """An interoperability snapshot of one evidence bundle for external verifiers.
 

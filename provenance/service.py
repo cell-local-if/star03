@@ -12,7 +12,7 @@ import hashlib
 from typing import Callable
 
 from sqlalchemy import exists, func, or_, select, update as sa_update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from provenance import canonical, ed25519, ids, signing
@@ -41,6 +41,7 @@ from provenance.errors import (
     ImpactImportNotFoundError,
     ImpactReconExchangeImportNotFoundError,
     ImpactReconExchangeImportValidationError,
+    ObservabilityUnavailableError,
     ProtectedAccessValidationError,
     UnknownActorError,
 )
@@ -2826,6 +2827,112 @@ def summarize_content_export_jobs(
         .limit(1)
     ).scalar_one_or_none()
     return counts, oldest_pending
+
+
+# --- Read-only running-state summary ----------------------------------------
+
+#: Service status vocabulary for the observability summary.
+OBSERVABILITY_SERVICE_OK = "ok"
+OBSERVABILITY_SERVICE_DEGRADED = "degraded"
+#: Database status vocabulary for the observability summary.
+OBSERVABILITY_DATABASE_READY = "ready"
+OBSERVABILITY_DATABASE_UNAVAILABLE = "unavailable"
+
+#: The resource families covered by the observability summary, in the exact
+#: response order, each paired with the ORM model holding its records. The
+#: ten families are the existing records: actors (subjects), contents,
+#: claims, evidence bundles, attestations, attestation revocations,
+#: attestation access grants, content relations, audit events, and content
+#: export (async) jobs.
+_OBSERVABILITY_RESOURCE_MODELS = (
+    ("actors", Actor),
+    ("contents", Content),
+    ("claims", Claim),
+    ("evidence_bundles", EvidenceBundle),
+    ("attestations", Attestation),
+    ("attestation_revocations", AttestationRevocation),
+    ("attestation_access_grants", AttestationAccessGrant),
+    ("content_relations", ContentRelation),
+    ("audit_events", AuditEvent),
+    ("content_export_jobs", ContentExportJob),
+)
+
+
+def get_observability_summary(session: Session) -> dict:
+    """Return the read-only running-state summary from current persisted state.
+
+    The summary covers the ten existing resource families, the four content
+    export job lifecycle states, and the audit trail (its event total and the
+    latest event's UTC time, ``None`` when the trail is empty). Every count
+    is a non-negative integer and an empty database yields all-zero counts,
+    the deterministic empty audit state, and ``ok``/``ready`` statuses.
+
+    The read is strictly read-only: it only ever issues ``SELECT`` queries
+    inside the session's single read transaction, never commits, and
+    creates, modifies, or deletes no resource, task, or audit event. The
+    same persisted state therefore produces identical counts, statuses, and
+    audit results on repeated, concurrent, or post-restart reads. An
+    unreadable database or any internal failure of the summary queries
+    raises :class:`ObservabilityUnavailableError` (``503
+    service_unavailable``) instead of returning a partial summary.
+    """
+    try:
+        resource_counts = {
+            name: int(
+                session.scalar(select(func.count()).select_from(model))
+            )
+            for name, model in _OBSERVABILITY_RESOURCE_MODELS
+        }
+        status_rows = session.execute(
+            select(ContentExportJob.status, func.count()).group_by(
+                ContentExportJob.status
+            )
+        ).all()
+        task_counts = {state: 0 for state in CONTENT_EXPORT_JOB_STATES}
+        for status_value, total in status_rows:
+            # An unknown lifecycle value in anomalous history is ignored for
+            # the four named counters rather than surfacing as a fifth key.
+            if status_value in task_counts:
+                task_counts[status_value] = int(total)
+        latest_event_at = session.execute(
+            select(AuditEvent.created_at)
+            .order_by(
+                AuditEvent.created_at.desc(),
+                AuditEvent.seq.desc(),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+    except SQLAlchemyError:
+        # An unreadable database (connection, schema, statement failure):
+        # drop any half-open read transaction; a summary failure must leave
+        # no transaction side effect behind. The summary itself never
+        # writes, so rollback cannot discard any application mutation.
+        session.rollback()
+        raise ObservabilityUnavailableError("database_unavailable")
+    except Exception:
+        # Any other internal failure assembling the summary is still a
+        # service unavailability for this read-only route, never a partial
+        # body or a 500, and the read has nothing to commit.
+        session.rollback()
+        raise ObservabilityUnavailableError("internal_error")
+
+    return {
+        "service_status": OBSERVABILITY_SERVICE_OK,
+        "database_status": OBSERVABILITY_DATABASE_READY,
+        "resource_counts": resource_counts,
+        "task_counts": {
+            CONTENT_EXPORT_JOB_PENDING: task_counts[CONTENT_EXPORT_JOB_PENDING],
+            CONTENT_EXPORT_JOB_RUNNING: task_counts[CONTENT_EXPORT_JOB_RUNNING],
+            CONTENT_EXPORT_JOB_SUCCEEDED: task_counts[
+                CONTENT_EXPORT_JOB_SUCCEEDED
+            ],
+            CONTENT_EXPORT_JOB_FAILED: task_counts[CONTENT_EXPORT_JOB_FAILED],
+        },
+        "audit_status": {
+            "event_count": resource_counts["audit_events"],
+            "latest_event_at": latest_event_at,
+        },
+    }
 
 
 def get_evidence_bundle_exchange(

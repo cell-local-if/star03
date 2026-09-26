@@ -180,6 +180,7 @@ from provenance.schemas import (
     EvidenceBundleResponse,
     ExchangeManifestVerificationCreate,
     ExchangeManifestVerificationResponse,
+    ObservabilitySummaryResponse,
     TrustDecisionResponse,
     TrustEvaluationResponse,
 )
@@ -1525,13 +1526,12 @@ def _csp_import_response(record) -> CspImportResponse:
     )
 
 
-@router.post("/csp-imports", response_model=CspImportResponse)
+@router.post("/csp-imports")
 async def import_correction_checkpoint(
     payload: CspImportCreate,
     request: Request,
     session: DbSession,
-    response: Response,
-) -> CspImportResponse:
+) -> Response:
     # Structure, fixed version/algorithm, strict digest spelling, the
     # correction-item fields and timestamps, and the claimed correction
     # count have all passed request validation exactly as on the stateless
@@ -1553,10 +1553,15 @@ async def import_correction_checkpoint(
     record, created = service.create_csp_import(session, payload)
     # First registration of this receiving identity -> 201; a retried
     # submission -> 200 with the original record and no new audit event.
-    response.status_code = (
+    status_code = (
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
-    return _csp_import_response(record)
+    # Compact UTF-8 JSON terminated by exactly one newline, matching the
+    # other compact-wire import routes and the single-newline contract.
+    return _render_compact_json(
+        _csp_import_response(record).model_dump(mode="json"),
+        status_code=status_code,
+    )
 
 
 _CSP_IMPORTS_PARAMS = frozenset(
@@ -3274,6 +3279,46 @@ async def get_content_export_jobs_summary(
         + "\n"
     ).encode("utf-8")
     return Response(content=body, media_type="application/json")
+
+
+@router.get("/observability/summary")
+async def get_observability_summary(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only running-state summary for operations. The request takes no
+    # body and no query parameters: any non-empty body (including whitespace,
+    # arbitrary bytes, or malformed JSON) and any parameter (unknown, blank,
+    # or repeated) is a 422 validation_error, rejected before any state is
+    # read -- an invalid request never produces a partial summary, and no
+    # resource, task, or audit event is created, modified, or deleted.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # The summary only ever reads current persisted state: ten existing
+    # resource-family counts, the four job lifecycle counts, and the audit
+    # trail's total and latest UTC time. An empty database yields all-zero
+    # counts, the determined empty audit state (latest_event_at null), and
+    # ok/ready; an unreadable database or an internal summary-query failure
+    # is the existing-structure 503 service_unavailable carrying a reason,
+    # never a partial body.
+    summary = service.get_observability_summary(session)
+    result = ObservabilitySummaryResponse(
+        service_status=summary["service_status"],
+        database_status=summary["database_status"],
+        resource_counts=summary["resource_counts"],
+        task_counts=summary["task_counts"],
+        audit_status=summary["audit_status"],
+        checked_at=utc_now(),
+    )
+    # Compact UTF-8 JSON, UTC timestamps, integral numbers only, terminated
+    # by exactly one newline; members appear in the fixed service/database/
+    # counts/tasks/audit/checked order.
+    return _render_compact_json(result.model_dump(mode="json"))
 
 
 @router.post(

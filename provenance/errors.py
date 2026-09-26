@@ -314,6 +314,23 @@ class ImpactReconSignatureVerificationError(DomainError):
         super().__init__(details=details)
 
 
+class ObservabilityUnavailableError(DomainError):
+    """The read-only observability summary cannot be assembled.
+
+    An unreadable database or an internal failure of the summary queries
+    renders as ``503 service_unavailable`` under the existing error JSON
+    structure, carrying a machine-readable reason. The summary is strictly
+    read-only, so the failure path writes no resource, task, or audit row.
+    """
+
+    status_code = 503
+    code = "service_unavailable"
+    message = "The observability summary is temporarily unavailable."
+
+    def __init__(self, reason: str):
+        super().__init__(details={"reason": reason})
+
+
 class ContentExportJobNotFoundError(DomainError):
     status_code = 404
     code = "content_export_job_not_found"
