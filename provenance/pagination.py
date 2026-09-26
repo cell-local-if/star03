@@ -77,6 +77,10 @@ CONTENT_EXPORT_JOBS_CURSOR_VERSION = "cx1"
 #: traversal.
 CLAIM_SUPERSESSION_LINEAGE_CURSOR_VERSION = "sl1"
 
+#: Marker for cursors that page through the global claim-supersession
+#: search.
+CLAIM_SUPERSESSIONS_CURSOR_VERSION = "cs1"
+
 #: Marker for cursors that page through the trust-policy retrieval.
 TRUST_POLICIES_CURSOR_VERSION = "tp1"
 
@@ -635,6 +639,46 @@ CLAIM_SUPERSESSION_LINEAGE_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_claim_supersession_lineage_claims,
+)
+
+
+def _validate_claim_supersessions_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null) or non-empty strings;
+    # matching is case- and whitespace-sensitive, so the raw value is bound.
+    _optional_nonempty_str(claims, "supersession_id")
+    _optional_nonempty_str(claims, "superseded_claim_id")
+    _optional_nonempty_str(claims, "replacement_claim_id")
+    _optional_nonempty_str(claims, "reason")
+    # The time bounds are absent (null) or canonical RFC 3339 UTC strings.
+    for field in ("from", "to"):
+        value = claims[field]
+        if value is not None and (
+            not isinstance(value, str) or parse_rfc3339_utc(value) is None
+        ):
+            raise InvalidCursorError(f"cursor {field} is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/claim-supersessions``.
+CLAIM_SUPERSESSIONS_CURSOR = CursorKind(
+    version=CLAIM_SUPERSESSIONS_CURSOR_VERSION,
+    claim_fields=(
+        "supersession_id",
+        "superseded_claim_id",
+        "replacement_claim_id",
+        "reason",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_claim_supersessions_claims,
 )
 
 

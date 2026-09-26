@@ -80,6 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.claim_supersession_lineage_cursor_secret = (
         secrets.token_bytes(32)
     )
+    app.state.claim_supersessions_cursor_secret = secrets.token_bytes(32)
     app.state.trust_policies_cursor_secret = secrets.token_bytes(32)
     app.state.actors_cursor_secret = secrets.token_bytes(32)
     app.state.contents_cursor_secret = secrets.token_bytes(32)
