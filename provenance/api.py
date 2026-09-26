@@ -38,6 +38,8 @@ from provenance.schemas import (
     AUDIT_CHECKPOINT_VERSION,
     EXCHANGE_MANIFEST_DIGEST_ALGORITHM,
     EXCHANGE_MANIFEST_VERSION,
+    IMPACT_RECON_CHECKPOINT_VERSION,
+    IMPACT_RECON_DIGEST_ALGORITHM,
     REVOCATION_IMPACT_CHECKPOINT_VERSION,
     REVOCATION_IMPACT_DIGEST_ALGORITHM,
     ActorCreate,
@@ -71,6 +73,11 @@ from provenance.schemas import (
     RevocationImpactPackageResponse,
     RevocationImpactVerificationCreate,
     RevocationImpactVerificationResponse,
+    ImpactReconCheckpointResponse,
+    ImpactReconEntryResponse,
+    ImpactReconPackageResponse,
+    ImpactReconVerificationCreate,
+    ImpactReconVerificationResponse,
     AuditCheckpointImportCreate,
     AuditCheckpointImportPageResponse,
     AuditCheckpointImportReconciliationItem,
@@ -3765,6 +3772,179 @@ async def list_revocation_impact_import_reconciliations(
         + "\n"
     ).encode("utf-8")
     return Response(content=body, media_type="application/json")
+
+
+_IMPACT_RECON_PACKAGE_PARAMS = frozenset({"local_available", "matches"})
+
+
+def _impact_recon_package_item(
+    record,
+    local_available: bool,
+    local_checkpoint: RevocationImpactCheckpointResponse,
+    matches: bool,
+) -> ImpactReconEntryResponse:
+    # Exactly the existing global-reconciliation list item: the receipt
+    # public view with the local availability flag, current local
+    # checkpoint, and match verdict; the imported impacts array is absent.
+    return ImpactReconEntryResponse(
+        id=record.id,
+        checkpoint_version=record.checkpoint_version,
+        impact_count=record.impact_count,
+        impacts_digest_hex=record.impacts_digest_hex,
+        received_at=record.created_at,
+        local_available=local_available,
+        local_checkpoint=local_checkpoint,
+        matches=matches,
+    )
+
+
+@router.get("/impact-recon-package")
+async def export_impact_recon_package(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only export of every currently-hit impact-import reconciliation
+    # entry together with an offline-recomputable checkpoint. The GET
+    # request body must be empty: carrying any bytes (even whitespace,
+    # arbitrary bytes, or malformed JSON) is a 422 validated before any
+    # query parameter, receipt, or local impact is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # The filter contract is exactly the global reconciliation listing's
+    # minus pagination: only local_available/matches are accepted, so
+    # limit/cursor and every other undeclared parameter are rejected rather
+    # than ignored, a repeated scalar is rejected instead of silently
+    # taking the last value, and only the lowercase literals true/false
+    # are accepted.
+    raw = request.query_params
+
+    unknown = set(raw) - _IMPACT_RECON_PACKAGE_PARAMS
+    if unknown:
+        # A typo or a pagination parameter never silently changes the
+        # snapshot.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    local_available_filter = _parse_bool_literal_param(raw, "local_available")
+    matches_filter = _parse_bool_literal_param(raw, "matches")
+
+    # Strictly read-only, and the package derives from one state read under
+    # exactly the global reconciliation rules: receipts follow stable
+    # creation order, the current local impact set is read once complete
+    # and unfiltered (identical for every entry), and the two filters apply
+    # to the read-time reconciliation and combine as logical AND. No
+    # resource, receipt, or audit event is written; an empty match set
+    # yields "entries": [] with entry_count 0 and the digest of the empty
+    # array.
+    records = service.list_revocation_impact_import_reconciliations(session)
+    local_checkpoint = _local_revocation_impact_checkpoint(session)
+    available = local_checkpoint.impact_count > 0
+
+    entry_views: list[ImpactReconEntryResponse] = []
+    for record in records:
+        record_matches = (
+            record.checkpoint_version == local_checkpoint.checkpoint_version
+            and record.impact_count == local_checkpoint.impact_count
+            and record.impacts_digest_hex == local_checkpoint.impacts_digest_hex
+        )
+        if (
+            local_available_filter is not None
+            and available != local_available_filter
+        ):
+            continue
+        if matches_filter is not None and record_matches != matches_filter:
+            continue
+        entry_views.append(
+            _impact_recon_package_item(
+                record, available, local_checkpoint, record_matches
+            )
+        )
+
+    # mode="json" yields exactly the wire view served in this response's
+    # entries member (UTC datetimes as RFC 3339 strings), so the
+    # checkpoint binds to exactly those entries and is reproducible by an
+    # external verifier from the package body alone.
+    entry_payloads = [view.model_dump(mode="json") for view in entry_views]
+    package = ImpactReconPackageResponse(
+        checkpoint=ImpactReconCheckpointResponse(
+            checkpoint_version=IMPACT_RECON_CHECKPOINT_VERSION,
+            digest_algorithm=IMPACT_RECON_DIGEST_ALGORITHM,
+            entry_count=len(entry_payloads),
+            entries_digest_hex=canonical.impact_recon_entries_digest_hex(
+                entry_payloads
+            ),
+        ),
+        entries=entry_views,
+    )
+    # Compact UTF-8 JSON, null/boolean literals, integral numbers only
+    # (never a negative zero or non-finite number), terminated by exactly
+    # one newline; root members appear as checkpoint, entries.
+    body = (
+        json.dumps(
+            package.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
+
+
+@router.post(
+    "/impact-recon-verifications",
+    response_model=ImpactReconVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_impact_recon_package(
+    payload: ImpactReconVerificationCreate, request: Request
+) -> Response:
+    # The route accepts no query parameters: any (or repeated) parameter is
+    # a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no resource, audit row, or log is written.
+    # Verification uses the request body alone; no receipt, impact,
+    # attestation, actor, content, or bundle id is ever resolved against
+    # local state, so unknown resources, repeated requests, and differing
+    # local state verify identically. Malformed JSON and every
+    # structural, field, type, count, or digest-format failure are
+    # rejected by the request model as a 422 before this body runs.
+    body = await request.json()
+    # The digest commits to the entries array exactly as received: the raw
+    # JSON values (array order, timestamp spellings), not any parsed or
+    # re-serialized form. The array keeps its order; nested object keys
+    # (including local_checkpoint's) sort by Unicode code point under the
+    # checkpoint canonical rules.
+    computed_digest_hex = canonical.impact_recon_entries_digest_hex(
+        body["entries"]
+    )
+    if computed_digest_hex == payload.checkpoint.entries_digest_hex:
+        result = {"valid": True}
+    else:
+        result = {
+            "valid": False,
+            "computed_digest_hex": computed_digest_hex,
+        }
+    # Compact UTF-8 JSON, boolean literals, terminated by exactly one
+    # newline; a match carries no field besides valid.
+    data = (
+        json.dumps(
+            result,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=data, media_type="application/json")
 
 
 _TRUST_EVALUATION_PARAMS = frozenset(
