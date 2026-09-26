@@ -270,6 +270,34 @@ def checkpoint_import_id(
     return "aci_" + hashlib.sha256(material).hexdigest()
 
 
+def csp_import_id(
+    checkpoint_version: str,
+    correction_count: int,
+    corrections_digest_hex: str,
+) -> str:
+    """Return a stable ``csi_``-prefixed receipt id for a CSP checkpoint import.
+
+    The identity is exactly the receiving identity: the fixed correction
+    checkpoint version, the claimed correction count, and the corrections
+    SHA-256 digest. The corrections array itself never enters the material
+    -- only its verified digest -- so the same offline-verified checkpoint
+    always maps to the same receipt id even though no correction data is
+    persisted. The material is a canonical JSON array so fields containing
+    separators cannot collide with different field splits.
+    """
+    material = json.dumps(
+        [
+            "csp_checkpoint_import",
+            checkpoint_version,
+            correction_count,
+            corrections_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "csi_" + hashlib.sha256(material).hexdigest()
+
+
 def audit_exchange_import_id(
     signature_version: str,
     package_digest_hex: str,

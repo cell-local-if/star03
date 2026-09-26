@@ -25,6 +25,7 @@ from provenance.errors import (
     AuditCheckpointImportValidationError,
     AuditExchangeImportValidationError,
     AuditSignatureVerificationError,
+    CspImportValidationError,
     EvidenceBundleExchangeImportValidationError,
     ImpactImportValidationError,
     ImpactReconExchangeImportValidationError,
@@ -156,6 +157,12 @@ from provenance.schemas import (
     CorrectionPackageResponse,
     CorrectionVerificationCreate,
     CorrectionVerificationResponse,
+    CspImportCreate,
+    CspImportPageResponse,
+    CspImportReconciliationItem,
+    CspImportReconciliationPageResponse,
+    CspImportReconciliationResponse,
+    CspImportResponse,
     EvidenceBundleCreate,
     EvidenceBundleExchangeImportCreate,
     EvidenceBundleExchangeImportPageResponse,
@@ -1503,6 +1510,409 @@ async def verify_correction_package(
         + "\n"
     ).encode("utf-8")
     return Response(content=data, media_type="application/json")
+
+
+# --- Controlled correction-checkpoint imports -------------------------------------
+
+
+def _csp_import_response(record) -> CspImportResponse:
+    return CspImportResponse(
+        id=record.id,
+        checkpoint_version=record.checkpoint_version,
+        correction_count=record.correction_count,
+        corrections_digest_hex=record.corrections_digest_hex,
+        received_at=record.created_at,
+    )
+
+
+@router.post("/csp-imports", response_model=CspImportResponse)
+async def import_correction_checkpoint(
+    payload: CspImportCreate,
+    request: Request,
+    session: DbSession,
+    response: Response,
+) -> CspImportResponse:
+    # Structure, fixed version/algorithm, strict digest spelling, the
+    # correction-item fields and timestamps, and the claimed correction
+    # count have all passed request validation exactly as on the stateless
+    # verification route. The digest match is enforced here over the raw
+    # received JSON, so array order and datetime spellings participate
+    # exactly as received; a mismatch is a 422 and writes nothing.
+    body = await request.json()
+    computed_digest_hex = canonical.corrections_digest_hex(body["corrections"])
+    if computed_digest_hex != payload.checkpoint.corrections_digest_hex:
+        raise CspImportValidationError(
+            "corrections_digest_mismatch",
+            details={"computed_digest_hex": computed_digest_hex},
+        )
+
+    # Verification is decided entirely by the request body: the described
+    # corrections (claim supersessions) are never resolved against local
+    # state, so whether they exist locally cannot change the receipt, and no
+    # supersession or other resource is created or modified.
+    record, created = service.create_csp_import(session, payload)
+    # First registration of this receiving identity -> 201; a retried
+    # submission -> 200 with the original record and no new audit event.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _csp_import_response(record)
+
+
+_CSP_IMPORTS_PARAMS = frozenset(
+    {
+        "checkpoint_version",
+        "corrections_digest_hex",
+        "correction_count",
+        "from",
+        "to",
+        "limit",
+        "cursor",
+    }
+)
+
+
+@router.get("/csp-imports", response_model=CspImportPageResponse)
+async def list_correction_checkpoint_imports(
+    request: Request, session: DbSession
+) -> CspImportPageResponse:
+    # Read-only reviewer search over the registered correction-checkpoint
+    # import receipts. The GET request body must be empty: carrying any
+    # bytes (even whitespace or malformed JSON) is a 422 validated before
+    # any parameter or receipt is read. Raw multi-values are inspected
+    # deliberately: a repeated scalar is rejected instead of silently taking
+    # the last value, undeclared parameters are rejected rather than ignored,
+    # and a blank filter/limit is never coerced to a default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _CSP_IMPORTS_PARAMS
+    if unknown:
+        # A typo (e.g. ``checkpoint_versions``) never silently changes the
+        # search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    checkpoint_version = _parse_nonempty_filter(raw, "checkpoint_version")
+    corrections_digest_hex = _parse_nonempty_filter(
+        raw, "corrections_digest_hex"
+    )
+    correction_count = _parse_nonnegative_int_param(raw, "correction_count")
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CSP_IMPORTS_LIMIT,
+        service.MIN_CSP_IMPORTS_LIMIT,
+        service.MAX_CSP_IMPORTS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.csp_imports_cursor_secret,
+                pagination.CSP_IMPORTS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered; the time claim canonicalizes "Z" and
+        # "+00:00" to the same instant) and the effective limit must match
+        # exactly. A cursor minted by another endpoint family already fails
+        # decoding above.
+        expected = {
+            "checkpoint_version": checkpoint_version,
+            "corrections_digest_hex": corrections_digest_hex,
+            "correction_count": correction_count,
+            "from": _audit_time_claim(from_dt),
+            "to": _audit_time_claim(to_dt),
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no receipt, resource, or audit
+    # event. The total is the filtered count covering every page. Filter
+    # values are never resolved for existence, so an unknown or nonexistent
+    # value is an empty collection rather than a 404. Each item is exactly
+    # the single-receipt public view; the corrections array and every raw
+    # correction datum are never persisted and so can never be echoed.
+    items = service.list_csp_imports(
+        session,
+        checkpoint_version,
+        corrections_digest_hex,
+        correction_count,
+        from_dt,
+        to_dt,
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.csp_imports_cursor_secret,
+                pagination.CSP_IMPORTS_CURSOR,
+                {
+                    "checkpoint_version": checkpoint_version,
+                    "corrections_digest_hex": corrections_digest_hex,
+                    "correction_count": correction_count,
+                    "from": _audit_time_claim(from_dt),
+                    "to": _audit_time_claim(to_dt),
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    return CspImportPageResponse(
+        items=[_csp_import_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+
+
+@router.get("/csp-imports/{import_id}", response_model=CspImportResponse)
+def get_correction_checkpoint_import(
+    import_id: str, request: Request, session: DbSession
+) -> CspImportResponse:
+    # The receipt read takes no query parameters: any (or repeated)
+    # parameter is a 422 before the receipt lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only: a receipt read writes no resource and no audit
+    # event. An unknown id is an explicit, specific 404.
+    record = service.get_csp_import(session, import_id)
+    return _csp_import_response(record)
+
+
+def _local_correction_checkpoint(session: Session) -> CorrectionCheckpointResponse:
+    """Compute the current unfiltered local correction checkpoint.
+
+    Exactly the ``GET /v1/csp/package`` rules with no filters: every local
+    correction (claim supersession) is read once in the supersessions'
+    stable creation order and rendered through the same public wire view, so
+    the fixed version, digest algorithm, correction count, canonical digest,
+    and UTC representation are identical to that route. Strictly read-only.
+    An empty local set yields the deterministic zero-item checkpoint (the
+    digest of the empty array).
+    """
+    records = service.list_claim_supersessions(session)
+    correction_views = [_claim_supersession_response(item) for item in records]
+    # mode="json" yields exactly the wire view the package export serves
+    # (UTC datetimes as RFC 3339 strings), so the digest is reproducible by
+    # an external verifier from the package body alone.
+    correction_payloads = [
+        view.model_dump(mode="json") for view in correction_views
+    ]
+    return CorrectionCheckpointResponse(
+        checkpoint_version=CSP_CHECKPOINT_VERSION,
+        digest_algorithm=CSP_DIGEST_ALGORITHM,
+        correction_count=len(correction_payloads),
+        corrections_digest_hex=canonical.corrections_digest_hex(
+            correction_payloads
+        ),
+    )
+
+
+@router.get(
+    "/csp-imports/{import_id}/recon",
+    response_model=CspImportReconciliationResponse,
+)
+def reconcile_correction_checkpoint_import(
+    import_id: str, request: Request, session: DbSession
+) -> CspImportReconciliationResponse:
+    # Same boundary as the receipt read route: any (or repeated) query
+    # parameter is a 422 before the receipt lookup.
+    _reject_any_query_param(request)
+    # Strictly read-only: the reconciliation writes no resource, receipt, or
+    # audit event. An unknown receipt id is the csp_import_not_found 404.
+    record = service.get_csp_import(session, import_id)
+
+    # The current local correction set is always read complete and
+    # unfiltered; the receipt's imported corrections array is not persisted
+    # and is never read or echoed.
+    local_checkpoint = _local_correction_checkpoint(session)
+    matches = (
+        record.checkpoint_version == local_checkpoint.checkpoint_version
+        and record.correction_count == local_checkpoint.correction_count
+        and record.corrections_digest_hex
+        == local_checkpoint.corrections_digest_hex
+    )
+    return CspImportReconciliationResponse(
+        import_id=record.id,
+        local_checkpoint=local_checkpoint,
+        matches=matches,
+    )
+
+
+_CSP_IMPORT_RECONCILIATIONS_PARAMS = frozenset({"limit", "cursor"})
+
+
+def _csp_import_reconciliation_item(
+    record, local_checkpoint: CorrectionCheckpointResponse, matches: bool
+) -> CspImportReconciliationItem:
+    # The existing single-receipt public view, with the current unfiltered
+    # local correction checkpoint and its match verdict added; the imported
+    # corrections array is absent.
+    return CspImportReconciliationItem(
+        id=record.id,
+        checkpoint_version=record.checkpoint_version,
+        corrections_digest_hex=record.corrections_digest_hex,
+        correction_count=record.correction_count,
+        received_at=record.created_at,
+        local_checkpoint=local_checkpoint,
+        matches=matches,
+    )
+
+
+@router.get(
+    "/csp-import-reconciliations",
+    response_model=CspImportReconciliationPageResponse,
+)
+async def list_correction_checkpoint_import_reconciliations(
+    request: Request,
+    session: DbSession,
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> CspImportReconciliationPageResponse:
+    # Read-only, paginated reconciliation of every registered
+    # correction-checkpoint import receipt. The GET request body must be
+    # empty: carrying any bytes (even whitespace or malformed JSON) is a 422
+    # validated before any parameter, receipt, or local correction is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank limit is
+    # never coerced to the default.
+    raw = request.query_params
+
+    unknown = set(raw) - _CSP_IMPORT_RECONCILIATIONS_PARAMS
+    if unknown:
+        # The collection accepts only limit/cursor; a typo never silently
+        # changes the page.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_CSP_IMPORT_RECONCILIATIONS_LIMIT,
+        service.MIN_CSP_IMPORT_RECONCILIATIONS_LIMIT,
+        service.MAX_CSP_IMPORT_RECONCILIATIONS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.csp_import_reconciliations_cursor_secret,
+                pagination.CSP_IMPORT_RECONCILIATIONS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the collection is
+        # unfiltered, so the effective limit is the only bound claim.
+        if claims["limit"] != page_limit:
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the listing writes no resource, receipt, or audit
+    # event. Receipts follow stable creation order.
+    records = service.list_csp_import_reconciliations(session)
+    total = len(records)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page_records = records[offset : offset + page_limit]
+        next_offset = offset + len(page_records)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.csp_import_reconciliations_cursor_secret,
+                pagination.CSP_IMPORT_RECONCILIATIONS_CURSOR,
+                {"limit": page_limit, "offset": next_offset},
+            )
+        page = page_records
+
+    # The current local correction set is unfiltered and identical for every
+    # receipt on the page; read it once and reconcile each receipt's stored
+    # identity against it independently. The imported corrections arrays are
+    # not persisted and are never read or echoed.
+    local_checkpoint = _local_correction_checkpoint(session)
+    items = []
+    for record in page:
+        matches = (
+            record.checkpoint_version == local_checkpoint.checkpoint_version
+            and record.correction_count == local_checkpoint.correction_count
+            and record.corrections_digest_hex
+            == local_checkpoint.corrections_digest_hex
+        )
+        items.append(
+            _csp_import_reconciliation_item(record, local_checkpoint, matches)
+        )
+
+    return CspImportReconciliationPageResponse(
+        items=items,
+        count=total,
+        next_cursor=next_cursor,
+    )
 
 
 def _claim_supersession_lineage_item(
