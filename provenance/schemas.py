@@ -300,6 +300,17 @@ class ClaimSupersessionListResponse(BaseModel):
     count: int
 
 
+class ClaimSupersessionPageResponse(BaseModel):
+    """A cursor-paginated page of supersession public views."""
+
+    items: list[ClaimSupersessionResponse]
+    #: Total number of supersessions after filtering, independent of
+    #: pagination; not merely the size of the returned page.
+    count: int
+    #: Opaque continuation token; null on the final (or past-the-end) page.
+    next_cursor: str | None = None
+
+
 class ClaimSupersessionLineageItem(ClaimResponse):
     """A claim reached by supersession traversal: the full public view plus depth.
 

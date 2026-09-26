@@ -598,6 +598,75 @@ def list_supersessions_for_claim(
     return list(session.execute(stmt).scalars().all())
 
 
+# Global claim-supersession search paging bounds.
+DEFAULT_CLAIM_SUPERSESSIONS_LIMIT = 50
+MIN_CLAIM_SUPERSESSIONS_LIMIT = 1
+MAX_CLAIM_SUPERSESSIONS_LIMIT = 100
+
+
+def list_claim_supersessions_page(
+    session: Session,
+    supersession_id: str | None = None,
+    superseded_claim_id: str | None = None,
+    replacement_claim_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+    limit: int = DEFAULT_CLAIM_SUPERSESSIONS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[ClaimSupersession], int]:
+    """Return one supersession page and the filtered total, both in SQL.
+
+    ``supersession_id``, ``superseded_claim_id``, ``replacement_claim_id``,
+    and ``reason`` are non-empty, case- and whitespace-sensitive exact
+    matches that combine as logical AND; ``None`` means unfiltered.
+    ``from_dt``/``to_dt`` are timezone-aware UTC instants applied as
+    inclusive ``created_at`` bounds. Filter values are never resolved for
+    existence, so an unknown id or reason is an empty result rather than a
+    missing resource.
+
+    The total is a SQL ``COUNT`` over the filtered set (independent of the
+    page) and the page is a SQL ``LIMIT``/``OFFSET`` window of that set in
+    stable creation order (``created_at`` then the monotonic ``seq``
+    tiebreaker), so ordering and paging never depend on in-memory sorting
+    and stay stable across restarts. The retrieval is strictly read-only:
+    it writes no supersession, claim, resource, or audit event.
+    """
+    filters = []
+    if supersession_id is not None:
+        filters.append(ClaimSupersession.id == supersession_id)
+    if superseded_claim_id is not None:
+        filters.append(
+            ClaimSupersession.superseded_claim_id == superseded_claim_id
+        )
+    if replacement_claim_id is not None:
+        filters.append(
+            ClaimSupersession.replacement_claim_id == replacement_claim_id
+        )
+    if reason is not None:
+        filters.append(ClaimSupersession.reason == reason)
+    if from_dt is not None:
+        filters.append(ClaimSupersession.created_at >= from_dt)
+    if to_dt is not None:
+        filters.append(ClaimSupersession.created_at <= to_dt)
+
+    total = session.execute(
+        select(func.count())
+        .select_from(ClaimSupersession)
+        .where(*filters)
+    ).scalar_one()
+
+    page_stmt = (
+        select(ClaimSupersession)
+        .where(*filters)
+        .order_by(*_CLAIM_SUPERSESSION_ORDER)
+        .limit(limit)
+        .offset(offset)
+    )
+    page = list(session.execute(page_stmt).scalars().all())
+    return page, int(total)
+
+
 # Reviewer claim search paging bounds.
 DEFAULT_CLAIMS_LIMIT = 50
 MIN_CLAIMS_LIMIT = 1
