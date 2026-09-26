@@ -1991,6 +1991,207 @@ class ImpactReconExchangeImportReconResponse(BaseModel):
     matches: bool
 
 
+#: Fixed checkpoint format version emitted for impact-recon audit packages.
+IMPACT_RECON_AUDIT_CHECKPOINT_VERSION = "pir-audit-checkpoint-v1"
+#: The sole digest algorithm used for impact-recon audit checkpoints.
+IMPACT_RECON_AUDIT_DIGEST_ALGORITHM = "sha256"
+
+
+class ImpactReconAuditCheckpointResponse(BaseModel):
+    """A read-only integrity checkpoint over a filtered exchange-receipt set.
+
+    Exactly four members: the fixed ``checkpoint_version``
+    ("pir-audit-checkpoint-v1") and ``digest_algorithm`` ("sha256"), the
+    number of audit entries in the filtered snapshot, and the SHA-256 hex
+    digest of the canonical entries array. The checkpoint is derived
+    purely from existing signed exchange-import receipt rows and the
+    read-time local reconciliation: it introduces no resource, record, or
+    audit event, and its value is stable for unchanged persisted state
+    and local recon package -- including the empty set.
+    """
+
+    checkpoint_version: Literal[IMPACT_RECON_AUDIT_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[IMPACT_RECON_AUDIT_DIGEST_ALGORITHM]
+    entry_count: int
+    entries_digest_hex: str
+
+
+class ImpactReconAuditEntryResponse(BaseModel):
+    """One signed exchange-import receipt's audit entry in a package.
+
+    The stable receipt fields (``id``, ``signer_subject``, ``public_key``,
+    ``package_digest_hex``, ``signature_digest_hex``, UTC ``received_at``)
+    plus the read-time reconciliation triple: ``local_available`` (true
+    only when the current, complete, unfiltered local impact-recon package
+    carries at least one reconciliation entry), the current
+    ``local_package_digest_hex`` recomputed at this read (identical for
+    every entry), and ``matches`` -- true only when that current digest
+    equals the receipt's ``package_digest_hex`` character for character.
+    The imported package, the raw signature, and every private key are
+    never carried.
+    """
+
+    id: str
+    signer_subject: str
+    #: Base64 of the 32-byte Ed25519 public key, exactly as served on the
+    #: receipt.
+    public_key: str
+    package_digest_hex: str
+    #: SHA-256 hex digest of the verified signature; the raw signature is
+    #: never stored or echoed.
+    signature_digest_hex: str
+    received_at: datetime
+    local_available: bool
+    local_package_digest_hex: str
+    matches: bool
+
+
+class ImpactReconAuditPackageResponse(BaseModel):
+    """One read returning the filtered audit-entry set with its checkpoint.
+
+    Exactly two members: ``checkpoint`` is the four-field impact-recon
+    audit checkpoint for the effective filter and ``entries`` lists, in
+    the receipts' stable creation order, the audit-entry views selected
+    by that same filter. The checkpoint digest is computed over exactly
+    the ``entries`` array returned in this response under the checkpoint
+    canonical rules (array order kept, nested object keys sorted by
+    Unicode code point, compact separators, unescaped non-ASCII, UTF-8);
+    both halves derive from a single read-only state read, so they can
+    never disagree. The package introduces no resource, record, or audit
+    event; an empty match yields ``"entries": []`` together with the
+    digest of the empty array.
+    """
+
+    checkpoint: ImpactReconAuditCheckpointResponse
+    entries: list[ImpactReconAuditEntryResponse]
+
+
+class ImpactReconAuditVerificationEntry(BaseModel):
+    """One exchange-receipt audit entry under stateless verification.
+
+    The structure must match the exported entry field for field -- the
+    stable receipt fields plus ``local_available``,
+    ``local_package_digest_hex``, and ``matches`` -- with no undeclared
+    member (so no imported package, raw signature, or private key can
+    enter the request). ``received_at`` is kept as the raw string so the
+    digest commits to the timestamp exactly as spelled on the wire; it
+    must be a strict RFC 3339 UTC timestamp. Each digest must be exactly
+    64 lowercase hexadecimal characters. Verification never resolves any
+    id against local state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=80)
+    signer_subject: str = Field(..., min_length=1, max_length=255)
+    public_key: str = Field(..., min_length=1, max_length=255)
+    package_digest_hex: str
+    signature_digest_hex: str
+    received_at: str
+    local_available: StrictBool
+    local_package_digest_hex: str
+    matches: StrictBool
+
+    @field_validator("id", "signer_subject", "public_key")
+    @classmethod
+    def _identifier_nonempty(cls, v: str) -> str:
+        # Every identifier is a non-empty, non-whitespace string; nothing
+        # is trimmed or normalized.
+        if not v.strip():
+            raise ValueError("identifier must not be empty")
+        return v
+
+    @field_validator(
+        "package_digest_hex", "signature_digest_hex", "local_package_digest_hex"
+    )
+    @classmethod
+    def _digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: every digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "digest must be exactly 64 lowercase hexadecimal characters"
+            )
+        return v
+
+    @field_validator("received_at")
+    @classmethod
+    def _received_at_strict_rfc3339_utc(cls, v: str) -> str:
+        if parse_rfc3339_utc(v) is None:
+            raise ValueError(
+                "received_at must be a strict RFC 3339 UTC timestamp"
+            )
+        return v
+
+
+class ImpactReconAuditVerificationCheckpoint(BaseModel):
+    """The claimed audit package checkpoint under stateless verification.
+
+    Exactly the existing four-field audit checkpoint structure: the fixed
+    ``checkpoint_version`` and ``digest_algorithm``, the claimed entry
+    count, and the claimed entries digest. Undeclared members are
+    rejected rather than ignored, exactly as on the package export.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_version: Literal[IMPACT_RECON_AUDIT_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[IMPACT_RECON_AUDIT_DIGEST_ALGORITHM]
+    #: Non-negative integer count the submitted entries array must match.
+    entry_count: StrictInt = Field(..., ge=0)
+    entries_digest_hex: str
+
+    @field_validator("entries_digest_hex")
+    @classmethod
+    def _entries_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "entries_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class ImpactReconAuditVerificationCreate(BaseModel):
+    """A stateless impact-recon audit package verification request.
+
+    Exactly two members: ``checkpoint`` carries the claimed four-field
+    audit checkpoint and ``entries`` carries the audit-entry sequence it
+    commits to, with exactly ``checkpoint.entry_count`` elements, each
+    exactly the exported audit entry. Verification is pure: it reads and
+    writes no server state, so no receipt or resource id is ever
+    resolved against local state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint: ImpactReconAuditVerificationCheckpoint
+    entries: list[ImpactReconAuditVerificationEntry]
+
+    @model_validator(mode="after")
+    def _entries_match_claimed_count(self):
+        if len(self.entries) != self.checkpoint.entry_count:
+            raise ValueError(
+                "entries must contain exactly checkpoint.entry_count elements"
+            )
+        return self
+
+
+class ImpactReconAuditVerificationResponse(BaseModel):
+    """The stateless impact-recon audit verification verdict.
+
+    ``computed_digest_hex`` is present only on a mismatch, so a matching
+    checkpoint renders exactly ``{"valid": true}``.
+    """
+
+    valid: bool
+    #: The digest computed from the submitted entries array under the
+    #: checkpoint canonical rules; omitted when it matches the claim.
+    computed_digest_hex: str | None = None
+
+
 class AttestationAccessGrantCreate(BaseModel):
     # A grant carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.

@@ -48,6 +48,8 @@ from provenance.schemas import (
     AUDIT_CHECKPOINT_VERSION,
     EXCHANGE_MANIFEST_DIGEST_ALGORITHM,
     EXCHANGE_MANIFEST_VERSION,
+    IMPACT_RECON_AUDIT_CHECKPOINT_VERSION,
+    IMPACT_RECON_AUDIT_DIGEST_ALGORITHM,
     IMPACT_RECON_CHECKPOINT_VERSION,
     IMPACT_RECON_DIGEST_ALGORITHM,
     REVOCATION_IMPACT_CHECKPOINT_VERSION,
@@ -83,6 +85,11 @@ from provenance.schemas import (
     RevocationImpactPackageResponse,
     RevocationImpactVerificationCreate,
     RevocationImpactVerificationResponse,
+    ImpactReconAuditCheckpointResponse,
+    ImpactReconAuditEntryResponse,
+    ImpactReconAuditPackageResponse,
+    ImpactReconAuditVerificationCreate,
+    ImpactReconAuditVerificationResponse,
     ImpactReconCheckpointResponse,
     ImpactReconEntryResponse,
     ImpactReconExchangeImportCreate,
@@ -4316,6 +4323,196 @@ async def reconcile_impact_recon_exchange_import(
         matches=local_package_digest_hex == record.package_digest_hex,
     )
     return _render_compact_json(result.model_dump(mode="json"))
+
+
+_IMPACT_RECON_AUDIT_PACKAGES_PARAMS = frozenset(
+    {
+        "signer_subject",
+        "public_key",
+        "package_digest_hex",
+        "from",
+        "to",
+        "matches",
+    }
+)
+
+
+def _local_impact_recon_package_state(session: Session) -> tuple[bool, str]:
+    """The current unfiltered local recon package's availability and digest.
+
+    Exactly the single-receipt reconciliation's local read: the current
+    local impact-recon package is read once, complete and unfiltered,
+    under the package export's rules, so the digest is deterministic even
+    for the empty state. Strictly read-only.
+    """
+    entry_views = _unfiltered_impact_recon_entry_views(session)
+    package = _impact_recon_package_from_views(entry_views)
+    local_package_digest_hex = canonical.impact_recon_package_digest_hex(
+        package.model_dump(mode="json")
+    )
+    return len(entry_views) > 0, local_package_digest_hex
+
+
+def _impact_recon_audit_entry(
+    record,
+    local_available: bool,
+    local_package_digest_hex: str,
+) -> ImpactReconAuditEntryResponse:
+    # The stable receipt fields with the read-time reconciliation triple
+    # appended; the imported package, the raw signature, and every
+    # private key are never carried.
+    return ImpactReconAuditEntryResponse(
+        id=record.id,
+        signer_subject=record.signer_subject,
+        public_key=base64.b64encode(record.public_key).decode("ascii"),
+        package_digest_hex=record.package_digest_hex,
+        signature_digest_hex=record.signature_digest_hex,
+        received_at=record.created_at,
+        local_available=local_available,
+        local_package_digest_hex=local_package_digest_hex,
+        matches=record.package_digest_hex == local_package_digest_hex,
+    )
+
+
+@router.get("/impact-recon-audit-packages")
+async def export_impact_recon_audit_package(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only audit checkpoint export over the signed exchange-import
+    # receipts. The GET request body must be empty: carrying any bytes
+    # (even whitespace, arbitrary bytes, or malformed JSON) is a 422
+    # validated before any query parameter, receipt, or local state is
+    # read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters (including the limit/cursor pagination pair) are
+    # rejected rather than ignored, a blank filter is never coerced, and
+    # only the lowercase literals true/false are accepted for matches.
+    raw = request.query_params
+
+    unknown = set(raw) - _IMPACT_RECON_AUDIT_PACKAGES_PARAMS
+    if unknown:
+        # A typo or a pagination parameter never silently changes the
+        # snapshot.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    signer_subject = _parse_nonempty_filter(raw, "signer_subject")
+    public_key = _parse_nonempty_filter(raw, "public_key")
+    package_digest_hex = _parse_nonempty_filter(raw, "package_digest_hex")
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    matches_filter = _parse_bool_literal_param(raw, "matches")
+
+    # Strictly read-only: every validation failure above is raised before
+    # any receipt or local state is read, and the export itself writes no
+    # receipt, resource, audit event, or log. The receipt-field filters
+    # (including the exact-spelling public key) are pushed down to the
+    # database query; the current local recon package is then read once,
+    # complete and unfiltered, so its availability flag and digest are
+    # identical for every entry; the matches filter applies to the
+    # read-time verdict and combines with the rest as logical AND. An
+    # empty match set yields "entries": [] with entry_count 0 and the
+    # deterministic digest of the empty array.
+    records = service.list_impact_recon_audit_entries(
+        session,
+        signer_subject,
+        public_key,
+        package_digest_hex,
+        from_dt,
+        to_dt,
+    )
+    local_available, local_package_digest_hex = (
+        _local_impact_recon_package_state(session)
+    )
+    entry_views = [
+        _impact_recon_audit_entry(
+            record, local_available, local_package_digest_hex
+        )
+        for record in records
+    ]
+    if matches_filter is not None:
+        entry_views = [
+            view for view in entry_views if view.matches == matches_filter
+        ]
+    # mode="json" yields exactly the wire view served in this response's
+    # entries member (UTC datetimes as RFC 3339 strings), so the
+    # checkpoint binds to exactly those entries and is reproducible by an
+    # external verifier from the package body alone.
+    entry_payloads = [view.model_dump(mode="json") for view in entry_views]
+    package = ImpactReconAuditPackageResponse(
+        checkpoint=ImpactReconAuditCheckpointResponse(
+            checkpoint_version=IMPACT_RECON_AUDIT_CHECKPOINT_VERSION,
+            digest_algorithm=IMPACT_RECON_AUDIT_DIGEST_ALGORITHM,
+            entry_count=len(entry_payloads),
+            entries_digest_hex=canonical.impact_recon_audit_entries_digest_hex(
+                entry_payloads
+            ),
+        ),
+        entries=entry_views,
+    )
+    # Compact UTF-8 JSON, null/boolean literals, integral numbers only,
+    # terminated by exactly one newline; root members appear as
+    # checkpoint, entries.
+    return _render_compact_json(package.model_dump(mode="json"))
+
+
+@router.post(
+    "/impact-recon-audit-verifications",
+    response_model=ImpactReconAuditVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_impact_recon_audit_package(
+    payload: ImpactReconAuditVerificationCreate, request: Request
+) -> Response:
+    # The route accepts no query parameters: any (or repeated) parameter
+    # is a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no receipt, resource, audit row, or log
+    # is written. Verification uses the request body alone; no receipt or
+    # resource id is ever resolved against local state, so unknown
+    # resources, repeated requests, and differing local state verify
+    # identically. Malformed JSON and every structural, field, type,
+    # count, timestamp, or digest-format failure are rejected by the
+    # request model as a 422 before this body runs.
+    body = await request.json()
+    # The digest commits to the entries array exactly as received: the
+    # raw JSON values (array order, timestamp spellings), not any parsed
+    # or re-serialized form. The array keeps its order; nested object
+    # keys sort by Unicode code point under the checkpoint canonical
+    # rules.
+    computed_digest_hex = canonical.impact_recon_audit_entries_digest_hex(
+        body["entries"]
+    )
+    if computed_digest_hex == payload.checkpoint.entries_digest_hex:
+        result = {"valid": True}
+    else:
+        result = {
+            "valid": False,
+            "computed_digest_hex": computed_digest_hex,
+        }
+    # Compact UTF-8 JSON, boolean literals, terminated by exactly one
+    # newline; a match carries no field besides valid.
+    return _render_compact_json(result)
 
 
 _TRUST_EVALUATION_PARAMS = frozenset(

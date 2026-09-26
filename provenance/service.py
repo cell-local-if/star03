@@ -3212,6 +3212,62 @@ def list_impact_recon_exchange_imports(
     return rows
 
 
+def list_impact_recon_audit_entries(
+    session: Session,
+    signer_subject: str | None = None,
+    public_key: str | None = None,
+    package_digest_hex: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[ImpactReconExchangeImportRecord]:
+    """Return signed exchange-import receipts for the audit package export.
+
+    ``signer_subject`` and ``package_digest_hex`` are exact, case- and
+    whitespace-sensitive string matches against the stored receipt fields;
+    ``from_dt``/``to_dt`` are inclusive UTC bounds on the receipt's
+    ``created_at``. ``public_key`` is pushed down to the database query
+    but still compared by exact spelling: the stored raw key bytes are
+    rendered to standard Base64 inside the query and matched against the
+    filter value character for character, so the value is never decoded,
+    parsed, or normalized and a non-canonical spelling simply matches
+    nothing. All filters combine as logical AND; an absent filter imposes
+    no restriction, and a filter value that names nothing yields an empty
+    list rather than an error. Results follow the receipts' stable
+    creation order (``created_at`` with the monotonic ``seq``
+    tiebreaker). The function is strictly read-only: it writes no
+    resource and no audit event.
+    """
+    stmt = select(ImpactReconExchangeImportRecord)
+    if signer_subject is not None:
+        stmt = stmt.where(
+            ImpactReconExchangeImportRecord.signer_subject == signer_subject
+        )
+    if public_key is not None:
+        # Pushed down to the database query: the SQLite ``base64_encode``
+        # scalar (registered by ``database.make_engine``) renders the
+        # stored bytes exactly as the public view does, so the comparison
+        # binds the exact filter spelling without parsing it.
+        stmt = stmt.where(
+            func.base64_encode(ImpactReconExchangeImportRecord.public_key)
+            == public_key
+        )
+    if package_digest_hex is not None:
+        stmt = stmt.where(
+            ImpactReconExchangeImportRecord.package_digest_hex
+            == package_digest_hex
+        )
+    if from_dt is not None:
+        stmt = stmt.where(
+            ImpactReconExchangeImportRecord.created_at >= from_dt
+        )
+    if to_dt is not None:
+        stmt = stmt.where(
+            ImpactReconExchangeImportRecord.created_at <= to_dt
+        )
+    stmt = stmt.order_by(*_IMPACT_RECON_EXCHANGE_IMPORT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 # Impact-import receipt search paging bounds.
 DEFAULT_IMPACT_IMPORTS_LIMIT = 50
 MIN_IMPACT_IMPORTS_LIMIT = 1
