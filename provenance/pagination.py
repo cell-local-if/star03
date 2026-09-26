@@ -107,6 +107,10 @@ IMPACT_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "iir1"
 #: exchange-import receipts.
 IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR_VERSION = "rx1"
 
+#: Marker for cursors that page through signed audit checkpoint
+#: exchange-import receipts.
+AUDIT_EXCHANGE_IMPORTS_CURSOR_VERSION = "ax1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -926,6 +930,25 @@ def _validate_impact_recon_exchange_imports_claims(
 #: Cursor family for ``GET /v1/impact-recon-exchange-imports``.
 IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR = CursorKind(
     version=IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR_VERSION,
+    claim_fields=(
+        "signature_version",
+        "signer_subject",
+        "public_key",
+        "package_digest_hex",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_impact_recon_exchange_imports_claims,
+)
+
+
+#: Cursor family for ``GET /v1/audit-exchanges``: the same claim set and
+#: validation as the impact-recon exchange-import receipts (exact-match
+#: text filters, canonical RFC 3339 time bounds, limit, offset).
+AUDIT_EXCHANGE_IMPORTS_CURSOR = CursorKind(
+    version=AUDIT_EXCHANGE_IMPORTS_CURSOR_VERSION,
     claim_fields=(
         "signature_version",
         "signer_subject",

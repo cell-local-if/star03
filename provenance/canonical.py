@@ -176,3 +176,23 @@ def canonical_impact_recon_package_bytes(package: Any) -> bytes:
 def impact_recon_package_digest_hex(package: Any) -> str:
     """Return the SHA-256 hex digest of the canonical recon-package bytes."""
     return hashlib.sha256(canonical_impact_recon_package_bytes(package)).hexdigest()
+
+
+def canonical_audit_exchange_package_bytes(package: Any) -> bytes:
+    """Serialize an audit checkpoint exchange package under the digest rules.
+
+    Exactly the same canonical form as the other package/snapshot rules:
+    the package root keeps its member order (``checkpoint`` then
+    ``events``) and arrays keep their element order, while every nested
+    object's members are sorted by Unicode code point, with compact
+    separators, unescaped non-ASCII, and UTF-8 encoding -- so the digest
+    is reproducible by an external verifier from the received package
+    JSON alone. (The two root members are already in code-point order, so
+    this coincides with fully sorted canonicalization for this shape.)
+    """
+    return _ordered_root_canonical_bytes(package)
+
+
+def audit_exchange_package_digest_hex(package: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical exchange-package bytes."""
+    return hashlib.sha256(canonical_audit_exchange_package_bytes(package)).hexdigest()

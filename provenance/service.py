@@ -20,6 +20,8 @@ from provenance.errors import (
     ActorAlreadyExistsError,
     ActorTrustPolicyConflictError,
     AuditCheckpointImportNotFoundError,
+    AuditExchangeImportNotFoundError,
+    AuditExchangeImportValidationError,
     AttestationAccessGrantRevocationNotFoundError,
     AttestationNotFoundError,
     AttestationRevocationNotFoundError,
@@ -55,6 +57,7 @@ from provenance.models import (
     EVENT_ATTESTATION_CREATED,
     EVENT_ATTESTATION_REVOKED,
     EVENT_AUDIT_CHECKPOINT_IMPORTED,
+    EVENT_AUDIT_EXCHANGE_IMPORTED,
     EVENT_AUTHENTICATION_KEY_RETIRED,
     EVENT_AUTHENTICATION_KEY_ROTATED,
     EVENT_CLAIM_CREATED,
@@ -73,8 +76,9 @@ from provenance.models import (
     AttestationAccessGrant,
     AttestationAccessGrantRevocation,
     AttestationRevocation,
-    AuthenticationKeyRotation,
     AuditEvent,
+    AuditExchangeImportRecord,
+    AuthenticationKeyRotation,
     CheckpointImportRecord,
     Claim,
     ClaimSupersession,
@@ -94,6 +98,7 @@ from provenance.schemas import (
     AttestationCreate,
     AttestationRevocationCreate,
     AuditCheckpointImportCreate,
+    AuditExchangeImportCreate,
     AuthenticationKeyRotationCreate,
     ClaimCreate,
     ClaimSupersessionCreate,
@@ -3266,6 +3271,197 @@ def list_impact_recon_audit_entries(
         )
     stmt = stmt.order_by(*_IMPACT_RECON_EXCHANGE_IMPORT_ORDER)
     return list(session.execute(stmt).scalars().all())
+
+
+def _audit_exchange_import_identity_select(
+    signature_version: str,
+    package_digest_algorithm: str,
+    package_digest_hex: str,
+):
+    return select(AuditExchangeImportRecord).where(
+        AuditExchangeImportRecord.signature_version == signature_version,
+        AuditExchangeImportRecord.package_digest_algorithm
+        == package_digest_algorithm,
+        AuditExchangeImportRecord.package_digest_hex == package_digest_hex,
+    )
+
+
+def create_audit_exchange_import(
+    session: Session,
+    payload: AuditExchangeImportCreate,
+    signature_digest_hex: str,
+) -> tuple[AuditExchangeImportRecord, bool]:
+    """Register one signed, offline-verified audit checkpoint package.
+
+    The caller has already verified the package under the existing
+    stateless audit-checkpoint rules (structure, count, canonical events
+    digest) and verified the Ed25519 signature over the canonical
+    ``[version, subject, algorithm, digest]`` array. This function
+    performs no such verification and no local-resource lookup: every id
+    named by the package is an opaque reference, so whether the
+    referenced events exist locally never changes the outcome.
+
+    The receiving identity is ``(signature_version,
+    package_digest_algorithm, package_digest_hex)`` -- the exchanged
+    package; the package itself and the raw signature are never stored.
+    A first submission writes the receipt row and its
+    ``audit.exchange_imported`` audit event in a single transaction. A
+    retried submission for the same identity with the same signing
+    subject, public key, and signature digest returns the existing record
+    with ``created=False`` and writes nothing. A submission for the same
+    package identity with a different signing subject, public key, or
+    signature is a 422 validation error and leaves the original record
+    (and audit trail) untouched.
+    """
+    metadata = payload.signature_metadata
+    signature_version = metadata.signature_version
+    package_digest_algorithm = metadata.package_digest_algorithm
+    package_digest_hex = metadata.package_digest_hex
+
+    existing = session.execute(
+        _audit_exchange_import_identity_select(
+            signature_version, package_digest_algorithm, package_digest_hex
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        # The same package is already registered. An exact retry (same
+        # subject, key, and signature) is idempotent; a different signing
+        # identity or signature conflicts with the stored receipt and is
+        # refused without changing it.
+        if (
+            existing.signer_subject == metadata.signer_subject
+            and existing.public_key == metadata.public_key
+            and existing.signature_digest_hex == signature_digest_hex
+        ):
+            return existing, False
+        raise AuditExchangeImportValidationError(
+            "exchange_import_identity_conflict"
+        )
+
+    record = AuditExchangeImportRecord(
+        id=ids.audit_exchange_import_id(
+            signature_version, package_digest_algorithm, package_digest_hex
+        ),
+        signature_version=signature_version,
+        signer_subject=metadata.signer_subject,
+        public_key=metadata.public_key,
+        package_digest_algorithm=package_digest_algorithm,
+        package_digest_hex=package_digest_hex,
+        signature_digest_algorithm=canonical.CANONICAL_DIGEST_ALGORITHM,
+        signature_digest_hex=signature_digest_hex,
+    )
+    session.add(record)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_AUDIT_EXCHANGE_IMPORTED,
+            resource_id=record.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent import registered this package identity first. An
+        # exact concurrent retry resolves to that record; a different
+        # signing identity or signature conflicts with it.
+        session.rollback()
+        raced = session.execute(
+            _audit_exchange_import_identity_select(
+                signature_version, package_digest_algorithm, package_digest_hex
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if (
+            raced.signer_subject == metadata.signer_subject
+            and raced.public_key == metadata.public_key
+            and raced.signature_digest_hex == signature_digest_hex
+        ):
+            return raced, False
+        raise AuditExchangeImportValidationError(
+            "exchange_import_identity_conflict"
+        ) from None
+    session.refresh(record)
+    return record, True
+
+
+def get_audit_exchange_import(
+    session: Session, import_id: str
+) -> AuditExchangeImportRecord:
+    """Return a signed exchange-import receipt by id or raise the 404."""
+    record = session.execute(
+        select(AuditExchangeImportRecord).where(
+            AuditExchangeImportRecord.id == import_id
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        raise AuditExchangeImportNotFoundError(import_id)
+    return record
+
+
+# Signed audit checkpoint exchange-import receipt search paging bounds.
+DEFAULT_AUDIT_EXCHANGE_IMPORTS_LIMIT = 50
+MIN_AUDIT_EXCHANGE_IMPORTS_LIMIT = 1
+MAX_AUDIT_EXCHANGE_IMPORTS_LIMIT = 100
+
+_AUDIT_EXCHANGE_IMPORT_ORDER = (
+    AuditExchangeImportRecord.created_at.asc(),
+    AuditExchangeImportRecord.seq.asc(),
+)
+
+
+def list_audit_exchange_imports(
+    session: Session,
+    signature_version: str | None = None,
+    signer_subject: str | None = None,
+    public_key: str | None = None,
+    package_digest_hex: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[AuditExchangeImportRecord]:
+    """Return signed exchange-import receipts in stable creation order, filtered.
+
+    ``signature_version``, ``signer_subject``, and ``package_digest_hex``
+    are exact, case- and whitespace-sensitive string matches against the
+    stored receipt fields; ``public_key`` is an exact, case- and
+    whitespace-sensitive match against the receipt's standard-Base64
+    public view (never decoded or normalized, so a non-canonical spelling
+    simply matches nothing). ``from_dt``/``to_dt`` are inclusive UTC
+    bounds on the receipt's ``created_at``. All filters combine as
+    logical AND; an absent filter imposes no restriction, and a filter
+    value that names nothing yields an empty list rather than an error.
+    Results follow the receipts' stable creation order (``created_at``
+    with the monotonic ``seq`` tiebreaker). The function is strictly
+    read-only: it writes no resource and no audit event.
+    """
+    stmt = select(AuditExchangeImportRecord)
+    if signature_version is not None:
+        stmt = stmt.where(
+            AuditExchangeImportRecord.signature_version == signature_version
+        )
+    if signer_subject is not None:
+        stmt = stmt.where(
+            AuditExchangeImportRecord.signer_subject == signer_subject
+        )
+    if package_digest_hex is not None:
+        stmt = stmt.where(
+            AuditExchangeImportRecord.package_digest_hex == package_digest_hex
+        )
+    if from_dt is not None:
+        stmt = stmt.where(AuditExchangeImportRecord.created_at >= from_dt)
+    if to_dt is not None:
+        stmt = stmt.where(AuditExchangeImportRecord.created_at <= to_dt)
+    stmt = stmt.order_by(*_AUDIT_EXCHANGE_IMPORT_ORDER)
+    rows = list(session.execute(stmt).scalars().all())
+    if public_key is not None:
+        # The filter binds the exact Base64 spelling served on the public
+        # view; the stored raw key bytes are rendered, never the other way
+        # around, so a non-canonical spelling matches nothing.
+        rows = [
+            row
+            for row in rows
+            if base64.b64encode(row.public_key).decode("ascii") == public_key
+        ]
+    return rows
 
 
 # Impact-import receipt search paging bounds.

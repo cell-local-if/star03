@@ -170,6 +170,22 @@ def test_matching_checkpoint_is_valid(client):
     assert resp.content == b'{"valid":true}\n'
 
 
+def test_identifiers_have_no_length_ceiling(client):
+    # The entry identifiers carry no maximum length: an over-long (but
+    # non-empty) id, signer_subject, or public_key is structural input like
+    # any other and verifies on structure and digest alone.
+    entries = [
+        _entry(
+            id="irx_" + "a" * 200,
+            signer_subject="s" * 300,
+            public_key="A" * 300,
+        )
+    ]
+    resp = _verify(client, _request_body(entries))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"valid": True}
+
+
 def test_empty_entries_match_the_empty_array_digest(client):
     body = {
         "checkpoint": {
