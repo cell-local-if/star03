@@ -86,6 +86,10 @@ CONTENTS_CURSOR_VERSION = "ct1"
 #: search.
 ATTESTATION_REVOCATIONS_CURSOR_VERSION = "ar1"
 
+#: Marker for cursors that page through the global attestation
+#: access-grant-revocation search.
+ATTESTATION_ACCESS_GRANT_REVOCATIONS_CURSOR_VERSION = "agr1"
+
 #: Marker for cursors that page through the global content-relation search.
 CONTENT_RELATIONS_CURSOR_VERSION = "rl1"
 
@@ -714,6 +718,46 @@ ATTESTATION_REVOCATIONS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_attestation_revocations_claims,
+)
+
+
+def _validate_attestation_access_grant_revocations_claims(
+    claims: dict[str, Any],
+) -> None:
+    # The exact-match filters are either absent (null) or non-empty strings;
+    # matching is case- and whitespace-sensitive, so the raw value is bound.
+    _optional_nonempty_str(claims, "grant_id")
+    _optional_nonempty_str(claims, "revoker_actor_id")
+    _optional_nonempty_str(claims, "reason")
+    # The time bounds are absent (null) or canonical RFC 3339 UTC strings.
+    for field in ("from", "to"):
+        value = claims[field]
+        if value is not None and (
+            not isinstance(value, str) or parse_rfc3339_utc(value) is None
+        ):
+            raise InvalidCursorError(f"cursor {field} is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/attestation-access-grant-revocations``.
+ATTESTATION_ACCESS_GRANT_REVOCATIONS_CURSOR = CursorKind(
+    version=ATTESTATION_ACCESS_GRANT_REVOCATIONS_CURSOR_VERSION,
+    claim_fields=(
+        "grant_id",
+        "revoker_actor_id",
+        "reason",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_attestation_access_grant_revocations_claims,
 )
 
 
