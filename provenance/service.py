@@ -604,6 +604,76 @@ MIN_CLAIM_SUPERSESSIONS_LIMIT = 1
 MAX_CLAIM_SUPERSESSIONS_LIMIT = 100
 
 
+def _claim_supersession_filters(
+    supersession_id: str | None,
+    superseded_claim_id: str | None,
+    replacement_claim_id: str | None,
+    reason: str | None,
+    from_dt,
+    to_dt,
+) -> list:
+    """Build the shared claim-supersession filter clauses.
+
+    Each non-``None`` value is a case- and whitespace-sensitive exact match
+    (or an inclusive ``created_at`` bound for the time filters); the clauses
+    combine as logical AND. Values are never resolved for existence, so an
+    unknown id or reason simply matches nothing.
+    """
+    filters = []
+    if supersession_id is not None:
+        filters.append(ClaimSupersession.id == supersession_id)
+    if superseded_claim_id is not None:
+        filters.append(
+            ClaimSupersession.superseded_claim_id == superseded_claim_id
+        )
+    if replacement_claim_id is not None:
+        filters.append(
+            ClaimSupersession.replacement_claim_id == replacement_claim_id
+        )
+    if reason is not None:
+        filters.append(ClaimSupersession.reason == reason)
+    if from_dt is not None:
+        filters.append(ClaimSupersession.created_at >= from_dt)
+    if to_dt is not None:
+        filters.append(ClaimSupersession.created_at <= to_dt)
+    return filters
+
+
+def list_claim_supersessions(
+    session: Session,
+    supersession_id: str | None = None,
+    superseded_claim_id: str | None = None,
+    replacement_claim_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[ClaimSupersession]:
+    """Return every filtered supersession in stable creation order.
+
+    The unpaginated counterpart of :func:`list_claim_supersessions_page`
+    used by the checkpoint package export: the same exact-match and
+    inclusive-bound filter semantics, the same ``created_at``/``seq``
+    ordering, and the same strictly read-only guarantee -- it writes no
+    supersession, claim, resource, or audit event, and an unknown filter
+    value is an empty result rather than a missing resource.
+    """
+    stmt = (
+        select(ClaimSupersession)
+        .where(
+            *_claim_supersession_filters(
+                supersession_id,
+                superseded_claim_id,
+                replacement_claim_id,
+                reason,
+                from_dt,
+                to_dt,
+            )
+        )
+        .order_by(*_CLAIM_SUPERSESSION_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
+
+
 def list_claim_supersessions_page(
     session: Session,
     supersession_id: str | None = None,
@@ -632,23 +702,14 @@ def list_claim_supersessions_page(
     and stay stable across restarts. The retrieval is strictly read-only:
     it writes no supersession, claim, resource, or audit event.
     """
-    filters = []
-    if supersession_id is not None:
-        filters.append(ClaimSupersession.id == supersession_id)
-    if superseded_claim_id is not None:
-        filters.append(
-            ClaimSupersession.superseded_claim_id == superseded_claim_id
-        )
-    if replacement_claim_id is not None:
-        filters.append(
-            ClaimSupersession.replacement_claim_id == replacement_claim_id
-        )
-    if reason is not None:
-        filters.append(ClaimSupersession.reason == reason)
-    if from_dt is not None:
-        filters.append(ClaimSupersession.created_at >= from_dt)
-    if to_dt is not None:
-        filters.append(ClaimSupersession.created_at <= to_dt)
+    filters = _claim_supersession_filters(
+        supersession_id,
+        superseded_claim_id,
+        replacement_claim_id,
+        reason,
+        from_dt,
+        to_dt,
+    )
 
     total = session.execute(
         select(func.count())
