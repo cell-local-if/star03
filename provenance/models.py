@@ -50,6 +50,7 @@ EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
 EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 EVENT_AUDIT_CHECKPOINT_IMPORTED = "audit.checkpoint_imported"
+EVENT_CSP_CHECKPOINT_IMPORTED = "csp.checkpoint_imported"
 EVENT_AUDIT_EXCHANGE_IMPORTED = "audit.exchange_imported"
 EVENT_REVOCATION_IMPACT_IMPORTED = "revocation_impact.imported"
 EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED = (
@@ -809,6 +810,62 @@ class CheckpointImportRecord(Base):
     event_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
     #: The SHA-256 events digest the received event array was verified against.
     events_digest_hex: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+
+class CspImportRecord(Base):
+    """An immutable receipt for one offline-verified correction checkpoint.
+
+    The record is the controlled-import counterpart of the stateless
+    correction-checkpoint verification route: a checkpoint whose digest
+    matches the canonical SHA-256 of the received corrections array under
+    the existing correction checkpoint rules, with exactly the claimed
+    correction count, is registered exactly once. The receipt stores only
+    the receiving identity -- the fixed correction checkpoint version, the
+    correction count, and the corrections digest -- never the corrections
+    array itself and never any raw correction data; the full corrections
+    must be re-presented on a retry. Verification never depends on whether
+    the described corrections (claim supersessions) exist locally (they are
+    never created, modified, or queried), so no foreign keys and no local
+    supersession lookup participate in the decision.
+
+    Records are append-only and immutable; there is deliberately no update
+    or delete path. The identity triple is unique, so a retried submission
+    for the same checkpoint returns the original record without another
+    audit event.
+    """
+
+    __tablename__ = "csp_checkpoint_imports"
+    __table_args__ = (
+        UniqueConstraint(
+            "checkpoint_version",
+            "correction_count",
+            "corrections_digest_hex",
+            name="uq_csp_imports_identity",
+        ),
+        Index(
+            "ix_csp_imports_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable receipt identifier ("csi_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: Fixed correction checkpoint format version committed to by the request.
+    checkpoint_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The number of corrections the checkpoint commits to.
+    correction_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: The SHA-256 corrections digest the received array was verified against.
+    corrections_digest_hex: Mapped[str] = mapped_column(
+        String(128), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, nullable=False, default=utc_now
     )

@@ -495,6 +495,104 @@ class CorrectionVerificationResponse(BaseModel):
     computed_digest_hex: str | None = None
 
 
+class CspImportCreate(CorrectionVerificationCreate):
+    """A controlled import of one offline-verified correction checkpoint.
+
+    Exactly the existing two-member verification structure: ``checkpoint``
+    carries the claimed four-field correction checkpoint and
+    ``corrections`` carries the correction sequence it commits to, with
+    exactly ``checkpoint.correction_count`` elements, each exactly the
+    exported supersession public view. The digest match itself is enforced
+    at the route, over the raw received JSON so array order and datetime
+    spellings participate exactly as on the stateless verification route; a
+    mismatch is a 422 and writes nothing.
+
+    Registration is a pure function of the request body that never
+    resolves any supersession, claim, or resource id against local state:
+    the described corrections are not created, modified, or queried, and
+    they need not exist locally.
+    """
+
+
+class CspImportResponse(BaseModel):
+    """The public immutable receipt for one registered correction checkpoint import.
+
+    Exactly the stable ``csi_`` receipt id, the three receiving-identity
+    fields (checkpoint version, corrections digest, correction count), and
+    the UTC ``received_at`` instant. The corrections array itself is
+    deliberately not part of the receipt: it is neither copied into the
+    record nor echoed here.
+    """
+
+    id: str
+    checkpoint_version: str
+    corrections_digest_hex: str
+    correction_count: int
+    received_at: datetime
+
+
+class CspImportPageResponse(BaseModel):
+    """A cursor-paginated page of CSP-import receipt public views."""
+
+    items: list[CspImportResponse]
+    #: Total number of receipts after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
+class CspImportReconciliationResponse(BaseModel):
+    """A read-only reconciliation of one CSP-import receipt with local state.
+
+    Exactly three members: the receipt's ``import_id``, the four-field
+    checkpoint computed over the current, unfiltered local correction set
+    under the existing correction checkpoint rules
+    (``local_checkpoint``), and ``matches`` -- true only when the receipt's
+    ``checkpoint_version``, ``correction_count``, and
+    ``corrections_digest_hex`` all equal the corresponding local checkpoint
+    fields. The imported corrections array is never read (it is not
+    persisted) or echoed; no material beyond the receipt identity
+    participates in the verdict.
+    """
+
+    import_id: str
+    local_checkpoint: CorrectionCheckpointResponse
+    matches: bool
+
+
+class CspImportReconciliationItem(BaseModel):
+    """One receipt's current local reconciliation in a list page.
+
+    Carries the existing single-receipt public view exactly (``id``,
+    ``checkpoint_version``, ``corrections_digest_hex``,
+    ``correction_count``, ``received_at``) plus ``local_checkpoint`` -- the
+    four-field checkpoint computed over the complete, unfiltered local
+    correction set under the existing correction checkpoint rules -- and
+    ``matches``, true only when the receipt's ``checkpoint_version``,
+    ``correction_count``, and ``corrections_digest_hex`` all equal that
+    local checkpoint. The imported corrections array is never echoed.
+    """
+
+    id: str
+    checkpoint_version: str
+    corrections_digest_hex: str
+    correction_count: int
+    received_at: datetime
+    local_checkpoint: CorrectionCheckpointResponse
+    matches: bool
+
+
+class CspImportReconciliationPageResponse(BaseModel):
+    """A cursor-paginated page of receipt local reconciliations."""
+
+    items: list[CspImportReconciliationItem]
+    #: Total number of receipts, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
+
 class EvidenceBundleCreate(BaseModel):
     # Evidence bytes must never reach the service: any field not declared
     # here (e.g. "data" or "evidence") is a client error, not silently

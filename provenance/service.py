@@ -35,6 +35,7 @@ from provenance.errors import (
     ContentNotFoundError,
     ContentRelationNotFoundError,
     ContentRelationValidationError,
+    CspImportNotFoundError,
     EvidenceBundleExchangeImportNotFoundError,
     EvidenceBundleNotFoundError,
     ImpactImportNotFoundError,
@@ -66,6 +67,7 @@ from provenance.models import (
     EVENT_CONTENT_EXPORT_JOB_CREATED,
     EVENT_CONTENT_EXPORT_JOB_RUN,
     EVENT_CONTENT_RELATION_CREATED,
+    EVENT_CSP_CHECKPOINT_IMPORTED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
     EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED,
@@ -85,6 +87,7 @@ from provenance.models import (
     Content,
     ContentExportJob,
     ContentRelation,
+    CspImportRecord,
     EvidenceBundle,
     ExchangeImportRecord,
     ImpactImportRecord,
@@ -105,6 +108,7 @@ from provenance.schemas import (
     ContentCreate,
     ContentExportJobCreate,
     ContentRelationCreate,
+    CspImportCreate,
     EvidenceBundleExchangeImportCreate,
     EvidenceBundleCreate,
     EvidenceBundleImportCreate,
@@ -3122,6 +3126,167 @@ def list_audit_checkpoint_import_reconciliations(
     event.
     """
     stmt = select(CheckpointImportRecord).order_by(*_CHECKPOINT_IMPORT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
+def _csp_import_identity_select(
+    checkpoint_version: str,
+    correction_count: int,
+    corrections_digest_hex: str,
+):
+    return select(CspImportRecord).where(
+        CspImportRecord.checkpoint_version == checkpoint_version,
+        CspImportRecord.correction_count == correction_count,
+        CspImportRecord.corrections_digest_hex == corrections_digest_hex,
+    )
+
+
+def create_csp_import(
+    session: Session,
+    payload: CspImportCreate,
+) -> tuple[CspImportRecord, bool]:
+    """Register one offline-verified correction checkpoint, returning ``(record, created)``.
+
+    The caller has already verified the checkpoint: the request parses under
+    the existing correction checkpoint structure, its correction count
+    matches the array, and the corrections digest matches the canonical
+    SHA-256 of the received corrections array exactly as received. This
+    function performs no such verification and no local-supersession
+    lookup: the described corrections are never queried, created, or
+    modified, so whether they exist locally never changes the outcome.
+
+    The receiving identity is ``(checkpoint_version, correction_count,
+    corrections_digest_hex)``; the corrections array itself is never
+    stored. A first submission writes the receipt row and its
+    ``csp.checkpoint_imported`` audit event in a single transaction. A
+    retried submission for the same identity returns the existing record
+    with ``created=False`` and writes nothing -- no second row and no
+    second audit event.
+    """
+    checkpoint = payload.checkpoint
+    checkpoint_version = checkpoint.checkpoint_version
+    correction_count = checkpoint.correction_count
+    corrections_digest_hex = checkpoint.corrections_digest_hex
+
+    existing = session.execute(
+        _csp_import_identity_select(
+            checkpoint_version, correction_count, corrections_digest_hex
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    while True:
+        record = CspImportRecord(
+            id=ids.csp_import_id(
+                checkpoint_version, correction_count, corrections_digest_hex
+            ),
+            checkpoint_version=checkpoint_version,
+            correction_count=correction_count,
+            corrections_digest_hex=corrections_digest_hex,
+        )
+        session.add(record)
+        session.add(
+            AuditEvent(
+                event_type=EVENT_CSP_CHECKPOINT_IMPORTED,
+                resource_id=record.id,
+            )
+        )
+        try:
+            session.commit()
+        except IntegrityError:
+            # A concurrent import registered this identity first: roll back
+            # and return that record instead of duplicating it or writing a
+            # second audit event.
+            session.rollback()
+            raced = session.execute(
+                _csp_import_identity_select(
+                    checkpoint_version, correction_count, corrections_digest_hex
+                )
+            ).scalar_one_or_none()
+            if raced is None:  # pragma: no cover - defensive
+                raise
+            return raced, False
+        session.refresh(record)
+        return record, True
+
+
+def get_csp_import(session: Session, import_id: str) -> CspImportRecord:
+    """Return a CSP-import receipt by id or raise the 404 domain error."""
+    record = session.execute(
+        select(CspImportRecord).where(CspImportRecord.id == import_id)
+    ).scalar_one_or_none()
+    if record is None:
+        raise CspImportNotFoundError(import_id)
+    return record
+
+
+# CSP-import receipt search paging bounds.
+DEFAULT_CSP_IMPORTS_LIMIT = 50
+MIN_CSP_IMPORTS_LIMIT = 1
+MAX_CSP_IMPORTS_LIMIT = 100
+
+_CSP_IMPORT_ORDER = (
+    CspImportRecord.created_at.asc(),
+    CspImportRecord.seq.asc(),
+)
+
+
+def list_csp_imports(
+    session: Session,
+    checkpoint_version: str | None = None,
+    corrections_digest_hex: str | None = None,
+    correction_count: int | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[CspImportRecord]:
+    """Return CSP-import receipts in stable creation order, optionally filtered.
+
+    ``checkpoint_version`` and ``corrections_digest_hex`` are exact, case-
+    and whitespace-sensitive string matches; ``correction_count`` is an
+    exact non-negative integer match; ``from_dt``/``to_dt`` are inclusive
+    UTC bounds on the receipt's ``created_at``. The filters combine as
+    logical AND; an absent filter imposes no restriction. Results follow
+    the receipts' stable creation order (``created_at`` with the monotonic
+    ``seq`` tiebreaker). The function is strictly read-only: it writes no
+    resource and no audit event.
+    """
+    stmt = select(CspImportRecord)
+    if checkpoint_version is not None:
+        stmt = stmt.where(
+            CspImportRecord.checkpoint_version == checkpoint_version
+        )
+    if corrections_digest_hex is not None:
+        stmt = stmt.where(
+            CspImportRecord.corrections_digest_hex == corrections_digest_hex
+        )
+    if correction_count is not None:
+        stmt = stmt.where(CspImportRecord.correction_count == correction_count)
+    if from_dt is not None:
+        stmt = stmt.where(CspImportRecord.created_at >= from_dt)
+    if to_dt is not None:
+        stmt = stmt.where(CspImportRecord.created_at <= to_dt)
+    stmt = stmt.order_by(*_CSP_IMPORT_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
+# CSP-import reconciliation listing paging bounds.
+DEFAULT_CSP_IMPORT_RECONCILIATIONS_LIMIT = 50
+MIN_CSP_IMPORT_RECONCILIATIONS_LIMIT = 1
+MAX_CSP_IMPORT_RECONCILIATIONS_LIMIT = 100
+
+
+def list_csp_import_reconciliations(session: Session) -> list[CspImportRecord]:
+    """Return every CSP-import receipt in stable creation order.
+
+    The reconciliation collection is unfiltered; each receipt's current
+    local correction checkpoint reconciliation is computed by the caller
+    against the complete local correction set. Results follow the receipts'
+    stable creation order (``created_at`` with the monotonic ``seq``
+    tiebreaker). The function is strictly read-only: it writes no resource
+    and no audit event.
+    """
+    stmt = select(CspImportRecord).order_by(*_CSP_IMPORT_ORDER)
     return list(session.execute(stmt).scalars().all())
 
 

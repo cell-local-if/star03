@@ -53,6 +53,14 @@ CHECKPOINT_IMPORTS_CURSOR_VERSION = "ci1"
 #: Marker for cursors that page through checkpoint-import reconciliations.
 CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "cr1"
 
+#: Marker for cursors that page through CSP correction-checkpoint-import
+#: receipts.
+CSP_IMPORTS_CURSOR_VERSION = "csi1"
+
+#: Marker for cursors that page through CSP correction-checkpoint-import
+#: receipt reconciliations.
+CSP_IMPORT_RECONCILIATIONS_CURSOR_VERSION = "csr1"
+
 #: Marker for cursors that page through the reviewer claim search.
 CLAIMS_CURSOR_VERSION = "cl1"
 
@@ -382,6 +390,71 @@ CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR = CursorKind(
     version=CHECKPOINT_IMPORT_RECONCILIATIONS_CURSOR_VERSION,
     claim_fields=("limit", "offset"),
     validate=_validate_checkpoint_import_reconciliations_claims,
+)
+
+
+def _validate_csp_imports_claims(claims: dict[str, Any]) -> None:
+    # The exact-match string filters are either absent (null) or non-empty
+    # strings; matching is case- and whitespace-sensitive, so the raw value
+    # is bound. The correction-count filter is absent (null) or a
+    # non-negative integer. The received-time bounds are absent (null) or
+    # canonical RFC 3339 UTC strings.
+    _optional_nonempty_str(claims, "checkpoint_version")
+    _optional_nonempty_str(claims, "corrections_digest_hex")
+    correction_count = claims["correction_count"]
+    if correction_count is not None and (
+        not _is_int(correction_count) or correction_count < 0
+    ):
+        raise InvalidCursorError("cursor correction_count is invalid")
+    for field in ("from", "to"):
+        value = claims[field]
+        if value is not None and (
+            not isinstance(value, str) or parse_rfc3339_utc(value) is None
+        ):
+            raise InvalidCursorError(f"cursor {field} is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/csp-imports``.
+CSP_IMPORTS_CURSOR = CursorKind(
+    version=CSP_IMPORTS_CURSOR_VERSION,
+    claim_fields=(
+        "checkpoint_version",
+        "corrections_digest_hex",
+        "correction_count",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_csp_imports_claims,
+)
+
+
+def _validate_csp_import_reconciliations_claims(
+    claims: dict[str, Any],
+) -> None:
+    # The collection takes no filters: the cursor binds only limit/offset.
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/csp-import-reconciliations``.
+CSP_IMPORT_RECONCILIATIONS_CURSOR = CursorKind(
+    version=CSP_IMPORT_RECONCILIATIONS_CURSOR_VERSION,
+    claim_fields=("limit", "offset"),
+    validate=_validate_csp_import_reconciliations_claims,
 )
 
 
