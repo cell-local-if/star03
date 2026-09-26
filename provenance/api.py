@@ -10,6 +10,7 @@ import re
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from provenance import (
@@ -31,6 +32,7 @@ from provenance.errors import (
     ImpactReconExchangeImportValidationError,
     ImpactReconSignatureVerificationError,
     LineageValidationError,
+    ObservabilityUnavailableError,
     ProtectedAccessValidationError,
     ProtectedResourceNotFoundError,
 )
@@ -1525,13 +1527,12 @@ def _csp_import_response(record) -> CspImportResponse:
     )
 
 
-@router.post("/csp-imports", response_model=CspImportResponse)
+@router.post("/csp-imports")
 async def import_correction_checkpoint(
     payload: CspImportCreate,
     request: Request,
     session: DbSession,
-    response: Response,
-) -> CspImportResponse:
+) -> Response:
     # Structure, fixed version/algorithm, strict digest spelling, the
     # correction-item fields and timestamps, and the claimed correction
     # count have all passed request validation exactly as on the stateless
@@ -1552,11 +1553,18 @@ async def import_correction_checkpoint(
     # supersession or other resource is created or modified.
     record, created = service.create_csp_import(session, payload)
     # First registration of this receiving identity -> 201; a retried
-    # submission -> 200 with the original record and no new audit event.
-    response.status_code = (
+    # submission -> 200 with the original record and no new row or audit
+    # event.
+    status_code = (
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
-    return _csp_import_response(record)
+    # Compact UTF-8 JSON terminated by exactly one newline, matching the
+    # other controlled-import receipt routes and the single-newline compact
+    # JSON contract.
+    return _render_compact_json(
+        _csp_import_response(record).model_dump(mode="json"),
+        status_code=status_code,
+    )
 
 
 _CSP_IMPORTS_PARAMS = frozenset(
@@ -7084,3 +7092,93 @@ def get_audit_exchange(
     # event. An unknown id is an explicit, specific 404.
     record = service.get_audit_exchange_import(session, import_id)
     return _render_compact_json(_audit_exchange_import_response(record))
+
+
+# --- Read-only runtime status summary ---------------------------------------
+
+OBSERVABILITY_SUMMARY_PATH = "/observability/summary"
+
+
+@router.get(OBSERVABILITY_SUMMARY_PATH)
+async def get_observability_summary(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only runtime status for operators. The request takes no body and
+    # no query parameters: whitespace bytes, malformed JSON, an unknown
+    # parameter, or a repeated parameter are all 422 validation_error, and
+    # both checks complete before any state is read, so an invalid request
+    # never produces a partial summary and never touches the database.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # Every count and the audit status derive from one strictly read-only
+    # aggregation over the current persisted state. An unreadable database
+    # (missing table, locked/unopenable connection) or any internal failure
+    # of the summary queries is a 503 service_unavailable carrying a
+    # machine-readable reason under the existing error JSON structure; it
+    # still writes nothing.
+    try:
+        (
+            resource_counts,
+            task_counts,
+            audit_event_count,
+            latest_audit_event_at,
+        ) = service.summarize_observability(session)
+    except SQLAlchemyError as exc:
+        raise ObservabilityUnavailableError("database_unavailable") from exc
+    except Exception as exc:
+        # Any other failure while aggregating the read-only summary is
+        # still a 503 with a reason rather than a bare 500: the summary is
+        # an operational probe and stays strictly read-only either way.
+        raise ObservabilityUnavailableError("summary_query_failed") from exc
+
+    # A completed aggregation means the database served every count: the
+    # service is ok and the database is ready. An unreadable database never
+    # reaches here -- it is the 503 above, never a degraded 200.
+    payload = {
+        "service": {"status": "ok"},
+        "database": {"status": "ready"},
+        "resources": {
+            "actors": resource_counts["actors"],
+            "contents": resource_counts["contents"],
+            "claims": resource_counts["claims"],
+            "evidence_bundles": resource_counts["evidence_bundles"],
+            "attestations": resource_counts["attestations"],
+            "attestation_revocations": resource_counts[
+                "attestation_revocations"
+            ],
+            "attestation_access_grants": resource_counts[
+                "attestation_access_grants"
+            ],
+            "content_relations": resource_counts["content_relations"],
+            "audit_events": resource_counts["audit_events"],
+            "content_export_jobs": resource_counts["content_export_jobs"],
+        },
+        "tasks": {
+            "pending": task_counts[CONTENT_EXPORT_JOB_PENDING],
+            "running": task_counts[CONTENT_EXPORT_JOB_RUNNING],
+            "succeeded": task_counts[CONTENT_EXPORT_JOB_SUCCEEDED],
+            "failed": task_counts[CONTENT_EXPORT_JOB_FAILED],
+        },
+        "audit": {
+            "event_count": audit_event_count,
+            # An empty trail is a definite empty status: zero events and a
+            # null latest time, never a missing member or an error.
+            "latest_event_at": (
+                latest_audit_event_at.isoformat()
+                if latest_audit_event_at is not None
+                else None
+            ),
+        },
+        "checked_at": utc_now().isoformat(),
+    }
+    # Compact UTF-8 JSON, fixed member order, UTC times, integral numbers
+    # only, terminated by exactly one newline. No raw material is ever
+    # included -- only statuses, counts, and the latest audit instant.
+    return _render_compact_json(payload)

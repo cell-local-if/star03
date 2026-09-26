@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from datetime import datetime
 from typing import Callable
 
 from sqlalchemy import exists, func, or_, select, update as sa_update
@@ -2826,6 +2827,77 @@ def summarize_content_export_jobs(
         .limit(1)
     ).scalar_one_or_none()
     return counts, oldest_pending
+
+
+# The ten existing resource collections covered by the read-only
+# observability summary, in the fixed response order. Audit events are both
+# a resource count and the audit status's event total, so both always agree.
+_OBSERVABILITY_RESOURCE_MODELS = (
+    ("actors", Actor),
+    ("contents", Content),
+    ("claims", Claim),
+    ("evidence_bundles", EvidenceBundle),
+    ("attestations", Attestation),
+    ("attestation_revocations", AttestationRevocation),
+    ("attestation_access_grants", AttestationAccessGrant),
+    ("content_relations", ContentRelation),
+    ("audit_events", AuditEvent),
+    ("content_export_jobs", ContentExportJob),
+)
+
+
+def summarize_observability(
+    session: Session,
+) -> tuple[dict[str, int], dict[str, int], int, datetime | None]:
+    """Aggregate the current read-only runtime status in one state read.
+
+    Returns ``(resource_counts, task_counts, audit_event_count,
+    latest_audit_event_at)``:
+
+    * ``resource_counts`` maps the ten existing resource collections above to
+      their current row counts, each zero on an empty database -- a missing
+      table or unreadable database propagates as an exception rather than a
+      missing member;
+    * ``task_counts`` keys the four content-export-job lifecycle states
+      (``pending``/``running``/``succeeded``/``failed``), each defaulting to
+      zero;
+    * the audit pair is the total audit-event count and the latest audit
+      event's timezone-aware UTC ``created_at`` (``None`` when the trail is
+      empty -- an empty trail is a definite empty status, not a missing one).
+
+    The function is strictly read-only: it issues only ``SELECT``
+    aggregations and creates, modifies, or deletes no resource, task, or
+    audit event. Repeated and concurrent reads over the same persisted
+    state return the same numbers; only the caller's own check instant
+    differs.
+    """
+    resource_counts: dict[str, int] = {}
+    for key, model in _OBSERVABILITY_RESOURCE_MODELS:
+        resource_counts[key] = session.execute(
+            select(func.count()).select_from(model)
+        ).scalar_one()
+
+    task_rows = session.execute(
+        select(ContentExportJob.status, func.count()).group_by(
+            ContentExportJob.status
+        )
+    ).all()
+    task_counts = {state: 0 for state in CONTENT_EXPORT_JOB_STATES}
+    for status_value, total in task_rows:
+        task_counts[status_value] = total
+
+    # The audit status total is the same row count already reported under
+    # resources, so it is queried exactly once and the two views can never
+    # disagree; only the latest event time is read additionally.
+    latest_audit_event_at = session.execute(
+        select(func.max(AuditEvent.created_at))
+    ).scalar_one()
+    return (
+        resource_counts,
+        task_counts,
+        resource_counts["audit_events"],
+        latest_audit_event_at,
+    )
 
 
 def get_evidence_bundle_exchange(

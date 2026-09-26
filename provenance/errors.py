@@ -462,6 +462,24 @@ class ProtectedResourceNotFoundError(DomainError):
         super().__init__()
 
 
+class ObservabilityUnavailableError(DomainError):
+    """The read-only observability summary cannot be computed.
+
+    An unreadable database or an internal failure while aggregating the
+    summary renders as ``503 service_unavailable`` under the existing error
+    JSON structure, carrying a machine-readable reason. The summary is
+    strictly read-only, so the failure itself writes no resource, task, or
+    audit event.
+    """
+
+    status_code = 503
+    code = "service_unavailable"
+    message = "The observability summary is temporarily unavailable."
+
+    def __init__(self, reason: str):
+        super().__init__(details={"reason": reason})
+
+
 class LineageValidationError(DomainError):
     """A malformed lineage query (``direction`` / ``max_depth``).
 
