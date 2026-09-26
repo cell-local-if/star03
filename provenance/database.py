@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import DateTime, create_engine
+from sqlalchemy import DateTime, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.types import TypeDecorator
 
@@ -54,6 +55,21 @@ def _ensure_sqlite_parent_dir(database_url: str) -> None:
     parent.mkdir(parents=True, exist_ok=True)
 
 
+def _sqlite_base64_encode(value):
+    """Render raw bytes as standard Base64 (RFC 4648), exactly the public view.
+
+    The read-only impact-recon audit package export pushes its public-key
+    filter down to the database query while still comparing the exact
+    standard-Base64 spelling served on the receipt (never decoding or
+    normalizing the filter value). SQLite has no native Base64 function,
+    so this deterministic scalar renders the stored key bytes inside the
+    query instead.
+    """
+    if value is None:
+        return None
+    return base64.b64encode(value).decode("ascii")
+
+
 def make_engine(database_url: str):
     """Create an engine tuned for the configured database URL."""
     connect_args: dict[str, object] = {}
@@ -71,7 +87,16 @@ def make_engine(database_url: str):
             from sqlalchemy.pool import StaticPool
 
             kwargs["poolclass"] = StaticPool
-    return create_engine(database_url, **kwargs)
+    engine = create_engine(database_url, **kwargs)
+    if database_url.startswith("sqlite"):
+        # Pure, deterministic, and never writes: safe to register on every
+        # connection the pool opens.
+        event.listens_for(engine, "connect")(
+            lambda dbapi_connection, _record: dbapi_connection.create_function(
+                "base64_encode", 1, _sqlite_base64_encode
+            )
+        )
+    return engine
 
 
 def make_session_factory(engine) -> sessionmaker[Session]:
