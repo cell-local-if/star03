@@ -409,6 +409,39 @@ def content_export_job_id(content_id: str, request_id: str) -> str:
     return "cxj_" + hashlib.sha256(material).hexdigest()
 
 
+def audit_checkpoint_job_id(
+    request_id: str,
+    event_type: str | None,
+    resource_id: str | None,
+    from_dt: str | None,
+    to_dt: str | None,
+) -> str:
+    """Return a stable ``acj_``-prefixed id for an audit checkpoint job.
+
+    The identity is exactly the idempotency material: the client-supplied
+    request id plus the effective checkpoint filters (the exact-match
+    ``event_type``/``resource_id`` strings and the strict UTC
+    ``from``/``to`` bounds rendered in their canonical ``+00:00`` spelling,
+    each null when unset). A retry of the same material maps to the same
+    job; any different filter maps to a different id (and is rejected as a
+    conflict). The material is a canonical JSON array so fields containing
+    separators cannot collide with different field splits.
+    """
+    material = json.dumps(
+        [
+            "audit_checkpoint_job",
+            request_id,
+            event_type,
+            resource_id,
+            from_dt,
+            to_dt,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "acj_" + hashlib.sha256(material).hexdigest()
+
+
 def actor_trust_policy_id(actor_id: str) -> str:
     """Return a stable ``atp_``-prefixed identifier for a trust policy.
 

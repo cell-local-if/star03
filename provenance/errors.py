@@ -389,6 +389,49 @@ class ContentExportJobConflictError(DomainError):
         super().__init__(details={"job_id": job_id, "status": status})
 
 
+class AuditCheckpointJobNotFoundError(DomainError):
+    status_code = 404
+    code = "audit_checkpoint_job_not_found"
+    message = "The requested audit checkpoint job does not exist."
+
+    def __init__(self, job_id: str | None = None):
+        # A by-id lookup carries the requested job id in the details; a
+        # queue claim with no pending job has no id to report.
+        super().__init__(
+            details={"job_id": job_id} if job_id is not None else None
+        )
+
+
+class AuditCheckpointRequestConflictError(DomainError):
+    """A request_id reused for different filters than its first submission."""
+
+    status_code = 409
+    code = "audit_checkpoint_request_conflict"
+    message = (
+        "The request_id is already associated with a different checkpoint "
+        "filter."
+    )
+
+    def __init__(self, request_id: str):
+        super().__init__(details={"request_id": request_id})
+
+
+class AuditCheckpointJobConflictError(DomainError):
+    """A run against an audit checkpoint job that is no longer pending.
+
+    Only a ``pending`` job can be claimed; a concurrent run that won the
+    claim, or any repeat run after the job has settled, is a conflict rather
+    than a second execution.
+    """
+
+    status_code = 409
+    code = "conflict"
+    message = "The audit checkpoint job is not pending and cannot be run."
+
+    def __init__(self, job_id: str, status: str):
+        super().__init__(details={"job_id": job_id, "status": status})
+
+
 class ClaimSupersessionNotFoundError(DomainError):
     status_code = 404
     code = "claim_supersession_not_found"

@@ -58,6 +58,8 @@ EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED = (
 )
 EVENT_CONTENT_EXPORT_JOB_CREATED = "content_export_job.created"
 EVENT_CONTENT_EXPORT_JOB_RUN = "content_export_job.run"
+EVENT_AUDIT_CHECKPOINT_JOB_CREATED = "audit_checkpoint_job.created"
+EVENT_AUDIT_CHECKPOINT_JOB_RUN = "audit_checkpoint_job.run"
 EVENT_ACTOR_TRUST_POLICY_CREATED = "actor_trust_policy.created"
 
 # Content export job lifecycle states. A job is created ``pending``; a run
@@ -78,6 +80,25 @@ CONTENT_EXPORT_JOB_STATES = frozenset(
 )
 # Stable error recorded on a failed export run.
 CONTENT_EXPORT_JOB_FAILED_ERROR = "content_export_failed"
+
+# Audit checkpoint export job lifecycle states. As with content export jobs,
+# a job starts ``pending`` and a run atomically claims it into ``running``
+# before settling it exactly once as ``succeeded`` or ``failed``; a
+# non-pending job can never be claimed or re-run.
+AUDIT_CHECKPOINT_JOB_PENDING = "pending"
+AUDIT_CHECKPOINT_JOB_RUNNING = "running"
+AUDIT_CHECKPOINT_JOB_SUCCEEDED = "succeeded"
+AUDIT_CHECKPOINT_JOB_FAILED = "failed"
+AUDIT_CHECKPOINT_JOB_STATES = frozenset(
+    {
+        AUDIT_CHECKPOINT_JOB_PENDING,
+        AUDIT_CHECKPOINT_JOB_RUNNING,
+        AUDIT_CHECKPOINT_JOB_SUCCEEDED,
+        AUDIT_CHECKPOINT_JOB_FAILED,
+    }
+)
+# Stable error recorded on a failed audit checkpoint export run.
+AUDIT_CHECKPOINT_JOB_FAILED_ERROR = "audit_checkpoint_export_failed"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -1136,3 +1157,72 @@ class ContentExportJob(Base):
     error: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     content: Mapped[Content] = relationship()
+
+
+class AuditCheckpointJob(Base):
+    """An asynchronous job that exports a filtered audit-event checkpoint.
+
+    A job is registered with a client-chosen ``request_id`` idempotency key
+    and the existing audit checkpoint filters (exact-match ``event_type``/
+    ``resource_id`` and strict inclusive UTC ``from``/``to`` bounds, any of
+    which may be unset). It starts ``pending`` with no run timestamps,
+    result, or error. A run atomically claims a pending job into ``running``
+    (stamping UTC ``started_at``) and then settles it exactly once as
+    ``succeeded`` -- stamping UTC ``finished_at`` and storing the existing
+    read-only checkpoint package (``{"checkpoint", "events"}``) as its
+    ``result`` -- or ``failed`` -- stamping ``finished_at``, leaving
+    ``result`` null and recording the stable
+    ``audit_checkpoint_export_failed`` error. The state machine is
+    monotonic: only a ``pending`` job can be claimed, so a concurrent or
+    repeated run is a conflict rather than a second execution.
+
+    ``request_id`` is unique: a retried submission for the same key and
+    filters returns the original job; the same key reused for different
+    filters is a conflict. The result carries only the existing public
+    checkpoint and audit-event views; no raw material is ever stored.
+    """
+
+    __tablename__ = "audit_checkpoint_jobs"
+    __table_args__ = (
+        Index("ix_audit_checkpoint_jobs_created_order", "created_at", "seq"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable job identifier ("acj_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: Client-supplied idempotency key; unique across all jobs.
+    request_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    #: Exact-match event_type filter; null when unfiltered.
+    event_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: Exact-match resource_id filter; null when unfiltered.
+    resource_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    #: Inclusive UTC lower bound on event created_at; null when unfiltered.
+    from_dt: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+    #: Inclusive UTC upper bound on event created_at; null when unfiltered.
+    to_dt: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+    #: "pending", "running", "succeeded", or "failed".
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+    #: Set when a run claims the job; null while pending.
+    started_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+    #: Set when the run settles (succeeded or failed); null beforehand.
+    finished_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+    #: The checkpoint package ({"checkpoint", "events"}) on success; null.
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: Stable failure code on a failed run; null otherwise.
+    error: Mapped[str | None] = mapped_column(String(64), nullable=True)

@@ -2648,6 +2648,95 @@ class AuditEventCheckpointPackageResponse(BaseModel):
     events: list[AuditEventItem]
 
 
+class AuditCheckpointJobCreate(BaseModel):
+    """A request to register one asynchronous audit checkpoint export job.
+
+    Exactly five members: a non-empty client-supplied ``request_id``
+    idempotency key plus the existing audit checkpoint filters
+    (``event_type``/``resource_id`` exact-match strings and strict inclusive
+    UTC ``from``/``to`` bounds), every filter optional and null when unset.
+    Undeclared fields are rejected rather than silently discarded; blank or
+    non-string filters, malformed timestamps, and a ``from`` later than
+    ``to`` are validation errors.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    request_id: str = Field(..., min_length=1, max_length=255)
+    event_type: str | None = Field(default=None, max_length=64)
+    resource_id: str | None = Field(default=None, max_length=255)
+    from_: str | None = Field(default=None, alias="from", max_length=40)
+    to_: str | None = Field(default=None, alias="to", max_length=40)
+
+    @field_validator("request_id")
+    @classmethod
+    def _request_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "request_id")
+
+    @field_validator("event_type", "resource_id")
+    @classmethod
+    def _filter_nonempty(cls, v: str | None) -> str | None:
+        # Blank/whitespace-only filters are invalid, exactly as on the
+        # checkpoint query route; a non-blank value is kept verbatim (never
+        # trimmed or case-folded) so exact-match semantics are preserved.
+        if v is not None and not v.strip():
+            raise ValueError("filter must not be empty")
+        return v
+
+    @field_validator("from_", "to_")
+    @classmethod
+    def _bounds_strict_rfc3339_utc(cls, v: str | None) -> str | None:
+        if v is not None and parse_rfc3339_utc(v) is None:
+            raise ValueError("must be a strict RFC 3339 UTC timestamp")
+        return v
+
+    @model_validator(mode="after")
+    def _from_not_later_than_to(self) -> "AuditCheckpointJobCreate":
+        if self.from_dt is not None and self.to_dt is not None:
+            if self.from_dt > self.to_dt:
+                raise ValueError("from must not be later than to")
+        return self
+
+    @property
+    def from_dt(self) -> datetime | None:
+        """The inclusive UTC lower bound as an aware datetime, or null."""
+        return parse_rfc3339_utc(self.from_) if self.from_ is not None else None
+
+    @property
+    def to_dt(self) -> datetime | None:
+        """The inclusive UTC upper bound as an aware datetime, or null."""
+        return parse_rfc3339_utc(self.to_) if self.to_ is not None else None
+
+
+class AuditCheckpointJobResponse(BaseModel):
+    """Public view of one audit checkpoint job and its lifecycle state.
+
+    Carries the stable ``acj_`` id, the request id, the four effective
+    checkpoint filters (``event_type``/``resource_id`` exact-match strings and
+    strict UTC ``from``/``to`` bounds, null when unset), the current status,
+    the UTC lifecycle timestamps, and the settled outcome: ``result`` is the
+    existing checkpoint package (``{"checkpoint", "events"}``) on success
+    (otherwise null) and ``error`` is the stable failure code on a failed run
+    (otherwise null). A freshly created job is ``pending`` with
+    ``started_at``/``finished_at``/``result``/``error`` all null.
+    """
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: str
+    request_id: str
+    event_type: str | None
+    resource_id: str | None
+    from_: datetime | None = Field(default=None, alias="from")
+    to_: datetime | None = Field(default=None, alias="to")
+    status: Literal["pending", "running", "succeeded", "failed"]
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    result: AuditEventCheckpointPackageResponse | None
+    error: str | None
+
+
 class AuditCheckpointVerificationEvent(BaseModel):
     """An event under checkpoint verification: exactly the three public fields.
 
