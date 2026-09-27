@@ -111,6 +111,8 @@ from provenance.schemas import (
     AuditCheckpointImportReconciliationPageResponse,
     AuditCheckpointImportReconciliationResponse,
     AuditCheckpointImportResponse,
+    AuditCheckpointJobCreate,
+    AuditCheckpointJobResponse,
     AuditCheckpointVerificationCreate,
     AuditCheckpointVerificationResponse,
     AuditEventCheckpointPackageResponse,
@@ -6501,6 +6503,140 @@ def get_audit_events_checkpoint_package(
         checkpoint=_audit_checkpoint_response(events),
         events=event_views,
     )
+
+
+# --- Queued audit checkpoint export jobs ------------------------------------
+
+
+def _audit_checkpoint_package_payload(session: Session, job) -> dict:
+    """Wire-shaped ``{"checkpoint", "events"}`` package for one job's filter.
+
+    The package is built exactly once from the job's stored filter and is the
+    same read-only package served by
+    ``GET /v1/audit-events/checkpoint/package`` for that filter: the events
+    are read in stable creation order, the events member renders their
+    existing public views, and the checkpoint digests that same array.
+    ``model_dump(mode="json", by_alias=True)`` yields the exact wire shape
+    (UTC datetimes as RFC 3339 strings, bounds rendered as ``from``/``to``).
+    """
+    items = service.list_audit_events(
+        session, job.event_type, job.resource_id, job.from_dt, job.to_dt
+    )
+    event_views = [AuditEventItem.model_validate(item) for item in items]
+    events = [view.model_dump(mode="json") for view in event_views]
+    return AuditEventCheckpointPackageResponse(
+        checkpoint=_audit_checkpoint_response(events),
+        events=event_views,
+    ).model_dump(mode="json")
+
+
+def _audit_checkpoint_job_response(job) -> AuditCheckpointJobResponse:
+    return AuditCheckpointJobResponse.model_validate(job)
+
+
+def _reject_nonempty_body(raw_body: bytes) -> None:
+    """422 on any non-empty POST body (including whitespace or malformed JSON)."""
+    if raw_body:
+        raise _query_validation_error(
+            "body", "request body must be empty", "value_error.body"
+        )
+
+
+@router.post(
+    "/audit-checkpoint-jobs",
+    response_model=AuditCheckpointJobResponse,
+)
+async def create_audit_checkpoint_job(
+    payload: AuditCheckpointJobCreate,
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # The filter rides the JSON body (not the query string), so no query
+    # parameter is declared: any parameter (unknown, blank, or repeated) is a
+    # 422 validation_error before the body is read or a job is created.
+    _reject_any_query_param(request)
+    job, created = service.create_audit_checkpoint_job(session, payload)
+    # First registration -> 201; a retried submission for the same request_id
+    # and filter -> 200 with the original job and no new audit event. The same
+    # request_id with a different filter is a 409
+    # audit_checkpoint_request_conflict with zero writes.
+    result = _audit_checkpoint_job_response(job)
+    return _render_compact_json(
+        result.model_dump(mode="json", by_alias=True),
+        status_code=(
+            status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        ),
+    )
+
+
+@router.get(
+    "/audit-checkpoint-jobs/{job_id}",
+    response_model=AuditCheckpointJobResponse,
+)
+def get_audit_checkpoint_job(
+    job_id: str, request: Request, session: DbSession
+) -> Response:
+    # The detail read takes no query parameters: any (or repeated) parameter
+    # is a 422 before the job lookup. PUT/PATCH/DELETE and every other non-GET
+    # method on this path is the framework's 405 method_not_allowed.
+    _reject_any_query_param(request)
+    # Strictly read-only: the read returns one job's public view and writes no
+    # job and no audit event. An unknown id is an explicit, specific 404.
+    job = service.get_audit_checkpoint_job(session, job_id)
+    result = _audit_checkpoint_job_response(job)
+    return _render_compact_json(result.model_dump(mode="json", by_alias=True))
+
+
+@router.post(
+    "/audit-checkpoint-jobs/run-next",
+    response_model=AuditCheckpointJobResponse,
+)
+async def run_next_audit_checkpoint_job(
+    request: Request, session: DbSession
+) -> Response:
+    # The queue claim takes no body and no query parameters: any non-empty
+    # body (including whitespace, malformed JSON, a JSON object, or any extra
+    # field) and any parameter (unknown, blank, or repeated) is a 422
+    # validation_error, rejected before any job is read -- so a malformed
+    # request never claims, creates, modifies, or audits anything.
+    _reject_nonempty_body(await request.body())
+    _reject_any_query_param(request)
+    # Server-side queue claim: the single oldest pending job in stable
+    # creation order is atomically claimed and settled exactly as one
+    # single-job run. An empty queue is a 404 audit_checkpoint_job_not_found
+    # with zero writes; losing the claim to a concurrent caller (the chosen
+    # job was claimed first or is no longer pending) is a 409 conflict that
+    # touches no job, creates no resource, and writes no audit event.
+    job = service.run_next_audit_checkpoint_job(
+        session, _audit_checkpoint_package_payload
+    )
+    result = _audit_checkpoint_job_response(job)
+    return _render_compact_json(result.model_dump(mode="json", by_alias=True))
+
+
+@router.post(
+    "/audit-checkpoint-jobs/{job_id}/run",
+    response_model=AuditCheckpointJobResponse,
+)
+async def run_audit_checkpoint_job(
+    job_id: str, request: Request, session: DbSession
+) -> Response:
+    # Like the queue claim, a single-job run takes an empty body and no query
+    # parameters: any non-empty body or any parameter is a 422 before the
+    # lookup, so a malformed request never claims, modifies, or audits.
+    _reject_nonempty_body(await request.body())
+    _reject_any_query_param(request)
+    # Atomically claim the pending job (running + UTC started_at), then build
+    # the existing read-only checkpoint package and settle it as succeeded
+    # (result + UTC finished_at) or failed (null result,
+    # audit_checkpoint_export_failed) in one transaction with the run audit
+    # event. A job that is not pending is a 409 conflict; an unknown id is a
+    # 404 audit_checkpoint_job_not_found.
+    job = service.run_audit_checkpoint_job(
+        session, job_id, _audit_checkpoint_package_payload
+    )
+    result = _audit_checkpoint_job_response(job)
+    return _render_compact_json(result.model_dump(mode="json", by_alias=True))
 
 
 @router.post(

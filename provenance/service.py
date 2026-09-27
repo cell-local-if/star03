@@ -20,6 +20,9 @@ from provenance.errors import (
     ActorAlreadyExistsError,
     ActorTrustPolicyConflictError,
     AuditCheckpointImportNotFoundError,
+    AuditCheckpointJobConflictError,
+    AuditCheckpointJobNotFoundError,
+    AuditCheckpointRequestConflictError,
     AuditExchangeImportNotFoundError,
     AuditExchangeImportValidationError,
     AttestationAccessGrantRevocationNotFoundError,
@@ -52,6 +55,12 @@ from provenance.models import (
     CONTENT_EXPORT_JOB_RUNNING,
     CONTENT_EXPORT_JOB_STATES,
     CONTENT_EXPORT_JOB_SUCCEEDED,
+    AUDIT_CHECKPOINT_JOB_FAILED,
+    AUDIT_CHECKPOINT_JOB_FAILED_ERROR,
+    AUDIT_CHECKPOINT_JOB_PENDING,
+    AUDIT_CHECKPOINT_JOB_RUNNING,
+    AUDIT_CHECKPOINT_JOB_STATES,
+    AUDIT_CHECKPOINT_JOB_SUCCEEDED,
     EVENT_ACTOR_CREATED,
     EVENT_ACTOR_TRUST_POLICY_CREATED,
     EVENT_ATTESTATION_ACCESS_GRANTED,
@@ -59,6 +68,8 @@ from provenance.models import (
     EVENT_ATTESTATION_CREATED,
     EVENT_ATTESTATION_REVOKED,
     EVENT_AUDIT_CHECKPOINT_IMPORTED,
+    EVENT_AUDIT_CHECKPOINT_JOB_CREATED,
+    EVENT_AUDIT_CHECKPOINT_JOB_RUN,
     EVENT_AUDIT_EXCHANGE_IMPORTED,
     EVENT_AUTHENTICATION_KEY_RETIRED,
     EVENT_AUTHENTICATION_KEY_ROTATED,
@@ -81,6 +92,7 @@ from provenance.models import (
     AttestationRevocation,
     AuthenticationKeyRotation,
     AuditEvent,
+    AuditCheckpointJob,
     AuditExchangeImportRecord,
     CheckpointImportRecord,
     Claim,
@@ -102,6 +114,7 @@ from provenance.schemas import (
     AttestationCreate,
     AttestationRevocationCreate,
     AuditCheckpointImportCreate,
+    AuditCheckpointJobCreate,
     AuditExchangeImportCreate,
     AuthenticationKeyRotationCreate,
     ClaimCreate,
@@ -156,6 +169,10 @@ _AUDIT_EVENT_ORDER = (AuditEvent.created_at.asc(), AuditEvent.seq.asc())
 _CONTENT_EXPORT_JOB_ORDER = (
     ContentExportJob.created_at.asc(),
     ContentExportJob.seq.asc(),
+)
+_AUDIT_CHECKPOINT_JOB_ORDER = (
+    AuditCheckpointJob.created_at.asc(),
+    AuditCheckpointJob.seq.asc(),
 )
 _ACTOR_TRUST_POLICY_ORDER = (
     ActorTrustPolicy.created_at.asc(),
@@ -2748,6 +2765,268 @@ def _claim_and_run_content_export_job(
     )
     session.add(
         AuditEvent(event_type=EVENT_CONTENT_EXPORT_JOB_RUN, resource_id=job_id)
+    )
+    session.commit()
+    # The Core UPDATEs bypassed the ORM unit of work; reload the final state
+    # onto the identity-map object before returning it.
+    session.refresh(job)
+    return job
+
+
+#: Builds the stored export result for one audit checkpoint job: the
+#: wire-shaped ``{"checkpoint", "events"}`` package served by the read-only
+#: checkpoint package route for the job's effective filter. Injected by the
+#: API layer so the service stays free of response schemas and the failure
+#: path remains independently exercisable in tests.
+AuditCheckpointResultBuilder = Callable[[Session, AuditCheckpointJob], dict]
+
+
+def _audit_checkpoint_filters_equal(
+    job: AuditCheckpointJob, payload: AuditCheckpointJobCreate
+) -> bool:
+    return (
+        job.event_type == payload.event_type
+        and job.resource_id == payload.resource_id
+        and job.from_dt == payload.from_dt
+        and job.to_dt == payload.to_dt
+    )
+
+
+def create_audit_checkpoint_job(
+    session: Session, payload: AuditCheckpointJobCreate
+) -> tuple[AuditCheckpointJob, bool]:
+    """Register one asynchronous audit checkpoint export job.
+
+    ``request_id`` is the client idempotency key and is unique. A repeat
+    submission for the same ``request_id`` and the same effective filter
+    returns the existing job with ``created=False`` and writes no row or
+    audit event, regardless of the job's current lifecycle state. The same
+    ``request_id`` reused for a *different* filter is an
+    :class:`AuditCheckpointRequestConflictError` and writes nothing.
+
+    A first submission creates the job ``pending`` with null
+    ``started_at``/``finished_at``/``result``/``error``; the job row and its
+    ``audit_checkpoint_job.created`` audit event commit in a single
+    transaction.
+    """
+    existing = session.execute(
+        select(AuditCheckpointJob).where(
+            AuditCheckpointJob.request_id == payload.request_id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if not _audit_checkpoint_filters_equal(existing, payload):
+            raise AuditCheckpointRequestConflictError(payload.request_id)
+        return existing, False
+
+    job = AuditCheckpointJob(
+        id=ids.audit_checkpoint_job_id(
+            payload.request_id,
+            payload.event_type,
+            payload.resource_id,
+            payload.from_dt,
+            payload.to_dt,
+        ),
+        request_id=payload.request_id,
+        event_type=payload.event_type,
+        resource_id=payload.resource_id,
+        from_dt=payload.from_dt,
+        to_dt=payload.to_dt,
+        status=AUDIT_CHECKPOINT_JOB_PENDING,
+    )
+    session.add(job)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_AUDIT_CHECKPOINT_JOB_CREATED, resource_id=job.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent request registered this request_id first: roll back
+        # and reconcile against that job instead of duplicating it or
+        # writing a second audit event.
+        session.rollback()
+        raced = session.execute(
+            select(AuditCheckpointJob).where(
+                AuditCheckpointJob.request_id == payload.request_id
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if not _audit_checkpoint_filters_equal(raced, payload):
+            raise AuditCheckpointRequestConflictError(
+                payload.request_id
+            ) from None
+        return raced, False
+    session.refresh(job)
+    return job, True
+
+
+def get_audit_checkpoint_job(
+    session: Session, job_id: str
+) -> AuditCheckpointJob:
+    """Return an audit checkpoint job by id or raise the 404 domain error.
+
+    Strictly read-only: the read writes no job and no audit event.
+    """
+    job = session.execute(
+        select(AuditCheckpointJob).where(AuditCheckpointJob.id == job_id)
+    ).scalar_one_or_none()
+    if job is None:
+        raise AuditCheckpointJobNotFoundError(job_id)
+    return job
+
+
+def run_audit_checkpoint_job(
+    session: Session,
+    job_id: str,
+    build_result: AuditCheckpointResultBuilder,
+) -> AuditCheckpointJob:
+    """Atomically claim a pending audit checkpoint job (looked up by id).
+
+    The job must exist or :class:`AuditCheckpointJobNotFoundError` is raised.
+    Claim and settlement follow
+    :func:`_claim_and_run_audit_checkpoint_job`: only a ``pending`` job can be
+    claimed, so a concurrent or repeated run is a
+    :class:`AuditCheckpointJobConflictError` rather than a second execution.
+    """
+    job = session.execute(
+        select(AuditCheckpointJob).where(AuditCheckpointJob.id == job_id)
+    ).scalar_one_or_none()
+    if job is None:
+        raise AuditCheckpointJobNotFoundError(job_id)
+    return _claim_and_run_audit_checkpoint_job(session, job, build_result)
+
+
+def run_next_audit_checkpoint_job(
+    session: Session,
+    build_result: AuditCheckpointResultBuilder,
+) -> AuditCheckpointJob:
+    """Claim the oldest pending audit checkpoint job and run it to completion.
+
+    The queue candidate is the single oldest job still ``pending`` under the
+    stable creation order (``created_at`` with the monotonic ``seq``
+    tiebreaker, which survives restarts); other pending jobs are left
+    untouched in the queue. When no job is pending,
+    :class:`AuditCheckpointJobNotFoundError` is raised with zero writes: no
+    job is claimed or created and no audit event is recorded.
+
+    The selected job is claimed and settled through exactly the same atomic
+    path as :func:`run_audit_checkpoint_job`. If a concurrent caller claims
+    the same oldest job (or it otherwise stops being pending) between
+    selection and the claim, the conditional update matches zero rows and
+    this call raises :class:`AuditCheckpointJobConflictError` without
+    modifying any job, creating any resource, or writing an audit event; this
+    loser never falls through to a different (younger) pending job.
+    """
+    job = session.execute(
+        select(AuditCheckpointJob)
+        .where(AuditCheckpointJob.status == AUDIT_CHECKPOINT_JOB_PENDING)
+        .order_by(*_AUDIT_CHECKPOINT_JOB_ORDER)
+        .limit(1)
+    ).scalar_one_or_none()
+    if job is None:
+        # An empty queue is a missing runnable resource, not an execution:
+        # nothing is claimed, created, or written and no audit event is
+        # recorded.
+        raise AuditCheckpointJobNotFoundError()
+    return _claim_and_run_audit_checkpoint_job(session, job, build_result)
+
+
+def _claim_and_run_audit_checkpoint_job(
+    session: Session,
+    job: AuditCheckpointJob,
+    build_result: AuditCheckpointResultBuilder,
+) -> AuditCheckpointJob:
+    """Atomically flip one already-selected job pending->running and settle it.
+
+    The pending-to-running transition is a single conditional
+    ``UPDATE ... WHERE status = 'pending'``, so exactly one concurrent run
+    wins and any other request -- a concurrent loser, or a repeat run after
+    the job has settled -- observes zero updated rows and raises
+    :class:`AuditCheckpointJobConflictError` without writing a state change
+    or audit event.
+
+    The winning run stamps UTC ``started_at`` while claiming, builds the
+    existing read-only checkpoint package, and settles the job in the SAME
+    transaction: on success it stamps UTC ``finished_at`` and stores the
+    ``{"checkpoint", "events"}`` package as ``result`` with status
+    ``succeeded``; if the export raises, it stamps UTC ``finished_at``,
+    leaves ``result`` null, records the stable
+    ``audit_checkpoint_export_failed`` error, and sets status ``failed``.
+    Either settlement writes the ``audit_checkpoint_job.run`` audit event in
+    that same transaction.
+    """
+    job_id = job.id
+    # Atomic claim: the status predicate makes the pending->running flip a
+    # compare-and-set. Row locking serializes concurrent writers; the loser
+    # (the row is no longer pending) updates zero rows.
+    started_at = utc_now()
+    claimed = session.execute(
+        sa_update(AuditCheckpointJob)
+        .where(
+            AuditCheckpointJob.id == job_id,
+            AuditCheckpointJob.status == AUDIT_CHECKPOINT_JOB_PENDING,
+        )
+        .values(status=AUDIT_CHECKPOINT_JOB_RUNNING, started_at=started_at)
+    )
+    if claimed.rowcount != 1:
+        # A concurrent run claimed it first, or it already settled: this
+        # request is a conflict, not an execution, so it writes no state and
+        # no audit event. Reload to report the job's current status.
+        session.rollback()
+        current = session.execute(
+            select(AuditCheckpointJob).where(AuditCheckpointJob.id == job_id)
+        ).scalar_one_or_none()
+        current_status = (
+            current.status
+            if current is not None
+            else AUDIT_CHECKPOINT_JOB_PENDING
+        )
+        raise AuditCheckpointJobConflictError(job_id, current_status)
+
+    # The run audit event belongs to this settlement and is flushed before the
+    # package is read, in the SAME transaction. The package therefore covers
+    # the complete matched sequence -- including this very run event -- and
+    # equals a checkpoint-package read taken for the same filter at any time
+    # after this transaction commits. On a failed build the same run event is
+    # committed together with the failed settlement below.
+    session.add(
+        AuditEvent(
+            event_type=EVENT_AUDIT_CHECKPOINT_JOB_RUN, resource_id=job_id
+        )
+    )
+    session.flush()
+    try:
+        result = build_result(session, job)
+    except Exception:
+        # The export failed: settle as failed in the SAME transaction that
+        # holds the claim, so the job is never left stuck in ``running``.
+        finished_at = utc_now()
+        session.execute(
+            sa_update(AuditCheckpointJob)
+            .where(AuditCheckpointJob.id == job_id)
+            .values(
+                status=AUDIT_CHECKPOINT_JOB_FAILED,
+                finished_at=finished_at,
+                result=None,
+                error=AUDIT_CHECKPOINT_JOB_FAILED_ERROR,
+            )
+        )
+        session.commit()
+        session.refresh(job)
+        return job
+
+    finished_at = utc_now()
+    session.execute(
+        sa_update(AuditCheckpointJob)
+        .where(AuditCheckpointJob.id == job_id)
+        .values(
+            status=AUDIT_CHECKPOINT_JOB_SUCCEEDED,
+            finished_at=finished_at,
+            result=result,
+        )
     )
     session.commit()
     # The Core UPDATEs bypassed the ORM unit of work; reload the final state

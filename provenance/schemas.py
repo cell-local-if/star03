@@ -2648,6 +2648,99 @@ class AuditEventCheckpointPackageResponse(BaseModel):
     events: list[AuditEventItem]
 
 
+class AuditCheckpointJobCreate(BaseModel):
+    """A request to register one asynchronous audit checkpoint export job.
+
+    Exactly five members: a non-empty client-supplied ``request_id``
+    idempotency key and the four existing audit-checkpoint filters
+    (``event_type``/``resource_id`` exact matches and strict UTC
+    ``from``/``to`` bounds), each optional and null/absent when unfiltered.
+    The exact-match filter strings are preserved verbatim (never trimmed or
+    case-folded) and the time bounds must be strict RFC 3339 UTC timestamps,
+    exactly as the read-only checkpoint route requires. Undeclared fields are
+    rejected rather than silently discarded.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(..., min_length=1, max_length=255)
+    event_type: str | None = Field(default=None, min_length=1, max_length=64)
+    resource_id: str | None = Field(default=None, min_length=1, max_length=255)
+    from_dt: datetime | None = Field(default=None, alias="from")
+    to_dt: datetime | None = Field(default=None, alias="to")
+
+    @field_validator("request_id")
+    @classmethod
+    def _request_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "request_id")
+
+    @field_validator("event_type", "resource_id")
+    @classmethod
+    def _filter_nonempty(cls, v: str | None) -> str | None:
+        # Exact-match filters are preserved verbatim; only blank/whitespace is
+        # rejected, so a trailing-space or differently-cased value still
+        # matches nothing rather than being normalized into a match.
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("filter must not be empty")
+        return v
+
+    @field_validator("from_dt", "to_dt", mode="before")
+    @classmethod
+    def _parse_strict_utc_bound(cls, v):
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError(
+                "time bound must be a strict RFC 3339 UTC timestamp string"
+            )
+        parsed = parse_rfc3339_utc(v)
+        if parsed is None:
+            raise ValueError(
+                "time bound must be a strict RFC 3339 UTC timestamp"
+            )
+        return parsed
+
+    @model_validator(mode="after")
+    def _from_not_later_than_to(self):
+        if (
+            self.from_dt is not None
+            and self.to_dt is not None
+            and self.from_dt > self.to_dt
+        ):
+            raise ValueError("from must not be later than to")
+        return self
+
+
+class AuditCheckpointJobResponse(BaseModel):
+    """Public view of one audit checkpoint job and its lifecycle state.
+
+    Exactly the stable ``acj_`` id, the request id and effective filters
+    (``event_type``/``resource_id``/UTC ``from``/``to``), the current status,
+    the UTC lifecycle timestamps, and the settled outcome: ``result`` is the
+    existing checkpoint package on success (otherwise null) and ``error`` is
+    the stable failure code on a failed run (otherwise null). A freshly
+    created job is ``pending`` with ``started_at``/``finished_at``/
+    ``result``/``error`` all null.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    request_id: str
+    event_type: str | None
+    resource_id: str | None
+    from_dt: datetime | None = Field(serialization_alias="from")
+    to_dt: datetime | None = Field(serialization_alias="to")
+    status: Literal["pending", "running", "succeeded", "failed"]
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    result: AuditEventCheckpointPackageResponse | None
+    error: str | None
+
+
 class AuditCheckpointVerificationEvent(BaseModel):
     """An event under checkpoint verification: exactly the three public fields.
 
