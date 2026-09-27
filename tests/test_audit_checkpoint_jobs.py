@@ -557,6 +557,42 @@ def test_run_settles_failed_when_export_raises(client, db_session, monkeypatch):
     ]
 
 
+def test_failed_job_settlement_timestamps_are_utc_after_restart(tmp_db_url):
+    # A failed job keeps both started_at and finished_at as timezone-aware
+    # UTC instants, including when the settled row is re-read by a fresh
+    # process/app over the same database file.
+    from provenance.app import create_app
+    from provenance.config import Settings
+
+    app = create_app(Settings(database_url=tmp_db_url))
+    with TestClient(app) as client:
+        job = _create_job(client, "req-fail-utc").json()
+
+        def _boom(session, job):
+            raise RuntimeError("simulated checkpoint failure")
+
+        import provenance.service as svc
+
+        original = svc.list_audit_events
+        svc.list_audit_events = _boom
+        try:
+            settled = client.post(f"{JOBS_URL}/{job['id']}/run")
+        finally:
+            svc.list_audit_events = original
+        assert settled.status_code == 200
+        assert settled.json()["status"] == "failed"
+
+    restarted = create_app(Settings(database_url=tmp_db_url))
+    with TestClient(restarted) as client:
+        view = client.get(f"{JOBS_URL}/{job['id']}").json()
+        started = parse_rfc3339_utc(view["started_at"])
+        finished = parse_rfc3339_utc(view["finished_at"])
+        assert started is not None and finished is not None
+        assert started.tzinfo == timezone.utc
+        assert finished.tzinfo == timezone.utc
+        assert started <= finished
+
+
 @pytest.mark.parametrize(
     "send",
     [

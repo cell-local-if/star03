@@ -35,6 +35,10 @@ from provenance.errors import (
     ProtectedResourceNotFoundError,
 )
 from provenance.models import (
+    AUDIT_CHECKPOINT_JOB_FAILED,
+    AUDIT_CHECKPOINT_JOB_PENDING,
+    AUDIT_CHECKPOINT_JOB_RUNNING,
+    AUDIT_CHECKPOINT_JOB_SUCCEEDED,
     CONTENT_EXPORT_JOB_FAILED,
     CONTENT_EXPORT_JOB_PENDING,
     CONTENT_EXPORT_JOB_RUNNING,
@@ -113,6 +117,7 @@ from provenance.schemas import (
     AuditCheckpointImportResponse,
     AuditCheckpointJobCreate,
     AuditCheckpointJobResponse,
+    AuditCheckpointJobSummaryResponse,
     AuditCheckpointVerificationCreate,
     AuditCheckpointVerificationResponse,
     AuditEventCheckpointPackageResponse,
@@ -6288,7 +6293,7 @@ def _audit_time_claim(dt) -> str | None:
 
 
 @router.get("/audit-events", response_model=AuditEventPageResponse)
-def list_audit_events(request: Request, session: DbSession) -> AuditEventPageResponse:
+def list_audit_events(request: Request, session: DbSession) -> Response:
     # Raw multi-values are inspected deliberately: a repeated scalar is
     # rejected instead of silently taking the last value, and blank or
     # malformed values are never coerced to defaults.
@@ -6383,11 +6388,14 @@ def list_audit_events(request: Request, session: DbSession) -> AuditEventPageRes
                 },
             )
 
-    return AuditEventPageResponse(
+    result = AuditEventPageResponse(
         items=[AuditEventItem.model_validate(item) for item in page],
         count=total,
         next_cursor=next_cursor,
     )
+    # Compact UTF-8 JSON terminated by exactly one newline; error JSON and
+    # persisted data are unchanged.
+    return _render_compact_json(result.model_dump(mode="json"))
 
 
 _AUDIT_CHECKPOINT_PARAMS = frozenset({"event_type", "resource_id", "from", "to"})
@@ -6567,6 +6575,54 @@ async def create_audit_checkpoint_job(
             status.HTTP_201_CREATED if created else status.HTTP_200_OK
         ),
     )
+
+
+@router.get(
+    "/audit-checkpoint-jobs/summary",
+    response_model=AuditCheckpointJobSummaryResponse,
+)
+async def get_audit_checkpoint_jobs_summary(
+    request: Request, session: DbSession
+) -> Response:
+    # Registered before "/audit-checkpoint-jobs/{job_id}" so the literal
+    # "summary" segment is never captured as a job id. The summary takes no
+    # body and no query parameters: any non-empty body (including whitespace
+    # or malformed JSON) and any parameter (unknown, blank, or repeated) is
+    # a 422 validation_error, both rejected before any job is read -- an
+    # invalid request never produces a partial summary and keeps zero writes.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # Strictly read-only: the four counts and the oldest pending job are
+    # computed from the current persisted state at read time; nothing is
+    # frozen, claimed, settled, created, or audited, and the job lifecycle
+    # is unchanged. An unreadable database or an internal summary-query
+    # failure is the existing-structure 503 service_unavailable carrying a
+    # machine-readable reason, never a partial body.
+    counts, oldest = service.summarize_audit_checkpoint_jobs(session)
+    wait_seconds: int | None = None
+    if oldest is not None:
+        # Whole seconds waited so far: the current UTC instant minus the
+        # job's creation time, floored to an integer.
+        wait_seconds = math.floor(
+            (utc_now() - oldest.created_at).total_seconds()
+        )
+    result = AuditCheckpointJobSummaryResponse(
+        pending=counts[AUDIT_CHECKPOINT_JOB_PENDING],
+        running=counts[AUDIT_CHECKPOINT_JOB_RUNNING],
+        succeeded=counts[AUDIT_CHECKPOINT_JOB_SUCCEEDED],
+        failed=counts[AUDIT_CHECKPOINT_JOB_FAILED],
+        oldest_pending_id=oldest.id if oldest is not None else None,
+        oldest_pending_wait_seconds=wait_seconds,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated by
+    # exactly one newline.
+    return _render_compact_json(result.model_dump(mode="json"))
 
 
 @router.get(

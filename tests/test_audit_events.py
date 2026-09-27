@@ -142,6 +142,21 @@ def test_empty_database_is_an_empty_collection(client):
     assert _list(client).json() == {"items": [], "count": 0, "next_cursor": None}
 
 
+def test_success_body_ends_with_exactly_one_newline(client):
+    # The success body is compact JSON terminated by exactly one newline;
+    # the empty collection gets the same treatment.
+    empty = _list(client)
+    assert empty.status_code == 200
+    assert empty.content.endswith(b"\n")
+    assert not empty.content.endswith(b"\n\n")
+
+    _setup_events(client)
+    populated = _list(client)
+    assert populated.status_code == 200
+    assert populated.content.endswith(b"\n")
+    assert not populated.content.endswith(b"\n\n")
+
+
 # --- Exact-match filtering -----------------------------------------------------
 
 

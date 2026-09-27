@@ -2733,12 +2733,17 @@ def _claim_and_run_content_export_job(
     except Exception:
         # The export failed: settle as failed in the SAME transaction that
         # holds the claim, so the job is never left stuck in ``running``.
+        # Both settlement timestamps are explicit UTC instants: started_at
+        # is the claim instant re-stamped here so a failed row always
+        # carries it even if the claim write were missing, and finished_at
+        # is the failure instant.
         finished_at = utc_now()
         session.execute(
             sa_update(ContentExportJob)
             .where(ContentExportJob.id == job_id)
             .values(
                 status=CONTENT_EXPORT_JOB_FAILED,
+                started_at=started_at,
                 finished_at=finished_at,
                 result=None,
                 error=CONTENT_EXPORT_JOB_FAILED_ERROR,
@@ -3003,12 +3008,17 @@ def _claim_and_run_audit_checkpoint_job(
     except Exception:
         # The export failed: settle as failed in the SAME transaction that
         # holds the claim, so the job is never left stuck in ``running``.
+        # Both settlement timestamps are explicit UTC instants: started_at
+        # is the claim instant re-stamped here so a failed row always
+        # carries it even if the claim write were missing, and finished_at
+        # is the failure instant.
         finished_at = utc_now()
         session.execute(
             sa_update(AuditCheckpointJob)
             .where(AuditCheckpointJob.id == job_id)
             .values(
                 status=AUDIT_CHECKPOINT_JOB_FAILED,
+                started_at=started_at,
                 finished_at=finished_at,
                 result=None,
                 error=AUDIT_CHECKPOINT_JOB_FAILED_ERROR,
@@ -3033,6 +3043,61 @@ def _claim_and_run_audit_checkpoint_job(
     # onto the identity-map object before returning it.
     session.refresh(job)
     return job
+
+
+def summarize_audit_checkpoint_jobs(
+    session: Session,
+) -> tuple[dict[str, int], AuditCheckpointJob | None]:
+    """Return per-status counts over all audit checkpoint jobs and the oldest pending.
+
+    The counts cover every existing job keyed by the four lifecycle states
+    (``pending``/``running``/``succeeded``/``failed``), each defaulting to
+    zero; settled jobs remain in their ``succeeded``/``failed`` counts. The
+    second element is the single oldest ``pending`` job under the stable
+    creation order (``created_at`` with the monotonic ``seq`` tiebreaker,
+    which survives restarts), or ``None`` when no job is pending. Both are
+    computed from the current persisted state at call time -- nothing is
+    frozen, claimed, or settled.
+
+    The function is strictly read-only: it only ever issues ``SELECT``
+    queries and writes no job and no audit event. An unreadable database or
+    any internal failure of the summary queries raises
+    :class:`ObservabilityUnavailableError` (``503 service_unavailable``)
+    carrying a machine-readable reason instead of returning a partial
+    summary, and the half-open read transaction is rolled back.
+    """
+    try:
+        rows = session.execute(
+            select(AuditCheckpointJob.status, func.count()).group_by(
+                AuditCheckpointJob.status
+            )
+        ).all()
+        counts = {state: 0 for state in AUDIT_CHECKPOINT_JOB_STATES}
+        for status_value, total in rows:
+            # An unknown lifecycle value in anomalous history is ignored for
+            # the four named counters rather than surfacing as a fifth key.
+            if status_value in counts:
+                counts[status_value] = int(total)
+        oldest_pending = session.execute(
+            select(AuditCheckpointJob)
+            .where(AuditCheckpointJob.status == AUDIT_CHECKPOINT_JOB_PENDING)
+            .order_by(*_AUDIT_CHECKPOINT_JOB_ORDER)
+            .limit(1)
+        ).scalar_one_or_none()
+    except SQLAlchemyError:
+        # An unreadable database (connection, schema, statement failure):
+        # drop any half-open read transaction; a summary failure must leave
+        # no transaction side effect behind. The summary itself never
+        # writes, so rollback cannot discard any application mutation.
+        session.rollback()
+        raise ObservabilityUnavailableError("database_unavailable")
+    except Exception:
+        # Any other internal failure assembling the summary is still a
+        # service unavailability for this read-only route, never a partial
+        # body or a 500, and the read has nothing to commit.
+        session.rollback()
+        raise ObservabilityUnavailableError("internal_error")
+    return counts, oldest_pending
 
 
 # Reviewer content export job search paging bounds.
