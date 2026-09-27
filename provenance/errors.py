@@ -432,6 +432,23 @@ class AuditCheckpointJobConflictError(DomainError):
         super().__init__(details={"job_id": job_id, "status": status})
 
 
+class AuditCheckpointJobSummaryUnavailableError(DomainError):
+    """The read-only audit checkpoint job queue summary cannot be assembled.
+
+    An unreadable database or an internal failure of the summary queries
+    renders as ``503 service_unavailable`` under the existing error JSON
+    structure, carrying a machine-readable reason. The summary is strictly
+    read-only, so the failure path writes no job, resource, or audit row.
+    """
+
+    status_code = 503
+    code = "service_unavailable"
+    message = "The audit checkpoint job summary is temporarily unavailable."
+
+    def __init__(self, reason: str):
+        super().__init__(details={"reason": reason})
+
+
 class ClaimSupersessionNotFoundError(DomainError):
     status_code = 404
     code = "claim_supersession_not_found"
