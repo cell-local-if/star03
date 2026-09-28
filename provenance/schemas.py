@@ -2973,6 +2973,234 @@ class AuditCheckpointImportReconciliationPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+#: Fixed checkpoint format version emitted for audit checkpoint recon
+#: packages -- the envelope over the global import-reconciliation set.
+AUDIT_CHECKPOINT_RECON_CHECKPOINT_VERSION = (
+    "provenance-audit-checkpoint-recon-v1"
+)
+#: The sole digest algorithm used for audit checkpoint recon checkpoints.
+AUDIT_CHECKPOINT_RECON_DIGEST_ALGORITHM = "sha256"
+
+
+class AuditCheckpointReconCheckpointResponse(BaseModel):
+    """A read-only integrity checkpoint over the global reconciliation set.
+
+    Exactly four members: the fixed ``checkpoint_version``
+    ("provenance-audit-checkpoint-recon-v1") and ``digest_algorithm``
+    ("sha256"), the number of reconciliation entries in the snapshot, and
+    the SHA-256 hex digest of the canonical entries array. The checkpoint
+    is derived purely from existing checkpoint-import receipt rows and the
+    read-time local reconciliation: it introduces no resource, record, or
+    audit event, and its value is stable for unchanged persisted state and
+    the local audit sequence -- including the empty set.
+    """
+
+    checkpoint_version: Literal[AUDIT_CHECKPOINT_RECON_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[AUDIT_CHECKPOINT_RECON_DIGEST_ALGORITHM]
+    entry_count: int
+    entries_digest_hex: str
+
+
+class AuditCheckpointReconEntryResponse(BaseModel):
+    """One checkpoint-import receipt's current reconciliation in a package.
+
+    Exactly the existing global-reconciliation public view: the stable
+    single-receipt fields (``id``, ``checkpoint_version``,
+    ``events_digest_hex``, ``event_count``, UTC ``received_at``) plus
+    ``local_checkpoint`` -- the four-field checkpoint computed over the
+    complete, unfiltered local audit sequence under the existing
+    checkpoint rules -- and ``matches``. The imported event array is
+    never carried.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    checkpoint_version: str
+    events_digest_hex: str
+    event_count: int
+    received_at: datetime
+    local_checkpoint: AuditEventCheckpointResponse
+    matches: bool
+
+
+class AuditCheckpointReconPackageResponse(BaseModel):
+    """One read returning the global reconciliation set with its checkpoint.
+
+    Exactly two members: ``checkpoint`` is the four-field audit
+    checkpoint recon checkpoint and ``entries`` lists, in the receipts'
+    stable creation order, exactly the existing global-reconciliation
+    public views. The checkpoint digest is computed over exactly the
+    ``entries`` array returned in this response under the checkpoint
+    canonical rules (array order kept, nested object keys sorted
+    recursively by Unicode code point, compact separators, unescaped
+    non-ASCII, UTF-8); both derive from a single read-only state read,
+    so they can never disagree. The package introduces no resource,
+    record, or audit event; an empty set yields ``"entries": []``
+    together with the digest of the empty array.
+    """
+
+    checkpoint: AuditCheckpointReconCheckpointResponse
+    entries: list[AuditCheckpointReconEntryResponse]
+
+
+class AuditCheckpointReconVerificationLocalCheckpoint(BaseModel):
+    """The embedded current local checkpoint under stateless verification.
+
+    Exactly the existing four-field audit checkpoint structure: the
+    fixed ``checkpoint_version`` ("provenance-audit-checkpoint-v1") and
+    ``digest_algorithm`` ("sha256"), the non-negative local event count,
+    and the 64-lowercase-hex local events digest. Undeclared members are
+    rejected rather than ignored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_version: Literal[AUDIT_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[AUDIT_CHECKPOINT_DIGEST_ALGORITHM]
+    event_count: StrictInt = Field(..., ge=0)
+    events_digest_hex: str
+
+    @field_validator("events_digest_hex")
+    @classmethod
+    def _events_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "events_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class AuditCheckpointReconVerificationEntry(BaseModel):
+    """One checkpoint-import reconciliation entry under verification.
+
+    The structure must match the exported entry field for field -- the
+    stable receipt fields (``id``, ``checkpoint_version``,
+    ``events_digest_hex``, ``event_count``, UTC ``received_at``) plus
+    ``local_checkpoint`` and ``matches`` -- with no undeclared member
+    (so no imported event array, raw payload, content, or evidence byte
+    can enter the request). ``received_at`` is kept as the raw string so
+    the digest commits to the timestamp exactly as spelled on the wire;
+    it must be a strict RFC 3339 UTC timestamp. The receipt's
+    ``events_digest_hex`` must be exactly 64 lowercase hex characters
+    and ``event_count`` a non-negative integer. Verification never
+    resolves any id against local state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1)
+    checkpoint_version: str = Field(..., min_length=1)
+    events_digest_hex: str
+    event_count: StrictInt = Field(..., ge=0)
+    received_at: str
+    local_checkpoint: AuditCheckpointReconVerificationLocalCheckpoint
+    matches: StrictBool
+
+    @field_validator("id", "checkpoint_version")
+    @classmethod
+    def _identifier_nonempty(cls, v: str) -> str:
+        # Every identifier is a non-empty, non-whitespace string; nothing
+        # is trimmed or normalized.
+        if not v.strip():
+            raise ValueError("identifier must not be empty")
+        return v
+
+    @field_validator("events_digest_hex")
+    @classmethod
+    def _events_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the receipt digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "events_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+    @field_validator("received_at")
+    @classmethod
+    def _received_at_strict_rfc3339_utc(cls, v: str) -> str:
+        if parse_rfc3339_utc(v) is None:
+            raise ValueError(
+                "received_at must be a strict RFC 3339 UTC timestamp"
+            )
+        return v
+
+
+class AuditCheckpointReconVerificationCheckpoint(BaseModel):
+    """The claimed recon package checkpoint under stateless verification.
+
+    Exactly the existing four-field package checkpoint structure: the
+    fixed package ``checkpoint_version`` and ``digest_algorithm``, the
+    claimed entry count, and the claimed entries digest. Undeclared
+    members are rejected rather than ignored, exactly as on the package
+    export.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_version: Literal[AUDIT_CHECKPOINT_RECON_CHECKPOINT_VERSION]
+    digest_algorithm: Literal[AUDIT_CHECKPOINT_RECON_DIGEST_ALGORITHM]
+    #: Non-negative integer count the submitted entries array must match.
+    entry_count: StrictInt = Field(..., ge=0)
+    entries_digest_hex: str
+
+    @field_validator("entries_digest_hex")
+    @classmethod
+    def _entries_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "entries_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class AuditCheckpointReconVerificationCreate(BaseModel):
+    """A stateless audit checkpoint recon package verification request.
+
+    Exactly two members: ``checkpoint`` carries the claimed four-field
+    package checkpoint and ``entries`` carries the reconciliation-entry
+    sequence it commits to, with exactly ``checkpoint.entry_count``
+    elements, each exactly the exported reconciliation entry.
+    Verification is pure: it reads and writes no server state, so no
+    receipt, event, or resource id is ever resolved against local state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint: AuditCheckpointReconVerificationCheckpoint
+    entries: list[AuditCheckpointReconVerificationEntry]
+
+    @model_validator(mode="after")
+    def _entries_match_claimed_count(self):
+        if len(self.entries) != self.checkpoint.entry_count:
+            raise ValueError(
+                "entries must contain exactly checkpoint.entry_count elements"
+            )
+        return self
+
+
+class AuditCheckpointReconVerificationResponse(BaseModel):
+    """The stateless audit checkpoint recon verification verdict.
+
+    ``computed_digest_hex`` is present only on a mismatch, so a matching
+    checkpoint renders exactly ``{"valid": true}``.
+    """
+
+    valid: bool
+    #: The digest computed from the submitted entries array under the
+    #: checkpoint canonical rules; omitted when it matches the claim.
+    computed_digest_hex: str | None = None
+
+
+
 #: Fixed signature-exchange version for signed audit checkpoint packages.
 #: The same literal is the first element of the signed JSON array, so the
 #: metadata field and the signature domain-separation prefix can never
