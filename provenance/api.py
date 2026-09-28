@@ -38,6 +38,7 @@ from provenance.models import (
     AUDIT_CHECKPOINT_JOB_FAILED,
     AUDIT_CHECKPOINT_JOB_PENDING,
     AUDIT_CHECKPOINT_JOB_RUNNING,
+    AUDIT_CHECKPOINT_JOB_STATES,
     AUDIT_CHECKPOINT_JOB_SUCCEEDED,
     CONTENT_EXPORT_JOB_FAILED,
     CONTENT_EXPORT_JOB_PENDING,
@@ -116,6 +117,7 @@ from provenance.schemas import (
     AuditCheckpointImportReconciliationResponse,
     AuditCheckpointImportResponse,
     AuditCheckpointJobCreate,
+    AuditCheckpointJobPageResponse,
     AuditCheckpointJobResponse,
     AuditCheckpointJobSummaryResponse,
     AuditCheckpointVerificationCreate,
@@ -6575,6 +6577,170 @@ async def create_audit_checkpoint_job(
             status.HTTP_201_CREATED if created else status.HTTP_200_OK
         ),
     )
+
+
+_AUDIT_CHECKPOINT_JOBS_PARAMS = frozenset(
+    {
+        "request_id",
+        "event_type",
+        "resource_id",
+        "status",
+        "from",
+        "to",
+        "limit",
+        "cursor",
+    }
+)
+
+
+@router.get("/audit-checkpoint-jobs")
+async def list_audit_checkpoint_jobs(
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # Read-only global search over audit checkpoint jobs. The GET request
+    # body must be empty: carrying any bytes (even whitespace, arbitrary
+    # bytes, or malformed JSON) is a 422 validated before any parameter,
+    # cursor, or job is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _AUDIT_CHECKPOINT_JOBS_PARAMS
+    if unknown:
+        # A typo never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    request_id = _parse_nonempty_filter(raw, "request_id")
+    event_type = _parse_nonempty_filter(raw, "event_type")
+    resource_id = _parse_nonempty_filter(raw, "resource_id")
+    status = _parse_literal_filter(
+        raw, "status", AUDIT_CHECKPOINT_JOB_STATES
+    )
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_AUDIT_CHECKPOINT_JOBS_LIMIT,
+        service.MIN_AUDIT_CHECKPOINT_JOBS_LIMIT,
+        service.MAX_AUDIT_CHECKPOINT_JOBS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        if not cursor.strip():
+            # A blank/whitespace cursor is invalid rather than treated as a
+            # missing first page.
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            )
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.audit_checkpoint_jobs_cursor_secret,
+                pagination.AUDIT_CHECKPOINT_JOBS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered) and the effective limit must match.
+        expected = {
+            "request_id": request_id,
+            "event_type": event_type,
+            "resource_id": resource_id,
+            "status": status,
+            "from": _audit_time_claim(from_dt),
+            "to": _audit_time_claim(to_dt),
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no job and no audit event. No
+    # filter value is resolved for existence, so an unknown value is an
+    # empty collection rather than a 404. Items reuse the single-job public
+    # view; result snapshots carry only the existing public checkpoint/event
+    # structures, never raw material.
+    items = service.list_audit_checkpoint_jobs(
+        session, request_id, event_type, resource_id, status, from_dt, to_dt
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.audit_checkpoint_jobs_cursor_secret,
+                pagination.AUDIT_CHECKPOINT_JOBS_CURSOR,
+                {
+                    "request_id": request_id,
+                    "event_type": event_type,
+                    "resource_id": resource_id,
+                    "status": status,
+                    "from": _audit_time_claim(from_dt),
+                    "to": _audit_time_claim(to_dt),
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = AuditCheckpointJobPageResponse(
+        items=[_audit_checkpoint_job_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, booleans/null literal, integral numbers only,
+    # terminated by exactly one newline.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json", by_alias=True),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 @router.get(

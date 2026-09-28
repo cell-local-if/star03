@@ -2741,6 +2741,21 @@ class AuditCheckpointJobResponse(BaseModel):
     error: str | None
 
 
+class AuditCheckpointJobPageResponse(BaseModel):
+    """A cursor-paginated page of audit checkpoint job public views.
+
+    Each item is exactly the existing single-job public view (including its
+    settled ``result`` snapshot, which itself carries only the existing
+    public checkpoint/event structures -- never raw material).
+    """
+
+    items: list[AuditCheckpointJobResponse]
+    #: Total number of jobs after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class AuditCheckpointJobSummaryResponse(BaseModel):
     """Read-only queue summary over all existing audit checkpoint jobs.
 
