@@ -139,6 +139,7 @@ from provenance.schemas import (
     AuditExchangeImportPageResponse,
     AuditExchangeImportResponse,
     AuditReconExchangeImportCreate,
+    AuditReconExchangeImportPageResponse,
     AuditReconExchangeImportResponse,
     AuthenticationKeyRotationCreate,
     AuthenticationKeyRotationPageResponse,
@@ -7720,6 +7721,159 @@ async def import_audit_recon_exchange(
         _audit_recon_exchange_import_response(record),
         status_code=status_code,
     )
+
+
+_AUDIT_RECON_EXCHANGES_PARAMS = frozenset(
+    {
+        "signer_subject",
+        "public_key",
+        "package_digest_hex",
+        "from",
+        "to",
+        "limit",
+        "cursor",
+    }
+)
+
+
+@router.get(_AUDIT_RECON_EXCHANGE_POST_PATH)
+async def list_audit_recon_exchanges(
+    request: Request, session: DbSession
+) -> Response:
+    # The GET request body must be empty: carrying any bytes (even
+    # whitespace, arbitrary bytes, or malformed JSON) is a 422 validated
+    # before any query parameter or receipt is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default. Every parameter and the cursor are
+    # validated below before any receipt is read.
+    raw = request.query_params
+
+    unknown = set(raw) - _AUDIT_RECON_EXCHANGES_PARAMS
+    if unknown:
+        # A typo never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    signer_subject = _parse_nonempty_filter(raw, "signer_subject")
+    public_key = _parse_nonempty_filter(raw, "public_key")
+    package_digest_hex = _parse_nonempty_filter(raw, "package_digest_hex")
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_AUDIT_RECON_EXCHANGE_IMPORTS_LIMIT,
+        service.MIN_AUDIT_RECON_EXCHANGE_IMPORTS_LIMIT,
+        service.MAX_AUDIT_RECON_EXCHANGE_IMPORTS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.audit_recon_exchange_imports_cursor_secret,
+                pagination.AUDIT_RECON_EXCHANGE_IMPORTS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered; the time claims canonicalize "Z"
+        # and "+00:00" to the same instant) and the effective limit must
+        # match exactly. A cursor minted by another endpoint family (the
+        # ax1 audit-exchange family included) already fails decoding above.
+        expected = {
+            "signer_subject": signer_subject,
+            "public_key": public_key,
+            "package_digest_hex": package_digest_hex,
+            "from": _audit_time_claim(from_dt),
+            "to": _audit_time_claim(to_dt),
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no receipt, resource, or audit
+    # event. The total is the filtered count covering every page. Filter
+    # values are never resolved for existence, so an unknown value is an
+    # empty collection rather than a 404. The public-key filter binds the
+    # exact Base64 spelling of the public view (never decoded, normalized,
+    # or reverse-resolved by digest). Each item is exactly the
+    # single-receipt public view; the package, the raw signature, and every
+    # private key are never persisted and so can never be echoed.
+    items = service.list_audit_recon_exchange_imports(
+        session,
+        signer_subject,
+        public_key,
+        package_digest_hex,
+        from_dt,
+        to_dt,
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.audit_recon_exchange_imports_cursor_secret,
+                pagination.AUDIT_RECON_EXCHANGE_IMPORTS_CURSOR,
+                {
+                    "signer_subject": signer_subject,
+                    "public_key": public_key,
+                    "package_digest_hex": package_digest_hex,
+                    "from": _audit_time_claim(from_dt),
+                    "to": _audit_time_claim(to_dt),
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = AuditReconExchangeImportPageResponse(
+        items=[
+            _audit_recon_exchange_import_response(item) for item in page
+        ],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated
+    # by exactly one newline; members appear as items, count, next_cursor.
+    return _render_compact_json(result.model_dump(mode="json"))
 
 
 @router.get("/audit-recon-exchanges/{import_id}")

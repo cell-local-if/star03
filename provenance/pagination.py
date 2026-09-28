@@ -126,6 +126,10 @@ IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR_VERSION = "rx1"
 #: receipts.
 AUDIT_EXCHANGE_IMPORTS_CURSOR_VERSION = "ax1"
 
+#: Marker for cursors that page through signed audit recon exchange
+#: receipts.
+AUDIT_RECON_EXCHANGE_IMPORTS_CURSOR_VERSION = "arx1"
+
 #: Marker for cursors that page through the audit checkpoint job search.
 AUDIT_CHECKPOINT_JOBS_CURSOR_VERSION = "aj1"
 
@@ -1138,6 +1142,49 @@ AUDIT_EXCHANGE_IMPORTS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_audit_exchange_imports_claims,
+)
+
+
+def _validate_audit_recon_exchange_imports_claims(
+    claims: dict[str, Any],
+) -> None:
+    # The exact-match text filters are either absent (null) or non-empty
+    # strings; matching is case- and whitespace-sensitive, so the raw value
+    # is bound. The public-key filter binds the exact Base64 spelling.
+    _optional_nonempty_str(claims, "signer_subject")
+    _optional_nonempty_str(claims, "public_key")
+    _optional_nonempty_str(claims, "package_digest_hex")
+    # The received-time bounds are absent (null) or canonical RFC 3339 UTC
+    # strings (equivalent "Z" and "+00:00" spellings canonicalize to the
+    # same instant).
+    for field in ("from", "to"):
+        value = claims[field]
+        if value is not None and (
+            not isinstance(value, str) or parse_rfc3339_utc(value) is None
+        ):
+            raise InvalidCursorError(f"cursor {field} is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/audit-recon-exchanges``.
+AUDIT_RECON_EXCHANGE_IMPORTS_CURSOR = CursorKind(
+    version=AUDIT_RECON_EXCHANGE_IMPORTS_CURSOR_VERSION,
+    claim_fields=(
+        "signer_subject",
+        "public_key",
+        "package_digest_hex",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_audit_recon_exchange_imports_claims,
 )
 
 

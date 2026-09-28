@@ -3433,6 +3433,16 @@ class AuditReconExchangeImportResponse(BaseModel):
     received_at: datetime
 
 
+class AuditReconExchangeImportPageResponse(BaseModel):
+    """A cursor-paginated page of signed audit recon exchange receipts."""
+
+    items: list[AuditReconExchangeImportResponse]
+    #: Total number of receipts after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 
