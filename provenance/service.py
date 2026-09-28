@@ -4035,6 +4035,74 @@ def get_audit_recon_exchange_import(
     return record
 
 
+# Signed audit recon exchange-import receipt search paging bounds.
+DEFAULT_AUDIT_RECON_EXCHANGE_IMPORTS_LIMIT = 50
+MIN_AUDIT_RECON_EXCHANGE_IMPORTS_LIMIT = 1
+MAX_AUDIT_RECON_EXCHANGE_IMPORTS_LIMIT = 100
+
+_AUDIT_RECON_EXCHANGE_IMPORT_ORDER = (
+    AuditReconExchangeImportRecord.created_at.asc(),
+    AuditReconExchangeImportRecord.seq.asc(),
+)
+
+
+def list_audit_recon_exchange_imports(
+    session: Session,
+    signer_subject: str | None = None,
+    public_key: str | None = None,
+    package_digest_hex: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[AuditReconExchangeImportRecord]:
+    """Return signed audit recon exchange-import receipts in creation order.
+
+    ``signer_subject`` and ``package_digest_hex`` are exact, case- and
+    whitespace-sensitive string matches against the stored receipt
+    fields; ``public_key`` is an exact, case- and whitespace-sensitive
+    match against the receipt's standard-Base64 public view (never
+    decoded or normalized, so a non-canonical spelling simply matches
+    nothing). ``from_dt``/``to_dt`` are inclusive UTC bounds on the
+    receipt's ``created_at``. All filters combine as logical AND; an
+    absent filter imposes no restriction, and a filter value that names
+    nothing yields an empty list rather than an error. Results follow
+    the receipts' stable creation order (``created_at`` with the
+    monotonic ``seq`` tiebreaker), which stays stable across a restart.
+    The function is strictly read-only: it writes no receipt, resource,
+    or audit event.
+    """
+    stmt = select(AuditReconExchangeImportRecord)
+    if signer_subject is not None:
+        stmt = stmt.where(
+            AuditReconExchangeImportRecord.signer_subject == signer_subject
+        )
+    if package_digest_hex is not None:
+        stmt = stmt.where(
+            AuditReconExchangeImportRecord.package_digest_hex
+            == package_digest_hex
+        )
+    if from_dt is not None:
+        stmt = stmt.where(
+            AuditReconExchangeImportRecord.created_at >= from_dt
+        )
+    if to_dt is not None:
+        stmt = stmt.where(
+            AuditReconExchangeImportRecord.created_at <= to_dt
+        )
+    stmt = stmt.order_by(*_AUDIT_RECON_EXCHANGE_IMPORT_ORDER)
+    rows = list(session.execute(stmt).scalars().all())
+    if public_key is not None:
+        # The filter binds the exact Base64 spelling served on the public
+        # view; the stored raw key bytes are rendered, never the other way
+        # around, so a non-canonical spelling matches nothing and no
+        # digest is ever resolved in reverse to a resource.
+        rows = [
+            row
+            for row in rows
+            if base64.b64encode(row.public_key).decode("ascii") == public_key
+        ]
+    return rows
+
+
 # Signed audit exchange-import receipt search paging bounds.
 DEFAULT_AUDIT_EXCHANGE_IMPORTS_LIMIT = 50
 MIN_AUDIT_EXCHANGE_IMPORTS_LIMIT = 1
