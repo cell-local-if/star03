@@ -76,6 +76,40 @@ IMPACT_RECON_EXCHANGE_MESSAGE_PREFIX = (
 )
 
 
+#: Domain-separation prefix and protocol version of a signed audit
+#: checkpoint recon exchange package.
+AUDIT_RECON_EXCHANGE_MESSAGE_PREFIX = "acr-exchange-v1"
+
+
+def audit_recon_exchange_message_bytes(
+    signer_subject: str,
+    package_digest_algorithm: str,
+    package_digest_hex: str,
+) -> bytes:
+    """Return the exact canonical bytes an audit recon exchange signature is over.
+
+    The signature binds, in order, the fixed exchange version, the signing
+    subject, the package digest algorithm, and the whole-package digest
+    value:
+
+        ["acr-exchange-v1", subject, "sha256", digest]
+
+    The bytes are a UTF-8 compact JSON array (compact separators, non-ASCII
+    emitted unescaped), identical regardless of which client produced the
+    signature.
+    """
+    return json.dumps(
+        [
+            AUDIT_RECON_EXCHANGE_MESSAGE_PREFIX,
+            signer_subject,
+            package_digest_algorithm,
+            package_digest_hex,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
 def impact_recon_exchange_message_bytes(
     signer_subject: str,
     package_digest_algorithm: str,

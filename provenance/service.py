@@ -25,6 +25,8 @@ from provenance.errors import (
     AuditCheckpointRequestConflictError,
     AuditExchangeImportNotFoundError,
     AuditExchangeImportValidationError,
+    AuditReconExchangeImportNotFoundError,
+    AuditReconExchangeImportValidationError,
     AttestationAccessGrantRevocationNotFoundError,
     AttestationNotFoundError,
     AttestationRevocationNotFoundError,
@@ -71,6 +73,7 @@ from provenance.models import (
     EVENT_AUDIT_CHECKPOINT_JOB_CREATED,
     EVENT_AUDIT_CHECKPOINT_JOB_RUN,
     EVENT_AUDIT_EXCHANGE_IMPORTED,
+    EVENT_AUDIT_RECON_IMPORTED,
     EVENT_AUTHENTICATION_KEY_RETIRED,
     EVENT_AUTHENTICATION_KEY_ROTATED,
     EVENT_CLAIM_CREATED,
@@ -94,6 +97,7 @@ from provenance.models import (
     AuditEvent,
     AuditCheckpointJob,
     AuditExchangeImportRecord,
+    AuditReconExchangeImportRecord,
     CheckpointImportRecord,
     Claim,
     ClaimSupersession,
@@ -116,6 +120,7 @@ from provenance.schemas import (
     AuditCheckpointImportCreate,
     AuditCheckpointJobCreate,
     AuditExchangeImportCreate,
+    AuditReconExchangeImportCreate,
     AuthenticationKeyRotationCreate,
     ClaimCreate,
     ClaimSupersessionCreate,
@@ -3905,6 +3910,128 @@ def get_audit_exchange_import(
     ).scalar_one_or_none()
     if record is None:
         raise AuditExchangeImportNotFoundError(import_id)
+    return record
+
+
+def _audit_recon_exchange_import_identity_select(
+    signature_version: str,
+    package_digest_hex: str,
+):
+    return select(AuditReconExchangeImportRecord).where(
+        AuditReconExchangeImportRecord.signature_version == signature_version,
+        AuditReconExchangeImportRecord.package_digest_hex == package_digest_hex,
+    )
+
+
+def create_audit_recon_exchange_import(
+    session: Session,
+    payload: AuditReconExchangeImportCreate,
+    signature_digest_hex: str,
+) -> tuple[AuditReconExchangeImportRecord, bool]:
+    """Register one signed, offline-verified audit checkpoint recon package.
+
+    The caller has already verified the package under the existing recon
+    verification rules (structure, entry count, canonical entries digest,
+    whole-package digest) and verified the Ed25519 signature over the
+    canonical ``[version, subject, algorithm, digest]`` array. This
+    function performs no such verification and no local lookup: every
+    described receipt and event is an opaque reference, so whether they
+    exist locally never changes the outcome.
+
+    The receiving identity is ``(signature_version, package_digest_hex)``
+    -- the exchange version and the whole-package digest; the package
+    digest algorithm is pinned to sha256, and the package itself and the
+    raw signature are never stored. A first submission writes the receipt
+    row and its ``audit.recon_imported`` audit event in a single
+    transaction. A retried submission for the same identity with the same
+    signing subject, public key, and signature digest returns the
+    existing record with ``created=False`` and writes nothing. A
+    submission for the same package identity with a different signing
+    subject, public key, or signature is a 422 validation error and
+    leaves the original record (and audit trail) untouched.
+    """
+    metadata = payload.signature_metadata
+    signature_version = metadata.signature_version
+    package_digest_algorithm = metadata.package_digest_algorithm
+    package_digest_hex = metadata.package_digest_hex
+
+    existing = session.execute(
+        _audit_recon_exchange_import_identity_select(
+            signature_version, package_digest_hex
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        # The same package is already registered. An exact retry (same
+        # subject, key, and signature) is idempotent; a different signing
+        # identity or signature conflicts with the stored receipt and is
+        # refused without changing it.
+        if (
+            existing.signer_subject == metadata.signer_subject
+            and existing.public_key == metadata.public_key
+            and existing.signature_digest_hex == signature_digest_hex
+        ):
+            return existing, False
+        raise AuditReconExchangeImportValidationError(
+            "exchange_import_identity_conflict"
+        )
+
+    record = AuditReconExchangeImportRecord(
+        id=ids.audit_recon_exchange_import_id(
+            signature_version, package_digest_hex
+        ),
+        signature_version=signature_version,
+        signer_subject=metadata.signer_subject,
+        public_key=metadata.public_key,
+        package_digest_algorithm=package_digest_algorithm,
+        package_digest_hex=package_digest_hex,
+        signature_digest_algorithm=canonical.CANONICAL_DIGEST_ALGORITHM,
+        signature_digest_hex=signature_digest_hex,
+    )
+    session.add(record)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_AUDIT_RECON_IMPORTED,
+            resource_id=record.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent import registered this package identity first. An
+        # exact concurrent retry resolves to that record; a different
+        # signing identity or signature conflicts with it.
+        session.rollback()
+        raced = session.execute(
+            _audit_recon_exchange_import_identity_select(
+                signature_version, package_digest_hex
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if (
+            raced.signer_subject == metadata.signer_subject
+            and raced.public_key == metadata.public_key
+            and raced.signature_digest_hex == signature_digest_hex
+        ):
+            return raced, False
+        raise AuditReconExchangeImportValidationError(
+            "exchange_import_identity_conflict"
+        ) from None
+    session.refresh(record)
+    return record, True
+
+
+def get_audit_recon_exchange_import(
+    session: Session, import_id: str
+) -> AuditReconExchangeImportRecord:
+    """Return a signed audit recon exchange-import receipt by id or raise 404."""
+    record = session.execute(
+        select(AuditReconExchangeImportRecord).where(
+            AuditReconExchangeImportRecord.id == import_id
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        raise AuditReconExchangeImportNotFoundError(import_id)
     return record
 
 

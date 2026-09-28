@@ -241,6 +241,48 @@ class AuditSignatureVerificationError(DomainError):
         super().__init__(details=details)
 
 
+class AuditReconExchangeImportNotFoundError(DomainError):
+    status_code = 404
+    code = "audit_recon_not_found"
+    message = "The requested audit recon exchange receipt does not exist."
+
+    def __init__(self, import_id: str):
+        super().__init__(details={"import_id": import_id})
+
+
+class AuditReconExchangeImportValidationError(DomainError):
+    """A structurally valid audit recon exchange request that fails verification.
+
+    A recomputed entries or package digest that does not match the claimed
+    digest, or a retry whose identity or signature differs from the stored
+    receipt, renders with the same ``validation_error`` code and 422 status
+    as a malformed payload: the package is refused before any record or
+    audit row is written.
+    """
+
+    status_code = 422
+    code = "validation_error"
+    message = "Request payload failed validation."
+
+    def __init__(self, reason: str, details: dict | None = None):
+        merged = {"reason": reason}
+        if details:
+            merged.update(details)
+        super().__init__(details=merged)
+
+
+class AuditReconSignatureVerificationError(DomainError):
+    """An audit recon package whose structure and digests validate, but whose
+    Ed25519 signature cannot be verified."""
+
+    status_code = 422
+    code = "recon_signature_failed"
+    message = "The audit recon exchange signature could not be verified."
+
+    def __init__(self, details: dict | None = None):
+        super().__init__(details=details)
+
+
 class ImpactImportNotFoundError(DomainError):
     status_code = 404
     code = "impact_import_not_found"

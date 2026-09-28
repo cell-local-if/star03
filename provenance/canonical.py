@@ -209,6 +209,30 @@ def audit_checkpoint_package_digest_hex(package: Any) -> str:
     ).hexdigest()
 
 
+def canonical_audit_checkpoint_recon_package_bytes(package: Any) -> bytes:
+    """Serialize an audit checkpoint recon package for its whole-package digest.
+
+    This is the cross-system signed-exchange counterpart of the recon
+    package served by ``GET /v1/audit-checkpoint-recon-package``: the
+    package root keeps its member order (``checkpoint`` then ``entries``)
+    and the entries array keeps its element order, while every nested
+    object's members (including ``local_checkpoint``'s) are sorted
+    recursively by Unicode code point, with compact separators,
+    unescaped non-ASCII, and UTF-8 encoding -- so the digest is
+    reproducible by an external verifier from the received package JSON
+    alone. (The two root members are already in code-point order, so this
+    coincides with fully sorted canonicalization for this shape.)
+    """
+    return _ordered_root_canonical_bytes(package)
+
+
+def audit_checkpoint_recon_package_digest_hex(package: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical recon-package bytes."""
+    return hashlib.sha256(
+        canonical_audit_checkpoint_recon_package_bytes(package)
+    ).hexdigest()
+
+
 def canonical_impact_recon_package_bytes(package: Any) -> bytes:
     """Serialize an impact-recon package under the package digest rules.
 
