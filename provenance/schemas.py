@@ -3321,6 +3321,126 @@ class AuditExchangeImportPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class AuditExchangeImportPageResponse(BaseModel):
+    """A cursor-paginated page of signed audit exchange-import receipts."""
+
+    items: list[AuditExchangeImportResponse]
+    #: Total number of receipts after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
+#: Fixed signature-exchange version for signed audit checkpoint recon
+#: packages. The same literal is the first element of the signed JSON
+#: array, so the metadata field and the signature domain-separation prefix
+#: can never diverge.
+AUDIT_RECON_EXCHANGE_SIGNATURE_VERSION = "acr-exchange-v1"
+#: The sole digest algorithm a signed audit recon exchange package may name.
+AUDIT_RECON_EXCHANGE_DIGEST_ALGORITHM = AUDIT_CHECKPOINT_RECON_DIGEST_ALGORITHM
+
+
+class AuditReconExchangeSignatureMetadata(BaseModel):
+    """The signature metadata accompanying a signed audit recon package.
+
+    Exactly six members: the fixed exchange ``signature_version``
+    (``"acr-exchange-v1"``), the non-empty signing ``signer_subject``, the
+    standard-Base64 Ed25519 ``public_key`` (decoding to exactly 32 bytes),
+    the standard-Base64 ``signature`` (decoding to exactly 64 bytes), and
+    the package digest ``package_digest_algorithm`` (``"sha256"``) with
+    its 64-lowercase-hex ``package_digest_hex``. Undeclared members are
+    rejected rather than ignored, so no private key or other raw material
+    can enter the request. The raw signature is verified but never
+    persisted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signature_version: Literal[AUDIT_RECON_EXCHANGE_SIGNATURE_VERSION]
+    signer_subject: str = Field(..., min_length=1)
+    #: Base64 Ed25519 public key; must decode to exactly 32 bytes.
+    public_key: bytes
+    #: Base64 Ed25519 signature; must decode to exactly 64 bytes.
+    signature: bytes
+    package_digest_algorithm: Literal[AUDIT_RECON_EXCHANGE_DIGEST_ALGORITHM]
+    package_digest_hex: str
+
+    @field_validator("signer_subject")
+    @classmethod
+    def _signer_subject_nonempty(cls, v: str) -> str:
+        # The subject is a non-empty, non-whitespace identifier; nothing is
+        # trimmed or normalized.
+        if not v.strip():
+            raise ValueError("signer_subject must not be empty")
+        return v
+
+    @field_validator("public_key", mode="before")
+    @classmethod
+    def _public_key_is_32_bytes(cls, v: Any) -> bytes:
+        return _decode_base64(v, "public_key", PUBLIC_KEY_LENGTH)
+
+    @field_validator("signature", mode="before")
+    @classmethod
+    def _signature_is_64_bytes(cls, v: Any) -> bytes:
+        return _decode_base64(v, "signature", SIGNATURE_LENGTH)
+
+    @field_validator("package_digest_hex")
+    @classmethod
+    def _package_digest_is_sha256_hex(cls, v: str) -> str:
+        # No normalization: the claimed digest must already be exactly 64
+        # lowercase hexadecimal characters.
+        if not _HEX64.fullmatch(v):
+            raise ValueError(
+                "package_digest_hex must be exactly 64 lowercase"
+                " hexadecimal characters"
+            )
+        return v
+
+
+class AuditReconExchangeImportCreate(BaseModel):
+    """A controlled signed audit checkpoint recon exchange-import request.
+
+    Exactly two members, both reusing the existing public structures:
+    ``package`` is an audit checkpoint recon package validated under the
+    existing stateless verification structure (exactly
+    ``{"checkpoint", "entries"}`` with the pinned recon checkpoint
+    version/algorithm, the claimed entry count, strict entry fields and
+    timestamps, and the canonical entries digest), and
+    ``signature_metadata`` carries the six signature fields. Verification
+    is pure with respect to local state: no referenced id is ever
+    resolved against a local resource, queried, or created.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    package: AuditCheckpointReconVerificationCreate
+    signature_metadata: AuditReconExchangeSignatureMetadata
+
+
+class AuditReconExchangeImportResponse(BaseModel):
+    """The public immutable receipt for one signed audit recon exchange import.
+
+    Carries the stable ``arx_`` id (the receiving identity, determined by
+    the exchange version and the whole-package digest alone), the
+    signature version, the signing subject, the Base64 public key, the two
+    digests -- the verified whole-package digest and the SHA-256 digest of
+    the verified signature -- and the UTC ``received_at``. The package,
+    the raw signature, and any private key are never persisted and so are
+    never echoed.
+    """
+
+    id: str
+    signature_version: str
+    signer_subject: str
+    #: Base64 of the 32-byte Ed25519 public key.
+    public_key: str
+    package_digest_hex: str
+    #: SHA-256 hex digest of the submitted signature; the raw signature is
+    #: never stored or echoed.
+    signature_digest_hex: str
+    received_at: datetime
+
+
 class TrustEvaluationResponse(BaseModel):
     """Read-only trust assessment of a claim or evidence bundle.
 

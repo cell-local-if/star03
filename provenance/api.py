@@ -24,6 +24,8 @@ from provenance.access_signing import AccessAuthError
 from provenance.errors import (
     AuditCheckpointImportValidationError,
     AuditExchangeImportValidationError,
+    AuditReconExchangeImportValidationError,
+    AuditReconSignatureVerificationError,
     AuditSignatureVerificationError,
     CspImportValidationError,
     EvidenceBundleExchangeImportValidationError,
@@ -136,6 +138,8 @@ from provenance.schemas import (
     AuditExchangeImportCreate,
     AuditExchangeImportPageResponse,
     AuditExchangeImportResponse,
+    AuditReconExchangeImportCreate,
+    AuditReconExchangeImportResponse,
     AuthenticationKeyRotationCreate,
     AuthenticationKeyRotationPageResponse,
     AuthenticationKeyRotationResponse,
@@ -7604,3 +7608,143 @@ def get_audit_exchange(
     # event. An unknown id is an explicit, specific 404.
     record = service.get_audit_exchange_import(session, import_id)
     return _render_compact_json(_audit_exchange_import_response(record))
+
+
+# --- Signed audit checkpoint recon exchange imports -------------------------------
+
+_AUDIT_RECON_EXCHANGE_POST_PATH = "/audit-recon-exchanges"
+
+
+def _audit_recon_exchange_import_response(record) -> dict:
+    """Build the compact public receipt dict for one audit recon exchange."""
+    return AuditReconExchangeImportResponse(
+        id=record.id,
+        signature_version=record.signature_version,
+        signer_subject=record.signer_subject,
+        public_key=base64.b64encode(record.public_key).decode("ascii"),
+        package_digest_hex=record.package_digest_hex,
+        signature_digest_hex=record.signature_digest_hex,
+        received_at=record.created_at,
+    ).model_dump(mode="json")
+
+
+@router.post(_AUDIT_RECON_EXCHANGE_POST_PATH)
+async def import_audit_recon_exchange(
+    payload: AuditReconExchangeImportCreate,
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # The registration route accepts no query parameters: any (or
+    # repeated) parameter is a 422 validation_error before the package is
+    # read.
+    _reject_any_query_param(request)
+
+    # Structure, the fixed recon checkpoint version/algorithm, the claimed
+    # entry count, the strict entry fields and timestamps, the signature
+    # metadata fields, standard Base64 key/signature lengths, and the
+    # 64-lowercase-hex digest spellings have all passed request
+    # validation. The digest bindings are enforced here over the raw
+    # received JSON, so root/array order and datetime spellings
+    # participate exactly as received; every mismatch is a 422
+    # validation_error and writes nothing -- no local resource is read, no
+    # receipt/audit/log row is created, and the package and raw signature
+    # are not saved.
+    body = await request.json()
+    raw_package = body["package"]
+    metadata = payload.signature_metadata
+
+    # 1. The entries array digest under the existing recon checkpoint
+    #    rules: the received array order participates unchanged and
+    #    nested keys (including local_checkpoint's) sort recursively.
+    computed_entries_digest_hex = (
+        canonical.audit_checkpoint_recon_entries_digest_hex(
+            raw_package["entries"]
+        )
+    )
+    if computed_entries_digest_hex != payload.package.checkpoint.entries_digest_hex:
+        raise AuditReconExchangeImportValidationError(
+            "entries_digest_mismatch",
+            details={"computed_digest_hex": computed_entries_digest_hex},
+        )
+
+    # 2. The full package digest: root members (checkpoint, entries) and
+    #    the entries array keep their received order; nested object keys
+    #    sort recursively by Unicode code point under the package
+    #    canonical rules.
+    computed_package_digest_hex = (
+        canonical.audit_checkpoint_recon_package_digest_hex(raw_package)
+    )
+    if computed_package_digest_hex != metadata.package_digest_hex:
+        raise AuditReconExchangeImportValidationError(
+            "package_digest_mismatch",
+            details={"computed_digest_hex": computed_package_digest_hex},
+        )
+
+    # 3. The Ed25519 signature binds, in order, the fixed exchange version
+    #    ("acr-exchange-v1"), the signing subject, the package digest
+    #    algorithm, and the whole-package digest -- over the exact UTF-8
+    #    compact JSON array. Only now, after every structural and digest
+    #    check, is verification attempted; a failure is its own distinct
+    #    422 code and writes nothing.
+    message = signing.audit_recon_exchange_message_bytes(
+        metadata.signer_subject,
+        metadata.package_digest_algorithm,
+        metadata.package_digest_hex,
+    )
+    if not ed25519.verify(
+        metadata.public_key, message, metadata.signature
+    ):
+        raise AuditReconSignatureVerificationError(
+            details={"reason": "signature_verification_failed"}
+        )
+
+    # Only the SHA-256 digest of the signature is ever passed on for
+    # storage; the raw signature and the package are not persisted.
+    signature_digest_hex = hashlib.sha256(metadata.signature).hexdigest()
+
+    # Verification is decided entirely by the request body: no resource id
+    # named by the package is ever resolved against local state, so
+    # whether the referenced receipts or local checkpoints exist locally
+    # cannot change the receipt, and no local resource is queried or
+    # created.
+    record, created = service.create_audit_recon_exchange_import(
+        session, payload, signature_digest_hex
+    )
+    # First registration of this package identity -> 201; an exact retried
+    # submission (same subject, key, and signature) -> 200 with the
+    # original receipt and no new audit event. A different subject, key,
+    # or signature for the same package is a 422 from the service with
+    # the original record untouched.
+    status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _render_compact_json(
+        _audit_recon_exchange_import_response(record),
+        status_code=status_code,
+    )
+
+
+@router.get("/audit-recon-exchanges/{import_id}")
+async def get_audit_recon_exchange(
+    import_id: str, request: Request, session: DbSession
+) -> Response:
+    # The receipt read takes no query parameters and no request body: any
+    # (or repeated) query parameter or any body bytes (even whitespace,
+    # arbitrary bytes, or malformed JSON) is a 422 validation_error,
+    # validated before the receipt lookup. PUT/PATCH/DELETE and every
+    # other non-GET method on this path is the framework's 405
+    # method_not_allowed.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # Strictly read-only: a receipt read writes no resource and no audit
+    # event. An unknown id is an explicit, specific 404.
+    record = service.get_audit_recon_exchange_import(session, import_id)
+    return _render_compact_json(
+        _audit_recon_exchange_import_response(record)
+    )
