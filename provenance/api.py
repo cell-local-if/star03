@@ -53,6 +53,8 @@ from provenance.signing import ATTESTATION_TARGET_TYPES
 from provenance.time_utils import parse_rfc3339_utc, utc_now
 from provenance.schemas import (
     AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
+    AUDIT_CHECKPOINT_RECON_CHECKPOINT_VERSION,
+    AUDIT_CHECKPOINT_RECON_DIGEST_ALGORITHM,
     AUDIT_CHECKPOINT_VERSION,
     CSP_CHECKPOINT_VERSION,
     CSP_DIGEST_ALGORITHM,
@@ -120,6 +122,10 @@ from provenance.schemas import (
     AuditCheckpointJobPageResponse,
     AuditCheckpointJobResponse,
     AuditCheckpointJobSummaryResponse,
+    AuditCheckpointReconCheckpointResponse,
+    AuditCheckpointReconPackageResponse,
+    AuditCheckpointReconVerificationCreate,
+    AuditCheckpointReconVerificationResponse,
     AuditCheckpointVerificationCreate,
     AuditCheckpointVerificationResponse,
     AuditEventCheckpointPackageResponse,
@@ -7223,6 +7229,130 @@ def list_audit_events_checkpoint_import_reconciliations(
         count=total,
         next_cursor=next_cursor,
     )
+
+
+# --- Global audit checkpoint reconciliation package and offline verification ------
+
+
+def _unfiltered_audit_checkpoint_recon_views(
+    session: Session,
+) -> list[AuditCheckpointImportReconciliationItem]:
+    """Every global checkpoint-import reconciliation entry, complete and unfiltered.
+
+    Exactly the global reconciliation listing's read minus pagination:
+    receipts in stable creation order, the current local audit
+    checkpoint read once complete and unfiltered (identical for every
+    entry), and each entry's match verdict computed at this read through
+    the existing reconciliation item view. Strictly read-only.
+    """
+    records = service.list_audit_checkpoint_import_reconciliations(session)
+    local_checkpoint = _local_audit_checkpoint(session)
+    views: list[AuditCheckpointImportReconciliationItem] = []
+    for record in records:
+        matches = (
+            record.checkpoint_version == local_checkpoint.checkpoint_version
+            and record.event_count == local_checkpoint.event_count
+            and record.events_digest_hex == local_checkpoint.events_digest_hex
+        )
+        views.append(
+            _checkpoint_import_reconciliation_item(
+                record, local_checkpoint, matches
+            )
+        )
+    return views
+
+
+@router.get("/audit-checkpoint-recon-package")
+async def export_audit_checkpoint_recon_package(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only export of the complete global checkpoint-import
+    # reconciliation set together with an offline-recomputable
+    # checkpoint. The GET request body must be empty: carrying any bytes
+    # (even whitespace, arbitrary bytes, or malformed JSON) is a 422
+    # validated before any query parameter, receipt, or local state is
+    # read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    # The export takes no query parameters: any (or repeated) parameter
+    # -- limit/cursor included -- is a 422 validation_error rather than
+    # silently ignored.
+    _reject_any_query_param(request)
+
+    # Strictly read-only, and both halves derive from one state read
+    # under exactly the global reconciliation listing's rules: receipts
+    # follow stable creation order, the current local audit sequence is
+    # read once complete and unfiltered (identical for every entry), and
+    # each entry is exactly the existing global reconciliation public
+    # view. No receipt, resource, audit event, or log is written; the
+    # empty set still yields "entries": [] with entry_count 0 and the
+    # deterministic digest of the empty array.
+    entry_views = _unfiltered_audit_checkpoint_recon_views(session)
+    # mode="json" yields exactly the wire view served in this response's
+    # entries member (UTC datetimes as RFC 3339 strings), so the
+    # checkpoint binds to exactly those entries and is reproducible by
+    # an external verifier from the package body alone.
+    entry_payloads = [view.model_dump(mode="json") for view in entry_views]
+    package = AuditCheckpointReconPackageResponse(
+        checkpoint=AuditCheckpointReconCheckpointResponse(
+            checkpoint_version=AUDIT_CHECKPOINT_RECON_CHECKPOINT_VERSION,
+            digest_algorithm=AUDIT_CHECKPOINT_RECON_DIGEST_ALGORITHM,
+            entry_count=len(entry_payloads),
+            entries_digest_hex=canonical.audit_checkpoint_recon_entries_digest_hex(
+                entry_payloads
+            ),
+        ),
+        entries=entry_views,
+    )
+    # Compact UTF-8 JSON, null/boolean literals, integral numbers only,
+    # terminated by exactly one newline; root members appear as
+    # checkpoint, entries.
+    return _render_compact_json(package.model_dump(mode="json"))
+
+
+@router.post(
+    "/audit-checkpoint-recon-verifications",
+    response_model=AuditCheckpointReconVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_audit_checkpoint_recon_package(
+    payload: AuditCheckpointReconVerificationCreate, request: Request
+) -> Response:
+    # The route accepts no query parameters: any (or repeated) parameter
+    # is a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no receipt, resource, audit row, or log
+    # is written. Verification uses the request body alone; no receipt
+    # or resource id is ever resolved against local state, so unknown
+    # resources, repeated requests, and differing local state verify
+    # identically. Malformed JSON and every structural, field, type,
+    # count, timestamp, or digest-format failure are rejected by the
+    # request model as a 422 before this body runs.
+    body = await request.json()
+    # The digest commits to the entries array exactly as received: the
+    # raw JSON values (array order, timestamp spellings), not any parsed
+    # or re-serialized form. The array keeps its order; nested object
+    # keys (including local_checkpoint's) sort recursively by Unicode
+    # code point under the checkpoint canonical rules.
+    computed_digest_hex = canonical.audit_checkpoint_recon_entries_digest_hex(
+        body["entries"]
+    )
+    if computed_digest_hex == payload.checkpoint.entries_digest_hex:
+        result = {"valid": True}
+    else:
+        result = {
+            "valid": False,
+            "computed_digest_hex": computed_digest_hex,
+        }
+    # Compact UTF-8 JSON, boolean literals, terminated by exactly one
+    # newline; a match carries no field besides valid.
+    return _render_compact_json(result)
 
 
 # --- Signed audit checkpoint exchange imports -------------------------------------
