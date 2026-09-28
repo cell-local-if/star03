@@ -56,6 +56,8 @@ from provenance.time_utils import parse_rfc3339_utc, utc_now
 from provenance.schemas import (
     AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
     AUDIT_CHECKPOINT_RECON_CHECKPOINT_VERSION,
+    AUDIT_RECON_AUDIT_CHECKPOINT_VERSION,
+    AUDIT_RECON_AUDIT_DIGEST_ALGORITHM,
     AUDIT_CHECKPOINT_RECON_DIGEST_ALGORITHM,
     AUDIT_CHECKPOINT_VERSION,
     CSP_CHECKPOINT_VERSION,
@@ -123,6 +125,11 @@ from provenance.schemas import (
     AuditCheckpointReconCheckpointResponse,
     AuditCheckpointReconEntryResponse,
     AuditCheckpointReconPackageResponse,
+    AuditReconAuditCheckpointResponse,
+    AuditReconAuditEntryResponse,
+    AuditReconAuditPackageResponse,
+    AuditReconAuditVerificationCreate,
+    AuditReconAuditVerificationResponse,
     AuditCheckpointReconVerificationCreate,
     AuditCheckpointReconVerificationResponse,
     AuditCheckpointJobCreate,
@@ -7343,6 +7350,228 @@ async def verify_audit_checkpoint_recon_package(
     # keys (including local_checkpoint's) sort recursively by Unicode
     # code point under the checkpoint canonical rules.
     computed_digest_hex = canonical.audit_checkpoint_recon_entries_digest_hex(
+        body["entries"]
+    )
+    if computed_digest_hex == payload.checkpoint.entries_digest_hex:
+        result = {"valid": True}
+    else:
+        result = {
+            "valid": False,
+            "computed_digest_hex": computed_digest_hex,
+        }
+    # Compact UTF-8 JSON, boolean literals, terminated by exactly one
+    # newline; a match carries no field besides valid.
+    return _render_compact_json(result)
+
+
+# --- Signed audit recon exchange audit package export / verification -------------
+
+
+_AUDIT_RECON_AUDIT_PACKAGES_PARAMS = frozenset(
+    {
+        "signer_subject",
+        "public_key",
+        "package_digest_hex",
+        "from",
+        "to",
+        "matches",
+    }
+)
+
+
+def _local_audit_checkpoint_recon_package_state(session: Session) -> tuple[bool, str]:
+    """The current unfiltered local audit recon package's state and digest.
+
+    Exactly the ``GET /v1/audit-checkpoint-recon-package`` read with no
+    filter: the checkpoint-import reconciliation receipts follow stable
+    creation order, the current unfiltered local audit-event checkpoint
+    is read once (identical for every entry), and each entry's match
+    verdict is computed at this read. The whole-package digest is
+    recomputed over that package under the package canonical rules, so
+    it is deterministic even for the empty state; availability is true
+    only when that package carries at least one reconciliation entry.
+    Strictly read-only.
+    """
+    records = service.list_audit_checkpoint_import_reconciliations(session)
+    local_checkpoint = _local_audit_checkpoint(session)
+    entry_views = []
+    for record in records:
+        matches = (
+            record.checkpoint_version == local_checkpoint.checkpoint_version
+            and record.event_count == local_checkpoint.event_count
+            and record.events_digest_hex == local_checkpoint.events_digest_hex
+        )
+        entry_views.append(
+            _audit_checkpoint_recon_entry(record, local_checkpoint, matches)
+        )
+    entry_payloads = [view.model_dump(mode="json") for view in entry_views]
+    package = AuditCheckpointReconPackageResponse(
+        checkpoint=AuditCheckpointReconCheckpointResponse(
+            checkpoint_version=AUDIT_CHECKPOINT_RECON_CHECKPOINT_VERSION,
+            digest_algorithm=AUDIT_CHECKPOINT_RECON_DIGEST_ALGORITHM,
+            entry_count=len(entry_payloads),
+            entries_digest_hex=canonical.audit_checkpoint_recon_entries_digest_hex(
+                entry_payloads
+            ),
+        ),
+        entries=entry_views,
+    )
+    local_package_digest_hex = (
+        canonical.audit_checkpoint_recon_package_digest_hex(
+            package.model_dump(mode="json")
+        )
+    )
+    return len(entry_views) > 0, local_package_digest_hex
+
+
+def _audit_recon_audit_entry(
+    record,
+    local_available: bool,
+    local_package_digest_hex: str,
+) -> AuditReconAuditEntryResponse:
+    # The receipt public view (the exchange version is omitted) with the
+    # read-time reconciliation triple appended; the imported package,
+    # the raw signature, and every private key are never carried.
+    return AuditReconAuditEntryResponse(
+        id=record.id,
+        signer_subject=record.signer_subject,
+        public_key=base64.b64encode(record.public_key).decode("ascii"),
+        package_digest_hex=record.package_digest_hex,
+        signature_digest_hex=record.signature_digest_hex,
+        received_at=record.created_at,
+        local_available=local_available,
+        local_package_digest_hex=local_package_digest_hex,
+        matches=record.package_digest_hex == local_package_digest_hex,
+    )
+
+
+@router.get("/audit-recon-audit-packages")
+async def export_audit_recon_audit_package(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only audit checkpoint export over the signed audit recon
+    # exchange-import receipts. The GET request body must be empty:
+    # carrying any bytes (even whitespace, arbitrary bytes, or malformed
+    # JSON) is a 422 validated before any query parameter, receipt, or
+    # local state is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters (including local_available and the limit/cursor
+    # pagination pair) are rejected rather than ignored, a blank filter
+    # is never coerced, and only the lowercase literals true/false are
+    # accepted for matches.
+    raw = request.query_params
+
+    unknown = set(raw) - _AUDIT_RECON_AUDIT_PACKAGES_PARAMS
+    if unknown:
+        # A typo or a pagination parameter never silently changes the
+        # snapshot.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    signer_subject = _parse_nonempty_filter(raw, "signer_subject")
+    public_key = _parse_nonempty_filter(raw, "public_key")
+    package_digest_hex = _parse_nonempty_filter(raw, "package_digest_hex")
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    matches_filter = _parse_bool_literal_param(raw, "matches")
+
+    # Strictly read-only: every validation failure above is raised before
+    # any receipt or local state is read, and the export itself writes no
+    # receipt, resource, audit event, or log. The receipt-field exact
+    # filters combine as logical AND; the current local audit recon
+    # package is then read once, complete and unfiltered, so its
+    # availability flag and digest are identical for every entry; the
+    # matches filter applies to the read-time verdict and combines with
+    # the rest as logical AND. An empty match set yields "entries": []
+    # with entry_count 0 and the deterministic digest of the empty array.
+    records = service.list_audit_recon_exchange_imports(
+        session,
+        signer_subject,
+        public_key,
+        package_digest_hex,
+        from_dt,
+        to_dt,
+    )
+    local_available, local_package_digest_hex = (
+        _local_audit_checkpoint_recon_package_state(session)
+    )
+    entry_views = [
+        _audit_recon_audit_entry(
+            record, local_available, local_package_digest_hex
+        )
+        for record in records
+    ]
+    if matches_filter is not None:
+        entry_views = [
+            view for view in entry_views if view.matches == matches_filter
+        ]
+    # mode="json" yields exactly the wire view served in this response's
+    # entries member (UTC datetimes as RFC 3339 strings), so the
+    # checkpoint binds to exactly those entries and is reproducible by an
+    # external verifier from the package body alone.
+    entry_payloads = [view.model_dump(mode="json") for view in entry_views]
+    package = AuditReconAuditPackageResponse(
+        checkpoint=AuditReconAuditCheckpointResponse(
+            checkpoint_version=AUDIT_RECON_AUDIT_CHECKPOINT_VERSION,
+            digest_algorithm=AUDIT_RECON_AUDIT_DIGEST_ALGORITHM,
+            entry_count=len(entry_payloads),
+            entries_digest_hex=canonical.audit_recon_audit_entries_digest_hex(
+                entry_payloads
+            ),
+        ),
+        entries=entry_views,
+    )
+    # Compact UTF-8 JSON, null/boolean literals, integral numbers only,
+    # terminated by exactly one newline; root members appear as
+    # checkpoint, entries.
+    return _render_compact_json(package.model_dump(mode="json"))
+
+
+@router.post(
+    "/audit-recon-audit-verifications",
+    response_model=AuditReconAuditVerificationResponse,
+    response_model_exclude_none=True,
+)
+async def verify_audit_recon_audit_package(
+    payload: AuditReconAuditVerificationCreate, request: Request
+) -> Response:
+    # The route accepts no query parameters: any (or repeated) parameter
+    # is a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no receipt, resource, audit row, or log
+    # is written. Verification uses the request body alone; no receipt or
+    # resource id is ever resolved against local state, so unknown
+    # resources, repeated requests, and differing local state verify
+    # identically. Malformed JSON and every structural, field, type,
+    # count, timestamp, or digest-format failure are rejected by the
+    # request model as a 422 before this body runs.
+    body = await request.json()
+    # The digest commits to the entries array exactly as received: the
+    # raw JSON values (array order, timestamp spellings), not any parsed
+    # or re-serialized form. The array keeps its order; nested object
+    # keys sort by Unicode code point under the checkpoint canonical
+    # rules.
+    computed_digest_hex = canonical.audit_recon_audit_entries_digest_hex(
         body["entries"]
     )
     if computed_digest_hex == payload.checkpoint.entries_digest_hex:

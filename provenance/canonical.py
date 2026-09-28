@@ -172,6 +172,21 @@ def impact_recon_audit_entries_digest_hex(entries: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(entries)).hexdigest()
 
 
+def audit_recon_audit_entries_digest_hex(entries: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical audit-entries bytes.
+
+    The entries array keeps its element order exactly as exported (the
+    signed audit recon exchange-import receipts' stable creation order);
+    each entry object's members are sorted by Unicode code point, with
+    compact separators, non-ASCII emitted unescaped, and UTF-8 encoding
+    -- the same canonical form as
+    :func:`impact_recon_audit_entries_digest_hex`, so the digest is
+    reproducible offline from the exported ``entries`` member alone,
+    including an empty array (the digest of ``[]``).
+    """
+    return hashlib.sha256(canonical_json_bytes(entries)).hexdigest()
+
+
 def audit_checkpoint_recon_entries_digest_hex(entries: Any) -> str:
     """Return the SHA-256 hex digest of the canonical recon-entries bytes.
 
