@@ -126,6 +126,9 @@ IMPACT_RECON_EXCHANGE_IMPORTS_CURSOR_VERSION = "rx1"
 #: receipts.
 AUDIT_EXCHANGE_IMPORTS_CURSOR_VERSION = "ax1"
 
+#: Marker for cursors that page through the audit checkpoint job search.
+AUDIT_CHECKPOINT_JOBS_CURSOR_VERSION = "aj1"
+
 
 class InvalidCursorError(ValueError):
     """The cursor token is absent, malformed, expired, or unverifiable."""
@@ -1135,6 +1138,55 @@ AUDIT_EXCHANGE_IMPORTS_CURSOR = CursorKind(
         "offset",
     ),
     validate=_validate_audit_exchange_imports_claims,
+)
+
+
+def _validate_audit_checkpoint_jobs_claims(claims: dict[str, Any]) -> None:
+    # The exact-match filters are either absent (null) or non-empty strings;
+    # matching is case- and whitespace-sensitive, so the raw value is bound.
+    _optional_nonempty_str(claims, "request_id")
+    _optional_nonempty_str(claims, "event_type")
+    _optional_nonempty_str(claims, "resource_id")
+    # The status filter is absent (null, meaning unfiltered) or one of the
+    # four existing lifecycle literals; no other spelling is valid.
+    status = claims["status"]
+    if status is not None and status not in (
+        "pending",
+        "running",
+        "succeeded",
+        "failed",
+    ):
+        raise InvalidCursorError("cursor status is invalid")
+    # The time bounds are absent (null) or canonical RFC 3339 UTC strings.
+    for field in ("from", "to"):
+        value = claims[field]
+        if value is not None and (
+            not isinstance(value, str) or parse_rfc3339_utc(value) is None
+        ):
+            raise InvalidCursorError(f"cursor {field} is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/audit-checkpoint-jobs``.
+AUDIT_CHECKPOINT_JOBS_CURSOR = CursorKind(
+    version=AUDIT_CHECKPOINT_JOBS_CURSOR_VERSION,
+    claim_fields=(
+        "request_id",
+        "event_type",
+        "resource_id",
+        "status",
+        "from",
+        "to",
+        "limit",
+        "offset",
+    ),
+    validate=_validate_audit_checkpoint_jobs_claims,
 )
 
 

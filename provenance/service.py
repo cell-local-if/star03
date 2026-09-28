@@ -3100,6 +3100,51 @@ def summarize_audit_checkpoint_jobs(
     return counts, oldest_pending
 
 
+# Reviewer audit checkpoint job search paging bounds.
+DEFAULT_AUDIT_CHECKPOINT_JOBS_LIMIT = 50
+MIN_AUDIT_CHECKPOINT_JOBS_LIMIT = 1
+MAX_AUDIT_CHECKPOINT_JOBS_LIMIT = 100
+
+
+def list_audit_checkpoint_jobs(
+    session: Session,
+    request_id: str | None = None,
+    event_type: str | None = None,
+    resource_id: str | None = None,
+    status: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[AuditCheckpointJob]:
+    """Return audit checkpoint jobs in stable creation order, optionally filtered.
+
+    ``request_id``, ``event_type``, and ``resource_id`` are exact, combinable
+    string matches (case- and whitespace-sensitive); ``status`` is one of the
+    four lifecycle literals when supplied. ``from_dt``/``to_dt`` are
+    timezone-aware UTC instants applied as inclusive ``created_at`` bounds.
+    Filter values are never resolved for existence, so an unknown request id,
+    event type, or resource id is simply an empty match set rather than an
+    error. Results follow the jobs' stable creation order (``created_at``
+    with the monotonic ``seq`` tiebreaker, which stays stable across a
+    restart). The function is strictly read-only: it writes no job and no
+    audit event.
+    """
+    stmt = select(AuditCheckpointJob)
+    if request_id is not None:
+        stmt = stmt.where(AuditCheckpointJob.request_id == request_id)
+    if event_type is not None:
+        stmt = stmt.where(AuditCheckpointJob.event_type == event_type)
+    if resource_id is not None:
+        stmt = stmt.where(AuditCheckpointJob.resource_id == resource_id)
+    if status is not None:
+        stmt = stmt.where(AuditCheckpointJob.status == status)
+    if from_dt is not None:
+        stmt = stmt.where(AuditCheckpointJob.created_at >= from_dt)
+    if to_dt is not None:
+        stmt = stmt.where(AuditCheckpointJob.created_at <= to_dt)
+    stmt = stmt.order_by(*_AUDIT_CHECKPOINT_JOB_ORDER)
+    return list(session.execute(stmt).scalars().all())
+
+
 # Reviewer content export job search paging bounds.
 DEFAULT_CONTENT_EXPORT_JOBS_LIMIT = 50
 MIN_CONTENT_EXPORT_JOBS_LIMIT = 1
