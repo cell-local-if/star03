@@ -2585,6 +2585,28 @@ class AttestationAccessGrantRevocationPageResponse(BaseModel):
     next_cursor: str | None
 
 
+class AttestationAccessGrantExpiryResponse(BaseModel):
+    """Public grant-expiry view: id, grant, the future instant, and creation time."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    grant_id: str
+    expires_at: datetime
+    created_at: datetime
+
+
+class AttestationAccessGrantExpiryReadResponse(BaseModel):
+    """The signer's view of one grant's scheduled expiry.
+
+    ``expires_at`` is null when the grant carries no expiry (it never
+    expires); it is the stored UTC instant otherwise.
+    """
+
+    grant_id: str
+    expires_at: datetime | None
+
+
 class AuditEventItem(BaseModel):
     """Public audit-event view: type, resource, and UTC timestamp only."""
 

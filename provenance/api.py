@@ -79,6 +79,8 @@ from provenance.schemas import (
     AttestationAccessGrantCreate,
     AttestationAccessGrantPageResponse,
     AttestationAccessGrantResponse,
+    AttestationAccessGrantExpiryReadResponse,
+    AttestationAccessGrantExpiryResponse,
     AttestationAccessGrantRevocationCreate,
     AttestationAccessGrantRevocationListResponse,
     AttestationAccessGrantRevocationPageResponse,
@@ -5660,6 +5662,92 @@ def list_attestation_access_grant_revocations(
             for item in items
         ],
         count=len(items),
+    )
+
+
+def _parse_grant_expiry_body(raw_body: bytes):
+    """Parse the single-field ``{"expires_at": ...}`` expiry body.
+
+    Every malformed shape -- non-JSON bytes, a non-object document, a
+    missing/blank/non-string/extra field, or a value that is not a strict
+    RFC 3339 UTC timestamp -- renders as the same
+    ``validation_error``/``grant_expiry_invalid`` at the route boundary, so
+    no malformed request ever reaches authentication, the service, or any
+    write. Returns the parsed timezone-aware UTC datetime and the exact
+    submitted string (the idempotency-key material). The future-time rule
+    is a separate semantic check performed after authentication.
+    """
+    try:
+        obj = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ProtectedAccessValidationError("grant_expiry_invalid") from None
+    if not isinstance(obj, dict) or set(obj) != {"expires_at"}:
+        raise ProtectedAccessValidationError("grant_expiry_invalid")
+    raw_expires_at = obj["expires_at"]
+    if not isinstance(raw_expires_at, str) or not raw_expires_at.strip():
+        raise ProtectedAccessValidationError("grant_expiry_invalid")
+    expires_at = parse_rfc3339_utc(raw_expires_at)
+    if expires_at is None:
+        raise ProtectedAccessValidationError("grant_expiry_invalid")
+    return expires_at, raw_expires_at
+
+
+@router.post(
+    "/attestation-access-grants/{grant_id}/expiry",
+    response_model=AttestationAccessGrantExpiryResponse,
+)
+async def schedule_attestation_access_grant_expiry(
+    grant_id: str,
+    request: Request,
+    session: DbSession,
+    response: Response,
+) -> AttestationAccessGrantExpiryResponse:
+    # The signature covers the exact bytes on the wire; the body is parsed
+    # manually from those same bytes so field/JSON failures render with the
+    # expiry-specific reasons rather than the generic issues envelope. As on
+    # the other protected write routes, body structure/format is validated
+    # before the caller is authenticated; the future-time semantic rule is
+    # checked after authentication and before any grant lookup.
+    raw_body = await request.body()
+    expires_at, expires_at_raw = _parse_grant_expiry_body(raw_body)
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    if expires_at <= utc_now():
+        raise ProtectedAccessValidationError("grant_expiry_not_future")
+    expiry, created = service.schedule_attestation_access_grant_expiry(
+        session, grant_id, expires_at, expires_at_raw, caller
+    )
+    # First scheduling -> 201; a retry for the same grant and instant ->
+    # 200 with the original record and no new audit event; the same grant
+    # with a different instant is a 409 from the service.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return AttestationAccessGrantExpiryResponse.model_validate(expiry)
+
+
+@router.get(
+    "/attestation-access-grants/{grant_id}/expiry",
+    response_model=AttestationAccessGrantExpiryReadResponse,
+)
+async def get_attestation_access_grant_expiry(
+    grant_id: str, request: Request, session: DbSession
+) -> AttestationAccessGrantExpiryReadResponse:
+    # A GET carries no body; the signed body_sha256 is therefore the digest
+    # of zero bytes, exactly as on the other protected read route. Missing
+    # or unauthenticated credentials, an unknown grant, and a non-signer
+    # caller all collapse into the same opaque 404; malformed credentials
+    # stay 422.
+    raw_body = await request.body()
+    actor = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+    expires_at = service.get_access_grant_expiry_for_signer(
+        session, grant_id, actor
+    )
+    return AttestationAccessGrantExpiryReadResponse(
+        grant_id=grant_id, expires_at=expires_at
     )
 
 

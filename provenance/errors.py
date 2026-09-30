@@ -564,6 +564,26 @@ class ProtectedResourceNotFoundError(DomainError):
         super().__init__()
 
 
+class AttestationAccessGrantExpiryConflictError(DomainError):
+    """A second, different expiry for a grant that already has one.
+
+    A grant carries at most one immutable expiry: a submission carrying an
+    ``expires_at`` different from the grant's already-scheduled instant is a
+    conflict, not a replacement, and writes nothing. A retry carrying the
+    same instant is not an error -- it returns the original record.
+    """
+
+    status_code = 409
+    code = "attestation_access_grant_expiry_conflict"
+    message = (
+        "The attestation access grant already has an expiry with a different"
+        " expires_at."
+    )
+
+    def __init__(self, grant_id: str):
+        super().__init__(details={"grant_id": grant_id})
+
+
 class LineageValidationError(DomainError):
     """A malformed lineage query (``direction`` / ``max_depth``).
 
