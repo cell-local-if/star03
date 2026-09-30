@@ -45,6 +45,9 @@ EVENT_ATTESTATION_CREATED = "attestation.created"
 EVENT_ATTESTATION_REVOKED = "attestation.revoked"
 EVENT_ATTESTATION_ACCESS_GRANTED = "attestation.access_granted"
 EVENT_ATTESTATION_ACCESS_GRANT_REVOKED = "attestation.access_grant_revoked"
+EVENT_ATTESTATION_ACCESS_GRANT_EXPIRY_SCHEDULED = (
+    "attestation.access_grant_expiry_scheduled"
+)
 EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
@@ -557,6 +560,67 @@ class AttestationAccessGrantRevocation(Base):
 
     grant: Mapped[AttestationAccessGrant] = relationship()
     revoker_actor: Mapped[Actor] = relationship()
+
+
+class AttestationAccessGrantExpiry(Base):
+    """An immutable expiry scheduled on one existing read-only proof grant.
+
+    An expiry is an append-only statement by the attestation's signer that a
+    previously issued :class:`AttestationAccessGrant` stops authorizing its
+    grantee to read the proof through the protected endpoint once the stored
+    UTC ``expires_at`` instant is reached. It neither mutates nor deletes the
+    grant, the attestation, or any revocation: the original grant and its
+    ``attestation.access_granted`` audit relationship are preserved. A grant
+    with no expiry row -- the state of every grant created before this feature
+    -- keeps its existing meaning, so old data is untouched.
+
+    Only the signer of the grant's attestation may schedule an expiry. Each
+    grant carries at most one expiry: ``grant_id`` is unique, so a retried
+    submission carrying the same ``expires_at`` returns the original record
+    and a retried submission carrying a different ``expires_at`` is a conflict
+    rather than a replacement. The signer's own read access is never subject
+    to the expiry; only the grantee's grant-based access is. Expiries are
+    append-only and immutable: there is deliberately no update or delete path.
+    """
+
+    __tablename__ = "attestation_access_grant_expiries"
+    __table_args__ = (
+        UniqueConstraint(
+            "grant_id",
+            name="uq_attestation_access_grant_expiries_grant",
+        ),
+        Index(
+            "ix_attestation_access_grant_expiries_grant_order",
+            "grant_id",
+            "created_at",
+            "seq",
+        ),
+        Index(
+            "ix_attestation_access_grant_expiries_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("aage_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    grant_id: Mapped[str] = mapped_column(
+        String(80),
+        ForeignKey("attestation_access_grants.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    #: A timezone-aware UTC instant strictly later than the request time.
+    #: From that instant on, the grant no longer authorizes its grantee.
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    grant: Mapped[AttestationAccessGrant] = relationship()
 
 
 class AuthenticationKeyRotation(Base):

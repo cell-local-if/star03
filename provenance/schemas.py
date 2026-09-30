@@ -2537,6 +2537,53 @@ class AttestationAccessGrantPageResponse(BaseModel):
     next_cursor: str | None
 
 
+class AttestationAccessGrantExpiryCreate(BaseModel):
+    # An expiry carries exactly its one declared field; undeclared fields
+    # are rejected rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    #: Strict RFC 3339 UTC instant strictly later than the request time.
+    expires_at: str
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def _expires_at_is_rfc3339_utc_string(cls, v: Any) -> str:
+        # Only the strict string spelling is accepted: a number, boolean,
+        # list, object, or null is never silently normalized.
+        if not isinstance(v, str):
+            raise ValueError("expires_at must be an RFC 3339 UTC timestamp string")
+        parsed = parse_rfc3339_utc(v)
+        if parsed is None:
+            raise ValueError("expires_at must be an RFC 3339 UTC timestamp")
+        return v
+
+    def parsed_expires_at(self) -> datetime:
+        """Return the validated ``expires_at`` as a timezone-aware UTC value."""
+        return parse_rfc3339_utc(self.expires_at)  # type: ignore[return-value]
+
+
+class AttestationAccessGrantExpiryResponse(BaseModel):
+    """Public expiry view: id, the grant, the scheduled instant, and time."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    grant_id: str
+    expires_at: datetime
+    created_at: datetime
+
+
+class AttestationAccessGrantExpiryStateResponse(BaseModel):
+    """The signer-facing state of one grant's optional expiry.
+
+    ``expires_at`` is null when the grant has no scheduled expiry; the grant
+    id is always present.
+    """
+
+    grant_id: str
+    expires_at: datetime | None
+
+
 class AttestationAccessGrantRevocationCreate(BaseModel):
     # A grant revocation carries exactly its declared fields; undeclared
     # fields are rejected rather than silently discarded.

@@ -548,6 +548,26 @@ class ProtectedAccessValidationError(DomainError):
         super().__init__(details={"reason": reason})
 
 
+class AttestationAccessGrantExpiryConflictError(DomainError):
+    """A second, different expiry for a grant that already has one.
+
+    A grant carries at most one immutable expiry: a submission carrying an
+    ``expires_at`` different from the grant's existing scheduled expiry is a
+    conflict, not a replacement, and writes neither an expiry nor an audit
+    event. A retry carrying the same ``expires_at`` is instead the normal
+    200 idempotent return of the original record.
+    """
+
+    status_code = 409
+    code = "attestation_access_grant_expiry_conflict"
+    message = (
+        "The grant already has a scheduled expiry with a different expires_at."
+    )
+
+    def __init__(self, grant_id: str):
+        super().__init__(details={"grant_id": grant_id})
+
+
 class ProtectedResourceNotFoundError(DomainError):
     """Opaque 404 for the protected read route.
 

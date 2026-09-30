@@ -36,6 +36,12 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 #: and the insert trigger that continues the sequence for new actors.
 SCHEMA_VERSION_1 = 1
 
+#: Second schema generation: the attestation-access-grant expiry table.
+#: Fresh databases are created directly at this shape; legacy databases
+#: receive this one table (and its indexes) without touching existing
+#: grants, revocations, attestations, or audit rows.
+SCHEMA_VERSION_2 = 2
+
 #: Name of the AFTER INSERT trigger that assigns display_seq to new actors.
 ACTOR_SEQ_TRIGGER = "trg_actors_display_seq"
 
@@ -117,10 +123,29 @@ def _migration_1_up(cursor, engine, metadata) -> None:
     cursor.execute(_CREATE_ACTOR_SEQ_TRIGGER)
 
 
+def _migration_2_up(cursor, engine, metadata) -> None:
+    """Add the attestation-access-grant expiry table to a pre-existing DB.
+
+    Only a database that already shipped version 1 reaches this function; a
+    fresh database is created directly at the latest shape. Existing grants
+    gain no expiry row -- absence of a row continues to mean "no expiry" --
+    and no grant, revocation, attestation, actor, or audit value is changed.
+    The step is individually idempotent in addition to the surrounding
+    transaction, so a re-run after external intervention neither fails nor
+    duplicates the table or its indexes.
+    """
+    table = metadata.tables["attestation_access_grant_expiries"]
+    if table.name not in _existing_tables(cursor):
+        cursor.execute(str(CreateTable(table).compile(engine)))
+    for index in table.indexes:
+        cursor.execute(str(CreateIndex(index).compile(engine)))
+
+
 #: Known versions in application order. A fresh database is baselined past
 #: all of them; a legacy database applies each pending one in turn.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=SCHEMA_VERSION_1, up=_migration_1_up),
+    Migration(version=SCHEMA_VERSION_2, up=_migration_2_up),
 )
 
 _CREATE_LEDGER = (

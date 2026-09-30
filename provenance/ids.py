@@ -176,6 +176,30 @@ def attestation_access_grant_revocation_id(
     return "agr_" + hashlib.sha256(material).hexdigest()
 
 
+def attestation_access_grant_expiry_id(
+    grant_id: str, expires_at
+) -> str:
+    """Return a stable ``aage_``-prefixed id for a grant expiry.
+
+    The identity is exactly the idempotency key: the expiring access grant
+    and the scheduled UTC instant. A retry of the same pair maps to the same
+    record; the same grant with a different instant maps to a different id
+    (and is rejected as a conflict). The instant is rendered as strict
+    timezone-aware UTC ISO-8601. The material is a canonical JSON array so
+    fields containing separators cannot collide with different field splits.
+    """
+    material = json.dumps(
+        [
+            "attestation_access_grant_expiry",
+            grant_id,
+            expires_at.isoformat(),
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "aage_" + hashlib.sha256(material).hexdigest()
+
+
 def attestation_revocation_id(
     attestation_id: str,
     revoker_actor_id: str,

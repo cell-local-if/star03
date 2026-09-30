@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from datetime import datetime
 from typing import Callable
 
 from sqlalchemy import exists, func, or_, select, update as sa_update
@@ -19,6 +20,7 @@ from provenance import canonical, ed25519, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
     ActorTrustPolicyConflictError,
+    AttestationAccessGrantExpiryConflictError,
     AuditCheckpointImportNotFoundError,
     AuditCheckpointJobConflictError,
     AuditCheckpointJobNotFoundError,
@@ -48,6 +50,7 @@ from provenance.errors import (
     ImpactReconExchangeImportValidationError,
     ObservabilityUnavailableError,
     ProtectedAccessValidationError,
+    ProtectedResourceNotFoundError,
     UnknownActorError,
 )
 from provenance.models import (
@@ -67,6 +70,7 @@ from provenance.models import (
     EVENT_ACTOR_TRUST_POLICY_CREATED,
     EVENT_ATTESTATION_ACCESS_GRANTED,
     EVENT_ATTESTATION_ACCESS_GRANT_REVOKED,
+    EVENT_ATTESTATION_ACCESS_GRANT_EXPIRY_SCHEDULED,
     EVENT_ATTESTATION_CREATED,
     EVENT_ATTESTATION_REVOKED,
     EVENT_AUDIT_CHECKPOINT_IMPORTED,
@@ -91,6 +95,7 @@ from provenance.models import (
     ActorTrustPolicy,
     Attestation,
     AttestationAccessGrant,
+    AttestationAccessGrantExpiry,
     AttestationAccessGrantRevocation,
     AttestationRevocation,
     AuthenticationKeyRotation,
@@ -1910,6 +1915,140 @@ def create_attestation_access_grant_revocation(
     return revocation, True
 
 
+def _grant_for_signer(
+    session: Session, grant_id: str, caller_actor_id: str
+) -> AttestationAccessGrant | None:
+    """Return the grant iff it exists and ``caller_actor_id`` is its signer.
+
+    A missing grant and a caller who is not the signer of the grant's
+    attestation are indistinguishable to the caller: both collapse into
+    ``None`` so the caller's route renders one opaque 404 and never reveals
+    existence.
+    """
+    grant = session.execute(
+        select(AttestationAccessGrant).where(
+            AttestationAccessGrant.id == grant_id
+        )
+    ).scalar_one_or_none()
+    if grant is None:
+        return None
+    # Attestation is keyed for ORM lookup by its seq surrogate; select by
+    # the stable id column explicitly.
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == grant.attestation_id)
+    ).scalar_one_or_none()
+    # A stored grant always references a stored attestation; the guard
+    # preserves the opaque-404 contract even against anomalous history.
+    if attestation is None or attestation.signer_actor_id != caller_actor_id:
+        return None
+    return grant
+
+
+def set_attestation_access_grant_expiry(
+    session: Session,
+    grant_id: str,
+    expires_at,
+    caller_actor_id: str,
+) -> tuple[AttestationAccessGrantExpiry, bool]:
+    """Schedule one expiry on an existing grant, returning ``(record, created)``.
+
+    The authenticated caller must be the ``signer_actor_id`` of the
+    attestation the grant concerns; the grant must already exist and
+    ``expires_at`` must be a timezone-aware UTC instant strictly in the
+    future. A missing grant and a caller who is not the signer are
+    indistinguishable: both raise the same opaque
+    :class:`ProtectedResourceNotFoundError`, so existence is never revealed
+    to a caller without access.
+
+    A grant carries at most one expiry. A repeat submission for the same
+    grant and the same instant returns the existing record with
+    ``created=False`` and writes no row or audit event; a submission for a
+    different instant raises
+    :class:`AttestationAccessGrantExpiryConflictError` (``409``) with
+    nothing written. On first creation the expiry row and its
+    ``attestation.access_grant_expiry_scheduled`` audit event commit in a
+    single transaction; under concurrent different-instant submissions the
+    unique constraint lets exactly one writer through and every loser
+    re-reads the winner and conflicts.
+    """
+    # Payload semantics validate before any resource resolution, so an
+    # expired-bound instant is 422 even against an unknown grant.
+    if expires_at <= utc_now():
+        raise ProtectedAccessValidationError("grant_expiry_not_future")
+
+    grant = _grant_for_signer(session, grant_id, caller_actor_id)
+    if grant is None:
+        raise ProtectedResourceNotFoundError()
+
+    existing = session.execute(
+        select(AttestationAccessGrantExpiry).where(
+            AttestationAccessGrantExpiry.grant_id == grant_id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.expires_at == expires_at:
+            return existing, False
+        raise AttestationAccessGrantExpiryConflictError(grant_id)
+
+    expiry = AttestationAccessGrantExpiry(
+        id=ids.attestation_access_grant_expiry_id(grant_id, expires_at),
+        grant_id=grant_id,
+        expires_at=expires_at,
+    )
+    session.add(expiry)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_ATTESTATION_ACCESS_GRANT_EXPIRY_SCHEDULED,
+            resource_id=expiry.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent expiry for this grant won the unique-grant race:
+        # return its record when the instant matches (an identical retry),
+        # otherwise conflict.
+        session.rollback()
+        raced = session.execute(
+            select(AttestationAccessGrantExpiry).where(
+                AttestationAccessGrantExpiry.grant_id == grant_id
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if raced.expires_at == expires_at:
+            return raced, False
+        raise AttestationAccessGrantExpiryConflictError(grant_id) from None
+    session.refresh(expiry)
+    return expiry, True
+
+
+def get_attestation_access_grant_expiry_state(
+    session: Session, grant_id: str, actor_id: str
+) -> tuple[str, datetime | None] | None:
+    """Return ``(grant_id, expires_at)`` for the signer, else ``None``.
+
+    The caller must be the authenticated ``signer_actor_id`` of the grant's
+    existing attestation; a missing grant and a caller who is not its signer
+    are indistinguishable to the caller and both return ``None``, so the
+    route renders one opaque 404 and never reveals existence. When the grant
+    exists and the caller is its signer, the second tuple element is the
+    scheduled timezone-aware UTC ``expires_at``, or ``None`` when no expiry
+    has ever been scheduled -- the state of every older grant. The function
+    is strictly read-only: it writes no expiry, grant, resource, or audit
+    event.
+    """
+    grant = _grant_for_signer(session, grant_id, actor_id)
+    if grant is None:
+        return None
+    expiry = session.execute(
+        select(AttestationAccessGrantExpiry).where(
+            AttestationAccessGrantExpiry.grant_id == grant_id
+        )
+    ).scalar_one_or_none()
+    return grant_id, (expiry.expires_at if expiry is not None else None)
+
+
 def get_attestation_access_grant_revocation(
     session: Session, revocation_id: str
 ) -> AttestationAccessGrantRevocation:
@@ -2034,10 +2173,15 @@ def get_accessible_attestation(
     """Return the attestation iff ``actor_id`` may read it, else ``None``.
 
     The attestation's signer and any grantee holding an access grant for
-    this exact attestation that carries no revocation may read it. A grant
-    with any recorded revocation no longer authorizes its grantee, even
-    though the grant row is retained. The function is strictly read-only: it
-    performs no resource or audit writes.
+    this exact attestation that carries no revocation and has not expired
+    may read it. A grant with any recorded revocation no longer authorizes
+    its grantee, even though the grant row is retained; a grant carrying a
+    scheduled ``expires_at`` at or before the current UTC instant likewise
+    stops authorizing its grantee, while a grant with no expiry row -- the
+    state of every older grant -- and a grant with a later expiry continue
+    to authorize. Expiry constrains the grantee's grant-based access only:
+    the signer's own read is never subject to it. The function is strictly
+    read-only: it performs no resource or audit writes.
     """
     attestation = session.execute(
         select(Attestation).where(Attestation.id == attestation_id)
@@ -2049,11 +2193,16 @@ def get_accessible_attestation(
     revoked_grant = exists().where(
         AttestationAccessGrantRevocation.grant_id == AttestationAccessGrant.id
     )
+    expired_grant = exists().where(
+        AttestationAccessGrantExpiry.grant_id == AttestationAccessGrant.id,
+        AttestationAccessGrantExpiry.expires_at <= utc_now(),
+    )
     grant_exists = session.execute(
         select(AttestationAccessGrant.id).where(
             AttestationAccessGrant.attestation_id == attestation_id,
             AttestationAccessGrant.grantee_actor_id == actor_id,
             ~revoked_grant,
+            ~expired_grant,
         )
     ).first()
     return attestation if grant_exists is not None else None

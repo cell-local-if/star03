@@ -7,9 +7,11 @@ import hashlib
 import json
 import math
 import re
+from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from provenance import (
@@ -77,6 +79,9 @@ from provenance.schemas import (
     ActorTrustPolicyPageResponse,
     ActorTrustPolicyResponse,
     AttestationAccessGrantCreate,
+    AttestationAccessGrantExpiryResponse,
+    AttestationAccessGrantExpiryStateResponse,
+    AttestationAccessGrantExpiryCreate,
     AttestationAccessGrantPageResponse,
     AttestationAccessGrantResponse,
     AttestationAccessGrantRevocationCreate,
@@ -5660,6 +5665,88 @@ def list_attestation_access_grant_revocations(
             for item in items
         ],
         count=len(items),
+    )
+
+
+def _parse_grant_expiry_body(raw_body: bytes) -> datetime:
+    """Parse and validate the single-field expiry body from exact raw bytes.
+
+    The body must be a JSON object carrying exactly ``expires_at`` as a
+    strict RFC 3339 UTC string; malformed JSON, a non-object, an extra or
+    missing field, and a non-string value are all
+    ``grant_expiry_invalid``. Parsing happens against the exact wire bytes
+    the caller signed.
+    """
+    try:
+        parsed_body = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ProtectedAccessValidationError("grant_expiry_invalid") from None
+    try:
+        payload = AttestationAccessGrantExpiryCreate.model_validate(parsed_body)
+    except ValidationError:
+        raise ProtectedAccessValidationError("grant_expiry_invalid") from None
+    return payload.parsed_expires_at()
+
+
+@router.post(
+    "/attestation-access-grants/{grant_id}/expiry",
+    response_model=AttestationAccessGrantExpiryResponse,
+)
+async def set_attestation_access_grant_expiry(
+    grant_id: str,
+    request: Request,
+    session: DbSession,
+    response: Response,
+) -> AttestationAccessGrantExpiryResponse:
+    # The signature covers the exact bytes on the wire; the body is parsed
+    # from those same cached bytes, so body_sha256 matches what the client
+    # signed. Structural body validation precedes authentication, exactly as
+    # the pydantic-validated protected write routes validate before their
+    # handler runs.
+    raw_body = await request.body()
+    expires_at = _parse_grant_expiry_body(raw_body)
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    expiry, created = service.set_attestation_access_grant_expiry(
+        session, grant_id, expires_at, caller
+    )
+    # First scheduling -> 201; a retried submission for the same grant and
+    # instant -> 200 with the original record and no new audit event. A
+    # different instant is a 409 from the service.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return AttestationAccessGrantExpiryResponse.model_validate(expiry)
+
+
+@router.get(
+    "/attestation-access-grants/{grant_id}/expiry",
+    response_model=AttestationAccessGrantExpiryStateResponse,
+)
+async def get_attestation_access_grant_expiry(
+    grant_id: str, request: Request, session: DbSession
+) -> AttestationAccessGrantExpiryStateResponse:
+    # The read takes no query parameters: any parameter at all is a 422
+    # before authentication or the grant lookup, so a malformed request
+    # never renders as the opaque 404.
+    _reject_any_query_param(request)
+    # A GET carries no body; the signed body_sha256 is therefore the digest
+    # of zero bytes, exactly as on the other protected read routes.
+    # Malformed credentials stay 422; missing/unauthenticated credentials
+    # collapse into the same opaque 404 as an unknown grant or a non-signer.
+    raw_body = await request.body()
+    actor = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+    state = service.get_attestation_access_grant_expiry_state(
+        session, grant_id, actor
+    )
+    if state is None:
+        raise ProtectedResourceNotFoundError()
+    resolved_grant_id, expires_at = state
+    return AttestationAccessGrantExpiryStateResponse(
+        grant_id=resolved_grant_id, expires_at=expires_at
     )
 
 
