@@ -35,6 +35,14 @@ RELATION_VERSION_OF = "version_of"
 RELATION_DERIVED_FROM = "derived_from"
 SUPPORTED_RELATION_TYPES = frozenset({RELATION_VERSION_OF, RELATION_DERIVED_FROM})
 
+# Allowed emergency authentication-key revocation reasons.
+REASON_COMPROMISED = "compromised"
+REASON_SUPERSEDED = "superseded"
+REASON_POLICY = "policy"
+SUPPORTED_AUTHENTICATION_KEY_REVOCATION_REASONS = frozenset(
+    {REASON_COMPROMISED, REASON_SUPERSEDED, REASON_POLICY}
+)
+
 # Audit event types.
 EVENT_ACTOR_CREATED = "actor.created"
 EVENT_CONTENT_CREATED = "content.created"
@@ -51,6 +59,7 @@ EVENT_ATTESTATION_ACCESS_GRANT_EXPIRY_SCHEDULED = (
 EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
+EVENT_AUTHENTICATION_KEY_REVOKED = "authentication_key.revoked"
 EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 EVENT_AUDIT_CHECKPOINT_IMPORTED = "audit.checkpoint_imported"
 EVENT_CSP_CHECKPOINT_IMPORTED = "csp.checkpoint_imported"
@@ -678,6 +687,63 @@ class AuthenticationKeyRotation(Base):
     #: audit event; null while the key is active.
     retired_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime, nullable=True
+    )
+
+    actor: Mapped[Actor] = relationship()
+
+
+class AuthenticationKeyRevocation(Base):
+    """An immutable emergency revocation of one authentication public key.
+
+    A revocation is an append-only statement by the key's owning subject
+    that the 32-byte Ed25519 public key must stop authenticating the
+    subject's protected requests immediately, whatever carries it -- a
+    non-revoked attestation or an active key rotation. It neither mutates
+    nor deletes any attestation, rotation, or actor: the original records
+    and their audit relationships are preserved, and only the key's
+    membership in the subject's authentication set changes. Only the public
+    key is ever received: there is no field capable of carrying a private
+    key or a raw signature.
+
+    The ``(actor_id, public_key)`` pair is unique, so a retried submission
+    carrying the same reason returns the original record and a submission
+    carrying a different reason is a conflict rather than a replacement.
+    Revocations are append-only and immutable: there is deliberately no
+    update, delete, or reinstate path.
+    """
+
+    __tablename__ = "authentication_key_revocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id",
+            "public_key",
+            name="uq_authentication_key_revocations_identity",
+        ),
+        Index(
+            "ix_authentication_key_revocations_actor_order",
+            "actor_id",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("akv_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The subject who owns the key and whose signature authenticated the
+    #: request; the caller is always this actor.
+    actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The 32 raw Ed25519 public-key bytes (Base64 on the wire).
+    public_key: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    #: The emergency category: compromised, superseded, or policy.
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: The UTC instant the key left the subject's authentication set.
+    revoked_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
     )
 
     actor: Mapped[Actor] = relationship()

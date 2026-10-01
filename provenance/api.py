@@ -156,6 +156,9 @@ from provenance.schemas import (
     AuthenticationKeyRotationCreate,
     AuthenticationKeyRotationPageResponse,
     AuthenticationKeyRotationResponse,
+    AuthenticationKeyRevocationCreate,
+    AuthenticationKeyRevocationPageResponse,
+    AuthenticationKeyRevocationResponse,
     ClaimCreate,
     ClaimExportItem,
     ClaimListResponse,
@@ -6195,6 +6198,178 @@ def list_actor_authentication_key_rotations(
     # surrogate are never part of that view and so can never be echoed.
     return AuthenticationKeyRotationPageResponse(
         items=[_rotation_response(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+
+
+def _revocation_response(revocation) -> AuthenticationKeyRevocationResponse:
+    # Only the 32 public-key bytes leave the service, Base64 on the wire;
+    # there is never a private key or raw signature to render.
+    return AuthenticationKeyRevocationResponse(
+        id=revocation.id,
+        actor_id=revocation.actor_id,
+        public_key=base64.b64encode(revocation.public_key).decode("ascii"),
+        reason=revocation.reason,
+        revoked_at=revocation.revoked_at,
+    )
+
+
+@router.post(
+    "/authentication-key-revocations",
+    response_model=AuthenticationKeyRevocationResponse,
+)
+async def create_authentication_key_revocation(
+    request: Request,
+    payload: AuthenticationKeyRevocationCreate,
+    session: DbSession,
+    response: Response,
+) -> AuthenticationKeyRevocationResponse:
+    # The signature covers the exact bytes on the wire; FastAPI's parsed
+    # model is built from the same cached body, so body_sha256 matches what
+    # the client signed. The caller authenticated by the signature is the
+    # revocation's subject, and the key being revoked may itself be the
+    # signing key: authentication is evaluated before any state change.
+    raw_body = await request.body()
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    revocation, created = service.create_authentication_key_revocation(
+        session, payload, caller
+    )
+    # First creation -> 201; a retried submission for the same subject,
+    # public key, and reason -> 200 with the original record and no audit
+    # event.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _revocation_response(revocation)
+
+
+@router.get(
+    "/authentication-key-revocations/{revocation_id}",
+    response_model=AuthenticationKeyRevocationResponse,
+)
+def get_authentication_key_revocation(
+    revocation_id: str, session: DbSession
+) -> AuthenticationKeyRevocationResponse:
+    # Read-only retrieval of one immutable revocation record; an unknown id
+    # is the authentication_key_revocation_not_found 404.
+    revocation = service.get_authentication_key_revocation(
+        session, revocation_id
+    )
+    return _revocation_response(revocation)
+
+
+_ACTOR_REVOCATIONS_PARAMS = frozenset({"limit", "cursor"})
+
+
+@router.get(
+    "/actors/{actor_id}/authentication-key-revocations",
+    response_model=AuthenticationKeyRevocationPageResponse,
+)
+async def list_actor_authentication_key_revocations(
+    actor_id: str,
+    request: Request,
+    session: DbSession,
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> AuthenticationKeyRevocationPageResponse:
+    # Read-only reviewer retrieval of one existing subject's emergency
+    # key-revocation history. The GET request body must be empty. Raw
+    # multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, any parameter
+    # other than limit/cursor is rejected rather than ignored, and a blank
+    # or non-integer limit is never coerced to the default. Every such
+    # validation failure is a 422 before the subject lookup, so a malformed
+    # request never renders as an unknown_actor 404.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _ACTOR_REVOCATIONS_PARAMS
+    if unknown:
+        # The collection accepts only limit/cursor; a typo never silently
+        # changes the page.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_AUTHENTICATION_KEY_REVOCATIONS_LIMIT,
+        service.MIN_AUTHENTICATION_KEY_REVOCATIONS_LIMIT,
+        service.MAX_AUTHENTICATION_KEY_REVOCATIONS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.authentication_key_revocations_cursor_secret,
+                pagination.AUTHENTICATION_KEY_REVOCATIONS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the origin
+        # subject and the effective limit must match exactly. A cursor from
+        # another subject, another endpoint's family, or a different limit
+        # is a client validation error, not a new query.
+        if claims["actor_id"] != actor_id or claims["limit"] != page_limit:
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Parameters and cursor are validated first; a structurally valid
+    # request for an unknown subject is a missing resource (the existing
+    # unknown_actor 404), not an empty collection.
+    items = service.list_authentication_key_revocations_for_actor(
+        session, actor_id
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.authentication_key_revocations_cursor_secret,
+                pagination.AUTHENTICATION_KEY_REVOCATIONS_CURSOR,
+                {
+                    "actor_id": actor_id,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the revocation public view: the 32 public-key bytes, the
+    # reason, and the UTC revocation time. Private keys, raw signatures,
+    # authentication headers, and the internal ordering surrogate are never
+    # part of that view and so can never be echoed.
+    return AuthenticationKeyRevocationPageResponse(
+        items=[_revocation_response(item) for item in page],
         count=total,
         next_cursor=next_cursor,
     )

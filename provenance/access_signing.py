@@ -24,7 +24,11 @@ The signature is accepted if it verifies under **any** public key of a
 non-revoked attestation created by the calling actor, or under an active
 authentication key the actor introduced through a key rotation (a retired
 rotation key never authenticates). Revoked attestation keys never
-authenticate, regardless of the target the request operates on.
+authenticate, regardless of the target the request operates on. A public
+key the actor emergency-revoked through an authentication-key revocation
+never authenticates either, whatever carries it: the revoked key bytes
+leave the actor's authentication set immediately and no later idempotent
+replay of a rotation or revocation restores them.
 
 Failures split into two categories:
 
@@ -55,6 +59,7 @@ from provenance import ed25519
 from provenance.models import (
     Attestation,
     AttestationRevocation,
+    AuthenticationKeyRevocation,
     AuthenticationKeyRotation,
 )
 
@@ -156,11 +161,16 @@ def _actor_public_keys(session: Session, actor_id: str) -> list[bytes]:
     The set is the union of:
 
     * public keys of the actor's attestations carrying no revocation, and
-    * public keys of the actor's active (non-retired) key rotations.
+    * public keys of the actor's active (non-retired) key rotations,
+
+    minus every public key the actor emergency-revoked through an
+    authentication-key revocation.
 
     A rotated key therefore authenticates without any attestation, an
     existing non-revoked attestation key keeps working, and a retired
     rotation key -- like a revoked attestation key -- never authenticates.
+    An emergency-revoked key never authenticates either, even while its
+    attestation is unrevoked or its rotation is still active.
     """
     revoked = exists().where(
         AttestationRevocation.attestation_id == Attestation.id
@@ -185,10 +195,23 @@ def _actor_public_keys(session: Session, actor_id: str) -> list[bytes]:
         .scalars()
         .all()
     )
+    emergency_revoked = set(
+        session.execute(
+            select(AuthenticationKeyRevocation.public_key).where(
+                AuthenticationKeyRevocation.actor_id == actor_id
+            )
+        )
+        .scalars()
+        .all()
+    )
     # De-duplicate: the same key bytes may be carried by both an attestation
     # and a rotation; verifying twice adds no security and costs a scalar
-    # multiplication.
-    return list(dict.fromkeys([*attestation_keys, *rotation_keys]))
+    # multiplication. Emergency-revoked bytes are dropped from the union.
+    return [
+        key
+        for key in dict.fromkeys([*attestation_keys, *rotation_keys])
+        if key not in emergency_revoked
+    ]
 
 
 def authenticate(session: Session, request, body: bytes) -> str:

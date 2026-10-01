@@ -71,6 +71,10 @@ EVIDENCE_BUNDLES_CURSOR_VERSION = "eb1"
 #: rotations.
 AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION = "ak1"
 
+#: Marker for cursors that page through one actor's authentication-key
+#: revocations.
+AUTHENTICATION_KEY_REVOCATIONS_CURSOR_VERSION = "akv1"
+
 #: Marker for cursors that page through one attestation's access grants.
 ATTESTATION_ACCESS_GRANTS_CURSOR_VERSION = "ag1"
 
@@ -560,6 +564,17 @@ def _validate_authentication_key_rotations_claims(claims: dict[str, Any]) -> Non
 #: ``GET /v1/actors/{actor_id}/authentication-key-rotations``.
 AUTHENTICATION_KEY_ROTATIONS_CURSOR = CursorKind(
     version=AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION,
+    claim_fields=("actor_id", "limit", "offset"),
+    validate=_validate_authentication_key_rotations_claims,
+)
+
+
+#: Cursor family for
+#: ``GET /v1/actors/{actor_id}/authentication-key-revocations``: the same
+#: bound claims (one subject, the effective limit, the position) as the
+#: rotation family, under its own version marker so the families never mix.
+AUTHENTICATION_KEY_REVOCATIONS_CURSOR = CursorKind(
+    version=AUTHENTICATION_KEY_REVOCATIONS_CURSOR_VERSION,
     claim_fields=("actor_id", "limit", "offset"),
     validate=_validate_authentication_key_rotations_claims,
 )

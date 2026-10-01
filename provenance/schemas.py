@@ -3851,3 +3851,54 @@ class AuthenticationKeyRotationPageResponse(BaseModel):
     count: int
     #: Opaque server cursor for the next page, or null on the final page.
     next_cursor: str | None = None
+
+
+class AuthenticationKeyRevocationCreate(BaseModel):
+    # An emergency revocation carries exactly its declared material. There
+    # is deliberately no field capable of carrying a private key or a raw
+    # signature: undeclared fields are rejected rather than silently dropped.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The subject revoking the key. The authenticated caller must be this
+    #: same actor.
+    actor_id: str = Field(..., min_length=1, max_length=255)
+    #: Base64 Ed25519 public key; must decode to exactly 32 bytes.
+    public_key: bytes
+    #: The emergency category of the revocation.
+    reason: Literal["compromised", "superseded", "policy"]
+
+    @field_validator("actor_id")
+    @classmethod
+    def _actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "actor_id")
+
+    @field_validator("public_key", mode="before")
+    @classmethod
+    def _public_key_is_32_bytes(cls, v: Any) -> bytes:
+        return _decode_base64(v, "public_key", PUBLIC_KEY_LENGTH)
+
+
+class AuthenticationKeyRevocationResponse(BaseModel):
+    """Public revocation view: subject, public key, reason, and UTC time."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    #: The subject who owns the revoked key.
+    actor_id: str
+    #: Base64 of the 32-byte Ed25519 public key.
+    public_key: str
+    #: The emergency category recorded at creation.
+    reason: str
+    #: The UTC instant the key left the subject's authentication set.
+    revoked_at: datetime
+
+
+class AuthenticationKeyRevocationPageResponse(BaseModel):
+    """A cursor-paginated page of revocation public views for one subject."""
+
+    items: list[AuthenticationKeyRevocationResponse]
+    #: Total number of the subject's revocations, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None

@@ -568,6 +568,36 @@ class AttestationAccessGrantExpiryConflictError(DomainError):
         super().__init__(details={"grant_id": grant_id})
 
 
+class AuthenticationKeyRevocationNotFoundError(DomainError):
+    status_code = 404
+    code = "authentication_key_revocation_not_found"
+    message = "The requested authentication key revocation does not exist."
+
+    def __init__(self, revocation_id: str):
+        super().__init__(details={"revocation_id": revocation_id})
+
+
+class AuthenticationKeyRevocationConflictError(DomainError):
+    """A second, different reason for an already-revoked subject/key pair.
+
+    A subject's emergency revocation of one public key is immutable: a
+    submission carrying a reason different from the pair's existing
+    revocation is a conflict, not a replacement, and writes neither a
+    revocation nor an audit event. A retry carrying the same reason is
+    instead the normal 200 idempotent return of the original record.
+    """
+
+    status_code = 409
+    code = "authentication_key_revocation_conflict"
+    message = (
+        "The public key is already revoked for this actor with a different"
+        " reason."
+    )
+
+    def __init__(self, actor_id: str):
+        super().__init__(details={"actor_id": actor_id})
+
+
 class ProtectedResourceNotFoundError(DomainError):
     """Opaque 404 for the protected read route.
 
