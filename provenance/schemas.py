@@ -1002,6 +1002,26 @@ class ContentRelationPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ContentLineagePathResponse(BaseModel):
+    """The deterministic shortest lineage path between two contents.
+
+    ``nodes`` carries the content public views in traversal order (start
+    first, end last) and ``relations`` the relation public views in the same
+    traversal order, so ``nodes`` always has exactly one more entry than
+    ``depth`` when a path was found. When no path exists within the depth
+    limit, ``found`` is false, ``depth`` is null, and both lists are empty.
+    """
+
+    start_content_id: str
+    end_content_id: str
+    direction: str
+    found: bool
+    #: Number of relations on the path; null when no path was found.
+    depth: int | None
+    nodes: list[ContentResponse]
+    relations: list[ContentRelationResponse]
+
+
 class AttestationCreate(BaseModel):
     # Attestation requests carry exactly the declared verification material;
     # undeclared fields are rejected rather than silently discarded.

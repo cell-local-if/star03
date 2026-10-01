@@ -5422,3 +5422,105 @@ def get_content_lineage(
         (by_id[reached_id], reached_depth, relation_type)
         for reached_id, (reached_depth, relation_type) in reached.items()
     ]
+
+
+def find_content_lineage_path(
+    session: Session,
+    start_content_id: str,
+    end_content_id: str,
+    direction: str,
+    max_depth: int = DEFAULT_LINEAGE_MAX_DEPTH,
+) -> tuple[list[Content], list[ContentRelation]] | None:
+    """Return the deterministic shortest lineage path between two contents.
+
+    The path follows at most ``max_depth`` direct relations from the start
+    content to the end content: ``ancestors`` walks ``content_id ->
+    parent_content_id``, ``descendants`` walks the reverse. The result is
+    ``(nodes, relations)`` in traversal order (start first, end last), so
+    ``nodes`` has exactly one more entry than ``relations``. An identical
+    start and end is the trivial path ``([start], [])``. ``None`` is
+    returned when the end is not reachable within ``max_depth`` edges; that
+    is a result, not an error.
+
+    Among the shortest paths, the one whose relation id sequence is
+    lexicographically smallest is returned, making the choice deterministic
+    and independent of insertion order. Both endpoints must exist or
+    :class:`ContentNotFoundError` is raised before any traversal. The search
+    is strictly read-only and terminates even if anomalous history contains
+    a cycle (the distance layers strictly decrease along the returned path).
+    """
+    # Both endpoints are resolved before any traversal; a missing one is a
+    # missing resource, never an empty path result.
+    start = _require_content(session, start_content_id)
+    _require_content(session, end_content_id)
+
+    if start_content_id == end_content_id:
+        return [start], []
+
+    relations = list(
+        session.execute(
+            select(ContentRelation).order_by(*_CONTENT_RELATION_ORDER)
+        ).scalars().all()
+    )
+    # Forward and reverse adjacency along the traversal direction.
+    forward: dict[str, list[tuple[ContentRelation, str]]] = {}
+    backward: dict[str, list[str]] = {}
+    for relation in relations:
+        if direction == LINEAGE_ANCESTORS:
+            source_id = relation.content_id
+            neighbor_id = relation.parent_content_id
+        else:
+            source_id = relation.parent_content_id
+            neighbor_id = relation.content_id
+        forward.setdefault(source_id, []).append((relation, neighbor_id))
+        backward.setdefault(neighbor_id, []).append(source_id)
+
+    # Reverse breadth-first layers from the end: each node's shortest
+    # distance (in edges) to the end, bounded by ``max_depth``.
+    dist_to_end: dict[str, int] = {end_content_id: 0}
+    frontier = [end_content_id]
+    for depth in range(1, max_depth + 1):
+        if not frontier:
+            break
+        next_frontier: list[str] = []
+        for node_id in frontier:
+            for source_id in backward.get(node_id, []):
+                if source_id in dist_to_end:
+                    continue
+                dist_to_end[source_id] = depth
+                next_frontier.append(source_id)
+        frontier = next_frontier
+
+    path_depth = dist_to_end.get(start_content_id)
+    if path_depth is None:
+        # Unreachable within the depth limit: a result, not an error.
+        return None
+
+    # Greedy forward walk: every node on a shortest path sits exactly one
+    # distance layer closer to the end than its predecessor, so choosing the
+    # smallest relation id among the edges that drop one layer yields the
+    # lexicographically smallest relation id sequence.
+    path_relations: list[ContentRelation] = []
+    path_node_ids = [start_content_id]
+    current_id = start_content_id
+    for step in range(path_depth):
+        remaining = path_depth - step - 1
+        relation, neighbor_id = min(
+            (
+                (relation, neighbor_id)
+                for relation, neighbor_id in forward.get(current_id, [])
+                if dist_to_end.get(neighbor_id) == remaining
+            ),
+            key=lambda edge: edge[0].id,
+        )
+        path_relations.append(relation)
+        path_node_ids.append(neighbor_id)
+        current_id = neighbor_id
+
+    contents = (
+        session.execute(select(Content).where(Content.id.in_(path_node_ids)))
+        .scalars()
+        .all()
+    )
+    by_id = {content.id: content for content in contents}
+    return [by_id[node_id] for node_id in path_node_ids], path_relations

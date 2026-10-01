@@ -179,6 +179,7 @@ from provenance.schemas import (
     ContentExportVerificationCreate,
     ContentExportVerificationResponse,
     ContentLineageItem,
+    ContentLineagePathResponse,
     ContentLineageResponse,
     ContentPageResponse,
     ContentRelationCreate,
@@ -775,6 +776,21 @@ def _parse_once(raw, field: str) -> str | None:
     return values[0] if values else None
 
 
+def _parse_required_nonempty(raw, field: str) -> str:
+    """Parse a required non-empty string query parameter, at most once."""
+    value = _parse_once(raw, field)
+    if value is None:
+        raise _query_validation_error(
+            field, "Field required", "value_error.missing"
+        )
+    if not value.strip():
+        # Blank/whitespace values are invalid rather than looked up.
+        raise _query_validation_error(
+            field, f"{field} must not be empty", "value_error"
+        )
+    return value
+
+
 def _parse_int_param(raw, field: str, default: int, minimum: int, maximum: int):
     """Parse a strictly-formatted integer query parameter in [minimum, maximum]."""
     value = _parse_once(raw, field)
@@ -943,6 +959,115 @@ def get_content_lineage(
         count=total,
         next_cursor=next_cursor,
     )
+
+
+_CONTENT_LINEAGE_PATH_PARAMS = frozenset(
+    {
+        "start_content_id",
+        "end_content_id",
+        "direction",
+        "max_depth",
+    }
+)
+
+
+@router.get("/content-lineage-paths")
+async def get_content_lineage_path(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only deterministic shortest-path query between two contents. The
+    # GET request body must be empty: carrying any bytes (even whitespace or
+    # malformed JSON) is a 422 validated before any parameter or content is
+    # read. Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank required value
+    # is never coerced to a default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _CONTENT_LINEAGE_PATH_PARAMS
+    if unknown:
+        # A typo (e.g. ``start_id``) never silently changes the query.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    start_content_id = _parse_required_nonempty(raw, "start_content_id")
+    end_content_id = _parse_required_nonempty(raw, "end_content_id")
+
+    direction = _parse_once(raw, "direction")
+    if direction is None:
+        raise _query_validation_error(
+            "direction", "Field required", "value_error.missing"
+        )
+    if direction not in service.LINEAGE_DIRECTIONS:
+        # Covers blank/whitespace values and any spelling other than the two
+        # literal traversal directions; no value is ever normalized.
+        raise _query_validation_error(
+            "direction",
+            "direction must be 'ancestors' or 'descendants'",
+            "value_error",
+        )
+
+    max_depth = _parse_int_param(
+        raw,
+        "max_depth",
+        service.DEFAULT_LINEAGE_MAX_DEPTH,
+        service.MIN_LINEAGE_MAX_DEPTH,
+        service.MAX_LINEAGE_MAX_DEPTH,
+    )
+
+    # Strictly read-only: the search writes no content, relation, resource,
+    # or audit event. Both endpoints must exist before any traversal; an end
+    # unreachable within the depth limit is a result (found=false), not an
+    # error. Among the shortest paths, the one with the lexicographically
+    # smallest relation id sequence is returned.
+    result = service.find_content_lineage_path(
+        session, start_content_id, end_content_id, direction, max_depth
+    )
+    if result is None:
+        found = False
+        depth: int | None = None
+        nodes = []
+        relations = []
+    else:
+        found = True
+        nodes, relations = result
+        depth = len(relations)
+
+    payload = ContentLineagePathResponse(
+        start_content_id=start_content_id,
+        end_content_id=end_content_id,
+        direction=direction,
+        found=found,
+        depth=depth,
+        nodes=[ContentResponse.model_validate(content) for content in nodes],
+        relations=[
+            ContentRelationResponse.model_validate(relation)
+            for relation in relations
+        ],
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated by
+    # exactly one newline; members appear as start_content_id,
+    # end_content_id, direction, found, depth, nodes, relations.
+    body = (
+        json.dumps(
+            payload.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 @router.post("/claims", response_model=ClaimResponse)
