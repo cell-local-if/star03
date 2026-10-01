@@ -191,6 +191,26 @@ class ContentLineageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ContentLineagePathResponse(BaseModel):
+    """A deterministic shortest lineage path between two contents.
+
+    ``nodes`` reuse the content public view in traversal order and
+    ``relations`` reuse the relation public view in traversal order;
+    ``depth`` is the number of relations, always one fewer than the number
+    of nodes. When the two contents are the same, the path is the single
+    node at depth 0. When no path exists within the depth bound, ``found``
+    is false, ``depth`` is null, and both sequences are empty.
+    """
+
+    start_content_id: str
+    end_content_id: str
+    direction: Literal["ancestors", "descendants"]
+    found: bool
+    depth: int | None
+    nodes: list[ContentResponse]
+    relations: list[ContentRelationResponse]
+
+
 class ClaimCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     actor_id: str = Field(..., min_length=1, max_length=255)

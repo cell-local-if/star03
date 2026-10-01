@@ -5422,3 +5422,143 @@ def get_content_lineage(
         (by_id[reached_id], reached_depth, relation_type)
         for reached_id, (reached_depth, relation_type) in reached.items()
     ]
+
+
+def find_content_lineage_path(
+    session: Session,
+    start_content_id: str,
+    end_content_id: str,
+    direction: str,
+    max_depth: int = DEFAULT_LINEAGE_MAX_DEPTH,
+) -> tuple[bool, int | None, list[Content], list[ContentRelation]]:
+    """Find the deterministic shortest lineage path between two contents.
+
+    Returns ``(found, depth, nodes, relations)``: ``nodes`` in traversal
+    order from start to end, ``relations`` in the same order, with exactly
+    one more node than relations. Ancestor traversal follows edges
+    ``content_id -> parent_content_id``; descendant traversal follows them
+    in reverse. Only paths of at most ``max_depth`` direct relations are
+    considered. When several paths share the shortest length, the one whose
+    relation-id string sequence compares lexicographically smallest is
+    returned: a forward BFS fixes the shortest depth, a backward BFS fixes
+    each node's remaining distance to the target, and the reconstruction
+    takes the smallest-id edge that still admits a shortest completion at
+    every step, so ties are resolved greedily from the first edge onward.
+
+    Same endpoints yield ``(True, 0, [start], [])`` without any edge query.
+    Unreachability within the bound yields
+    ``(False, None, [], [])`` and is not an error. Both endpoints must
+    exist (start checked first) or :class:`ContentNotFoundError` is raised.
+    Like the multi-hop lineage walk this is strictly read-only; visited
+    sets bound the search and make anomalous cyclic history terminate.
+    """
+    # Both endpoints must exist before any edge is searched; the start is
+    # resolved first so its absence is reported with its own id.
+    start = _require_content(session, start_content_id)
+    if end_content_id == start_content_id:
+        return True, 0, [start], []
+    _require_content(session, end_content_id)
+
+    if direction == LINEAGE_ANCESTORS:
+        source_col = ContentRelation.content_id
+        neighbor_col = ContentRelation.parent_content_id
+    else:
+        source_col = ContentRelation.parent_content_id
+        neighbor_col = ContentRelation.content_id
+
+    # Forward BFS: every node reached at its shortest distance (in edges)
+    # from the start. Expansion stops at the first level that discovers the
+    # target; longer levels cannot contribute a shortest path. The map also
+    # serves as the visited set that makes anomalous cycles terminate.
+    visited: set[str] = {start_content_id}
+    frontier: list[str] = [start_content_id]
+    target_depth: int | None = None
+    for depth in range(1, max_depth + 1):
+        if not frontier:
+            break
+        rows = session.execute(
+            select(neighbor_col).where(source_col.in_(frontier))
+        ).all()
+        next_frontier: list[str] = []
+        for (neighbor_id,) in rows:
+            if neighbor_id in visited:
+                # Already reached at an equal or shorter depth; also what
+                # makes an anomalous cycle terminate.
+                continue
+            visited.add(neighbor_id)
+            next_frontier.append(neighbor_id)
+            if neighbor_id == end_content_id and target_depth is None:
+                target_depth = depth
+        frontier = next_frontier
+        if target_depth is not None:
+            break
+
+    if target_depth is None:
+        # Unreachable within max_depth: an empty result, not an error.
+        return False, None, [], []
+
+    # Backward BFS over the same directed edges (predecessors point back
+    # along source_col) bounded by the shortest target depth: the remaining
+    # distance to the target for every node that can finish a shortest path.
+    dist_to: dict[str, int] = {end_content_id: 0}
+    frontier = [end_content_id]
+    for depth in range(1, target_depth + 1):
+        if not frontier:
+            break
+        rows = session.execute(
+            select(source_col).where(neighbor_col.in_(frontier))
+        ).all()
+        next_frontier = []
+        for (predecessor_id,) in rows:
+            if predecessor_id not in dist_to:
+                dist_to[predecessor_id] = depth
+                next_frontier.append(predecessor_id)
+        frontier = next_frontier
+
+    # Greedy reconstruction: at each node choose the smallest relation id
+    # among edges whose neighbor still admits a shortest completion. The
+    # first differing edge decides the lexicographic order, so this greedy
+    # choice yields the globally smallest relation-id sequence.
+    chosen_relations: list[ContentRelation] = []
+    node_ids: list[str] = [start_content_id]
+    current_id = start_content_id
+    for step in range(target_depth):
+        wanted_remaining = target_depth - step - 1
+        edges = (
+            session.execute(
+                select(ContentRelation)
+                .where(source_col == current_id)
+                .order_by(ContentRelation.id.asc())
+            )
+            .scalars()
+            .all()
+        )
+        chosen = None
+        for edge in edges:
+            neighbor_id = (
+                edge.parent_content_id
+                if direction == LINEAGE_ANCESTORS
+                else edge.content_id
+            )
+            if dist_to.get(neighbor_id) == wanted_remaining:
+                chosen = edge
+                break
+        if chosen is None:
+            # Defensive: the two BFS maps guarantee a completion exists.
+            return False, None, [], []
+        chosen_relations.append(chosen)
+        current_id = (
+            chosen.parent_content_id
+            if direction == LINEAGE_ANCESTORS
+            else chosen.content_id
+        )
+        node_ids.append(current_id)
+
+    contents = (
+        session.execute(select(Content).where(Content.id.in_(node_ids)))
+        .scalars()
+        .all()
+    )
+    by_id = {content.id: content for content in contents}
+    nodes = [by_id[node_id] for node_id in node_ids]
+    return True, target_depth, nodes, chosen_relations
