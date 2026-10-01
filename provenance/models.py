@@ -51,6 +51,7 @@ EVENT_ATTESTATION_ACCESS_GRANT_EXPIRY_SCHEDULED = (
 EVENT_CONTENT_RELATION_CREATED = "content_relation.created"
 EVENT_AUTHENTICATION_KEY_ROTATED = "authentication_key.rotated"
 EVENT_AUTHENTICATION_KEY_RETIRED = "authentication_key.retired"
+EVENT_AUTHENTICATION_KEY_REVOKED = "authentication_key.revoked"
 EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED = "evidence_bundle.exchange_imported"
 EVENT_AUDIT_CHECKPOINT_IMPORTED = "audit.checkpoint_imported"
 EVENT_CSP_CHECKPOINT_IMPORTED = "csp.checkpoint_imported"
@@ -65,6 +66,18 @@ EVENT_CONTENT_EXPORT_JOB_RUN = "content_export_job.run"
 EVENT_ACTOR_TRUST_POLICY_CREATED = "actor_trust_policy.created"
 EVENT_AUDIT_CHECKPOINT_JOB_CREATED = "audit_checkpoint_job.created"
 EVENT_AUDIT_CHECKPOINT_JOB_RUN = "audit_checkpoint_job.run"
+
+# Allowed emergency-revocation reasons for an authentication public key.
+REVOCATION_REASON_COMPROMISED = "compromised"
+REVOCATION_REASON_SUPERSEDED = "superseded"
+REVOCATION_REASON_POLICY = "policy"
+AUTHENTICATION_KEY_REVOCATION_REASONS = frozenset(
+    {
+        REVOCATION_REASON_COMPROMISED,
+        REVOCATION_REASON_SUPERSEDED,
+        REVOCATION_REASON_POLICY,
+    }
+)
 
 # Content export job lifecycle states. A job is created ``pending``; a run
 # atomically claims it into ``running`` and then settles it as
@@ -678,6 +691,69 @@ class AuthenticationKeyRotation(Base):
     #: audit event; null while the key is active.
     retired_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime, nullable=True
+    )
+
+    actor: Mapped[Actor] = relationship()
+
+
+class AuthenticationKeyRevocation(Base):
+    """An immutable emergency revocation of one registered authentication key.
+
+    A revocation is an append-only statement by the owning subject that one
+    of its registered 32-byte Ed25519 public keys -- whether carried by an
+    attestation or introduced by a rotation -- must no longer authenticate
+    any protected request. It neither mutates nor deletes the attestation
+    or rotation records that registered the key: the original registrations
+    and their audit relationships are preserved, and a rotation's idempotent
+    re-submission still returns its original record without restoring the
+    key. Only the public key is ever received or stored: there is no field
+    capable of carrying a private key or a raw signature.
+
+    The ``(actor_id, public_key)`` pair is unique, so a retried submission
+    for the same subject, key, and reason returns the original record and a
+    different reason for the same pair is a conflict rather than a second
+    record. Revocations are append-only; there is deliberately no update or
+    delete path.
+    """
+
+    __tablename__ = "authentication_key_revocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id",
+            "public_key",
+            name="uq_authentication_key_revocations_identity",
+        ),
+        Index(
+            "ix_authentication_key_revocations_actor_order",
+            "actor_id",
+            "created_at",
+            "seq",
+        ),
+        Index(
+            "ix_authentication_key_revocations_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("akv_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The subject who owns the key and whose signature authenticated the
+    #: request; the caller is always this actor.
+    actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: The 32 raw Ed25519 public-key bytes (Base64 on the wire).
+    public_key: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    #: One of "compromised", "superseded", or "policy".
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: The UTC instant the key was revoked (rendered as ``revoked_at``).
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
     )
 
     actor: Mapped[Actor] = relationship()

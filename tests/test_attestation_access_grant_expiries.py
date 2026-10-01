@@ -577,7 +577,7 @@ def test_expiry_persists_across_restart(tmp_db_url, file_client):
         assert [r[0] for r in rows] == [created["id"]]
         assert [r[1] for r in rows] == [grant["id"]]
         assert audits == 1
-        assert [v[0] for v in versions] == [1, 2]
+        assert [v[0] for v in versions] == [1, 2, 3]
 
 
 def test_concurrent_identical_expiries_yield_one_record_and_audit(
@@ -724,7 +724,9 @@ def test_legacy_v1_database_gains_the_expiry_table(tmp_path):
         con.close()
 
     with TestClient(create_app(Settings(database_url=url))):
-        # Startup migrates the simulated pre-v2 database to version 2.
+        # Startup migrates the simulated pre-v2 database to the latest
+        # version (v2 restores the expiry table; v3 adds the
+        # authentication-key revocation table).
         pass
     con = _sqlite3.connect(db_path)
     try:
@@ -740,6 +742,6 @@ def test_legacy_v1_database_gains_the_expiry_table(tmp_path):
             for r in con.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
-        ] == [1, 2]
+        ] == [1, 2, 3]
     finally:
         con.close()

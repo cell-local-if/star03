@@ -399,6 +399,35 @@ class ContentExportRequestConflictError(DomainError):
         super().__init__(details={"request_id": request_id})
 
 
+class AuthenticationKeyRevocationNotFoundError(DomainError):
+    status_code = 404
+    code = "authentication_key_revocation_not_found"
+    message = "The requested authentication key revocation does not exist."
+
+    def __init__(self, revocation_id: str):
+        super().__init__(details={"revocation_id": revocation_id})
+
+
+class AuthenticationKeyRevocationConflictError(DomainError):
+    """A second, different-reason revocation for an already-revoked key.
+
+    A subject/key pair carries at most one immutable revocation: a
+    submission carrying a reason different from the pair's existing
+    revocation is a conflict, not a replacement, and writes neither a
+    record nor an audit event. A retry carrying the same reason is instead
+    the normal 200 idempotent return of the original record.
+    """
+
+    status_code = 409
+    code = "authentication_key_revocation_conflict"
+    message = (
+        "The public key already has a revocation with a different reason."
+    )
+
+    def __init__(self, actor_id: str):
+        super().__init__(details={"actor_id": actor_id})
+
+
 class ActorTrustPolicyConflictError(DomainError):
     """A second, different trust policy for a subject that already has one.
 

@@ -23,8 +23,11 @@ with three headers:
 The signature is accepted if it verifies under **any** public key of a
 non-revoked attestation created by the calling actor, or under an active
 authentication key the actor introduced through a key rotation (a retired
-rotation key never authenticates). Revoked attestation keys never
-authenticate, regardless of the target the request operates on.
+rotation key never authenticates) -- in both cases only while the key
+carries no authentication-key revocation. Revoked attestation keys never
+authenticate, regardless of the target the request operates on, and an
+emergency-revoked key never authenticates either, whether it was carried
+by an attestation or introduced by a rotation.
 
 Failures split into two categories:
 
@@ -55,6 +58,7 @@ from provenance import ed25519
 from provenance.models import (
     Attestation,
     AttestationRevocation,
+    AuthenticationKeyRevocation,
     AuthenticationKeyRotation,
 )
 
@@ -156,20 +160,34 @@ def _actor_public_keys(session: Session, actor_id: str) -> list[bytes]:
     The set is the union of:
 
     * public keys of the actor's attestations carrying no revocation, and
-    * public keys of the actor's active (non-retired) key rotations.
+    * public keys of the actor's active (non-retired) key rotations,
 
-    A rotated key therefore authenticates without any attestation, an
-    existing non-revoked attestation key keeps working, and a retired
-    rotation key -- like a revoked attestation key -- never authenticates.
+    minus every key the actor has emergency-revoked. A rotated key
+    therefore authenticates without any attestation, an existing
+    non-revoked attestation key keeps working, and a retired rotation key
+    -- like a revoked attestation key or an emergency-revoked key -- never
+    authenticates.
     """
     revoked = exists().where(
         AttestationRevocation.attestation_id == Attestation.id
+    )
+    # Correlated per source row: the key bytes carry an emergency
+    # revocation recorded by this actor.
+    attestation_key_revoked = exists().where(
+        AuthenticationKeyRevocation.actor_id == actor_id,
+        AuthenticationKeyRevocation.public_key == Attestation.public_key,
+    )
+    rotation_key_revoked = exists().where(
+        AuthenticationKeyRevocation.actor_id == actor_id,
+        AuthenticationKeyRevocation.public_key
+        == AuthenticationKeyRotation.public_key,
     )
     attestation_keys = (
         session.execute(
             select(Attestation.public_key).where(
                 Attestation.signer_actor_id == actor_id,
                 ~revoked,
+                ~attestation_key_revoked,
             )
         )
         .scalars()
@@ -180,6 +198,7 @@ def _actor_public_keys(session: Session, actor_id: str) -> list[bytes]:
             select(AuthenticationKeyRotation.public_key).where(
                 AuthenticationKeyRotation.actor_id == actor_id,
                 AuthenticationKeyRotation.active.is_(True),
+                ~rotation_key_revoked,
             )
         )
         .scalars()

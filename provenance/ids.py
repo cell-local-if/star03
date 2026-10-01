@@ -238,6 +238,27 @@ def authentication_key_rotation_id(
     return "akr_" + hashlib.sha256(material).hexdigest()
 
 
+def authentication_key_revocation_id(
+    actor_id: str, public_key_hex: str
+) -> str:
+    """Return a stable ``akv_``-prefixed identifier for a key revocation.
+
+    The identity is exactly the idempotency key: the subject and the revoked
+    public key (each subject/key pair carries at most one revocation, so a
+    retried submission maps to the same record and id, and a different
+    reason maps to the same id and is rejected as a conflict). A private key
+    or a raw signature never enters the material. The material is a
+    canonical JSON array so fields containing separators cannot collide with
+    different field splits.
+    """
+    material = json.dumps(
+        ["authentication_key_revocation", actor_id, public_key_hex],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "akv_" + hashlib.sha256(material).hexdigest()
+
+
 def exchange_import_id(
     manifest_version: str,
     evidence_bundle_id: str,

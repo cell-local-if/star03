@@ -33,6 +33,8 @@ from provenance.errors import (
     AttestationNotFoundError,
     AttestationRevocationNotFoundError,
     AttestationVerificationError,
+    AuthenticationKeyRevocationConflictError,
+    AuthenticationKeyRevocationNotFoundError,
     ClaimNotFoundError,
     ClaimSupersessionNotFoundError,
     ClaimSupersessionValidationError,
@@ -79,6 +81,7 @@ from provenance.models import (
     EVENT_AUDIT_EXCHANGE_IMPORTED,
     EVENT_AUDIT_RECON_IMPORTED,
     EVENT_AUTHENTICATION_KEY_RETIRED,
+    EVENT_AUTHENTICATION_KEY_REVOKED,
     EVENT_AUTHENTICATION_KEY_ROTATED,
     EVENT_CLAIM_CREATED,
     EVENT_CLAIM_SUPERSEDED,
@@ -98,6 +101,7 @@ from provenance.models import (
     AttestationAccessGrantExpiry,
     AttestationAccessGrantRevocation,
     AttestationRevocation,
+    AuthenticationKeyRevocation,
     AuthenticationKeyRotation,
     AuditEvent,
     AuditCheckpointJob,
@@ -126,6 +130,7 @@ from provenance.schemas import (
     AuditCheckpointJobCreate,
     AuditExchangeImportCreate,
     AuditReconExchangeImportCreate,
+    AuthenticationKeyRevocationCreate,
     AuthenticationKeyRotationCreate,
     ClaimCreate,
     ClaimSupersessionCreate,
@@ -2407,6 +2412,170 @@ def retire_authentication_key_rotation(
     # onto the identity-map object before returning it.
     session.refresh(rotation)
     return rotation
+
+
+DEFAULT_AUTHENTICATION_KEY_REVOCATIONS_LIMIT = 50
+MIN_AUTHENTICATION_KEY_REVOCATIONS_LIMIT = 1
+MAX_AUTHENTICATION_KEY_REVOCATIONS_LIMIT = 100
+
+_AUTHENTICATION_KEY_REVOCATION_ORDER = (
+    AuthenticationKeyRevocation.created_at.asc(),
+    AuthenticationKeyRevocation.seq.asc(),
+)
+
+
+def _authentication_key_registered(
+    session: Session, actor_id: str, public_key: bytes
+) -> bool:
+    """True when the key bytes are registered for the subject.
+
+    Registration means the key is carried by any of the subject's
+    attestations (revoked or not) or introduced by any of the subject's
+    rotations (active or retired): an emergency revocation may target a key
+    that has already left the authentication set, but never a key the
+    subject never registered.
+    """
+    in_attestation = select(
+        exists().where(
+            Attestation.signer_actor_id == actor_id,
+            Attestation.public_key == public_key,
+        )
+    )
+    if session.execute(in_attestation).scalar():
+        return True
+    in_rotation = select(
+        exists().where(
+            AuthenticationKeyRotation.actor_id == actor_id,
+            AuthenticationKeyRotation.public_key == public_key,
+        )
+    )
+    return bool(session.execute(in_rotation).scalar())
+
+
+def create_authentication_key_revocation(
+    session: Session,
+    payload: AuthenticationKeyRevocationCreate,
+    caller_actor_id: str,
+) -> tuple[AuthenticationKeyRevocation, bool]:
+    """Emergency-revoke a registered authentication key, ``(record, created)``.
+
+    The authenticated caller is the subject: ``payload.actor_id`` must be
+    the caller and the subject must already exist; an unknown subject or a
+    caller/body mismatch is a ``422`` validation error and writes nothing.
+    The target key must be registered for the subject (carried by one of
+    its attestations or introduced by one of its rotations, in any
+    lifecycle state); an unregistered key is a ``422`` validation error and
+    likewise writes nothing. The key being revoked may itself authenticate
+    the request: authentication is evaluated against the key set as it
+    stands before the revocation commits.
+
+    Each subject/key pair carries at most one revocation: a repeat
+    submission of the same subject, key, and reason returns the original
+    record with ``created=False`` and writes no row or audit event, while
+    the same pair with a different reason is a ``409
+    authentication_key_revocation_conflict`` and likewise writes nothing.
+    On first creation the row and its ``authentication_key.revoked`` audit
+    event commit in a single transaction, and the key bytes immediately
+    leave the subject's authentication set for the protected routes.
+    """
+    # Validate the subject before the identity lookup: an unknown subject
+    # and a caller/body mismatch are 422s, not 404s.
+    actor = session.get(Actor, payload.actor_id)
+    if actor is None:
+        raise ProtectedAccessValidationError("unknown_actor")
+
+    if payload.actor_id != caller_actor_id:
+        raise ProtectedAccessValidationError("actor_mismatch")
+
+    if not _authentication_key_registered(
+        session, payload.actor_id, payload.public_key
+    ):
+        raise ProtectedAccessValidationError("unknown_public_key")
+
+    existing = session.execute(
+        select(AuthenticationKeyRevocation).where(
+            AuthenticationKeyRevocation.actor_id == payload.actor_id,
+            AuthenticationKeyRevocation.public_key == payload.public_key,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.reason == payload.reason:
+            # Idempotent retry: the original record, no new write or audit.
+            return existing, False
+        # A revocation is never updated, replaced, or re-reasoned.
+        raise AuthenticationKeyRevocationConflictError(payload.actor_id)
+
+    revocation = AuthenticationKeyRevocation(
+        id=ids.authentication_key_revocation_id(
+            payload.actor_id, payload.public_key.hex()
+        ),
+        actor_id=payload.actor_id,
+        public_key=payload.public_key,
+        reason=payload.reason,
+    )
+    session.add(revocation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_AUTHENTICATION_KEY_REVOKED,
+            resource_id=revocation.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent revocation for the same subject and key won the race.
+        session.rollback()
+        raced = session.execute(
+            select(AuthenticationKeyRevocation).where(
+                AuthenticationKeyRevocation.actor_id == payload.actor_id,
+                AuthenticationKeyRevocation.public_key == payload.public_key,
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if raced.reason == payload.reason:
+            return raced, False
+        raise AuthenticationKeyRevocationConflictError(payload.actor_id)
+    session.refresh(revocation)
+    return revocation, True
+
+
+def get_authentication_key_revocation(
+    session: Session, revocation_id: str
+) -> AuthenticationKeyRevocation:
+    """Return one revocation by id, or raise ``authentication_key_revocation_not_found``.
+
+    Strictly read-only: no record, resource, or audit event is written.
+    """
+    revocation = session.execute(
+        select(AuthenticationKeyRevocation).where(
+            AuthenticationKeyRevocation.id == revocation_id
+        )
+    ).scalar_one_or_none()
+    if revocation is None:
+        raise AuthenticationKeyRevocationNotFoundError(revocation_id)
+    return revocation
+
+
+def list_authentication_key_revocations_for_actor(
+    session: Session, actor_id: str
+) -> list[AuthenticationKeyRevocation]:
+    """Return one existing subject's revocations in stable creation order.
+
+    Results follow the revocations' stable creation order (``created_at``
+    with the monotonic ``seq`` tiebreaker). The subject must exist; an
+    unknown actor is a missing resource (``unknown_actor`` 404), not an
+    empty collection. The function is strictly read-only: it writes no
+    revocation, resource, or audit event.
+    """
+    if session.get(Actor, actor_id) is None:
+        raise UnknownActorError(actor_id)
+    stmt = (
+        select(AuthenticationKeyRevocation)
+        .where(AuthenticationKeyRevocation.actor_id == actor_id)
+        .order_by(*_AUTHENTICATION_KEY_REVOCATION_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
 
 
 def get_content_export(
