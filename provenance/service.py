@@ -51,6 +51,7 @@ from provenance.errors import (
     ObservabilityUnavailableError,
     ProtectedAccessValidationError,
     ProtectedResourceNotFoundError,
+    TrustEvaluationBatchTargetNotFoundError,
     UnknownActorError,
 )
 from provenance.models import (
@@ -138,6 +139,7 @@ from provenance.schemas import (
     EvidenceBundleImportCreate,
     ImpactReconExchangeImportCreate,
     RevocationImpactImportCreate,
+    TrustEvaluationBatchRequest,
 )
 from provenance.time_utils import utc_now
 
@@ -4943,6 +4945,58 @@ def evaluate_trust(
             else TRUST_DECISION_UNTRUSTED
         ),
     }
+
+
+def evaluate_trust_batch(
+    session: Session, payload: TrustEvaluationBatchRequest
+) -> list[dict]:
+    """Evaluate trust for 1..100 targets with the single-target semantics.
+
+    Every item is structurally validated by the caller before this function
+    runs, so here existence is resolved first, strictly in request order:
+    the first target that is missing, or whose declared type does not match
+    an existing resource, fails the whole batch with one type-matched
+    :class:`TrustEvaluationBatchTargetNotFoundError`, and no later target
+    (and no signer count) is read. This preserves the single-target rule
+    that validation precedes existence and existence precedes counting.
+
+    Once every target exists, each result is computed exactly as in
+    :func:`evaluate_trust` -- verified, non-revoked attestations of the
+    exact target, deduplicated by signing actor -- including for repeated
+    items: duplicates are never merged or dropped, results keep the input
+    order, and each item's own ``min_signers`` decides its verdict. The
+    function is strictly read-only: it writes no resource, task, or audit
+    event, so a repeated batch returns the same results for the same state.
+    """
+    for item in payload.items:
+        try:
+            _require_trust_target(session, item.target_type, item.target_id)
+        except (ClaimNotFoundError, EvidenceBundleNotFoundError):
+            # The whole batch is one 404 keyed on the first missing target,
+            # in request order, rather than one 404 per item.
+            raise TrustEvaluationBatchTargetNotFoundError(
+                item.target_type, item.target_id
+            ) from None
+
+    results = []
+    for item in payload.items:
+        qualified = _qualified_signer_count(
+            session, item.target_type, item.target_id
+        )
+        results.append(
+            {
+                "target_type": item.target_type,
+                "target_id": item.target_id,
+                "min_signers": item.min_signers,
+                "qualified_signer_count": qualified,
+                "decision": (
+                    TRUST_DECISION_TRUSTED
+                    if qualified >= item.min_signers
+                    else TRUST_DECISION_UNTRUSTED
+                ),
+            }
+        )
+    return results
 
 
 def create_actor_trust_policy(

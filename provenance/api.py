@@ -216,6 +216,8 @@ from provenance.schemas import (
     ExchangeManifestVerificationResponse,
     ObservabilitySummaryResponse,
     TrustDecisionResponse,
+    TrustEvaluationBatchRequest,
+    TrustEvaluationBatchResponse,
     TrustEvaluationResponse,
 )
 
@@ -762,6 +764,25 @@ def _query_validation_error(field: str, msg: str, error_type: str):
     return LineageValidationError(
         [{"loc": ["query", field], "msg": msg, "type": error_type}]
     )
+
+
+def _request_body_validation_error(exc: ValidationError) -> LineageValidationError:
+    """Render a manually-parsed body's pydantic errors as the uniform 422.
+
+    The body is parsed by hand (raw bytes -> JSON -> strict model) so the
+    route can reject malformed JSON before pydantic runs; its field errors
+    render with the same loc/msg/type issue shape as FastAPI's own body
+    validation failures.
+    """
+    issues = [
+        {
+            "loc": ["body", *(str(part) for part in error.get("loc", []))],
+            "msg": error.get("msg", ""),
+            "type": error.get("type", ""),
+        }
+        for error in exc.errors()
+    ]
+    return LineageValidationError(issues)
 
 
 def _parse_once(raw, field: str) -> str | None:
@@ -6265,6 +6286,64 @@ def evaluate_trust(
         session, target_type, target_id, threshold
     )
     return TrustEvaluationResponse(**result)
+
+
+_TRUST_EVALUATION_BATCHES_PARAMS = frozenset()
+
+
+@router.post("/trust-evaluation-batches")
+async def evaluate_trust_batch(
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # Read-only reviewer batch assessment: no authentication is required
+    # and the call creates no resource, task, or audit event, so repeated
+    # batches return identical results for the same state. Any query
+    # parameter is rejected before the body is parsed, exactly as an
+    # undeclared parameter is rejected on the single-target route.
+    unknown = set(request.query_params) - _TRUST_EVALUATION_BATCHES_PARAMS
+    if unknown:
+        # A typo (e.g. ``?min_signers=1``) never silently changes results.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    raw_body = await request.body()
+    try:
+        parsed = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # Empty body, invalid UTF-8, malformed JSON, or any non-object
+        # token (bare arrays/strings/numbers) is a 422 before any target
+        # is read; nothing is ever coerced from form data.
+        raise LineageValidationError(
+            [{"loc": ["body"], "msg": "invalid JSON body", "type": "json_error"}]
+        ) from None
+
+    try:
+        payload = TrustEvaluationBatchRequest.model_validate(parsed)
+    except ValidationError as exc:
+        # The whole structure (top level, every item, every field, the
+        # 1..100 cardinality) is validated up front: an empty batch, a
+        # wrong/extra/missing field, a non-object item, a non-literal
+        # target_type, a blank target_id, or a min_signers that is
+        # boolean/string/symbolic/fractional/exponential/out-of-range is a
+        # 422, and no target is ever looked up.
+        raise _request_body_validation_error(exc) from None
+
+    # Validation precedes existence: existence is resolved in request order
+    # and the first missing or type-mismatched target fails the whole batch
+    # with one type-matched 404 carrying that target's type and id.
+    results = service.evaluate_trust_batch(session, payload)
+    response = TrustEvaluationBatchResponse(
+        items=[TrustEvaluationResponse(**item) for item in results],
+        count=len(results),
+    )
+    # Compact UTF-8 JSON, integral numbers only, terminated by exactly one
+    # newline; members appear as items, count, and each item carries exactly
+    # the five single-target fields -- never a signature, attestation
+    # payload, claim payload, or content bytes.
+    return _compact_json_response(response, status.HTTP_200_OK)
 
 
 def _compact_json_response(model, status_code: int) -> Response:

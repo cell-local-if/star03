@@ -415,6 +415,32 @@ class ActorTrustPolicyConflictError(DomainError):
         super().__init__(details={"actor_id": actor_id})
 
 
+class TrustEvaluationBatchTargetNotFoundError(DomainError):
+    """The first missing target in a batch trust evaluation.
+
+    The whole batch is a single 404: existence is resolved in request order
+    after every item validates, and the first target that does not exist
+    (or whose declared type does not match) determines both the error code
+    and the details. The code is ``claim_not_found`` or
+    ``evidence_bundle_not_found`` exactly as on the single-target route;
+    ``details`` carries that target's ``target_type`` and verbatim
+    ``target_id``. The batch is read-only, so this failure writes nothing.
+    """
+
+    status_code = 404
+
+    def __init__(self, target_type: str, target_id: str):
+        if target_type == "claim":
+            self.code = "claim_not_found"
+            self.message = "The requested claim does not exist."
+        else:
+            self.code = "evidence_bundle_not_found"
+            self.message = "The requested evidence bundle does not exist."
+        super().__init__(
+            details={"target_type": target_type, "target_id": target_id}
+        )
+
+
 class ContentExportJobConflictError(DomainError):
     """A run against a job that is no longer pending.
 

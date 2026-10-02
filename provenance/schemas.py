@@ -18,6 +18,7 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    StrictStr,
     field_validator,
     model_validator,
 )
@@ -3736,6 +3737,64 @@ class TrustEvaluationResponse(BaseModel):
     qualified_signer_count: int
     #: ``"trusted"`` when ``qualified_signer_count >= min_signers``.
     decision: Literal["trusted", "untrusted"]
+
+
+class TrustEvaluationBatchItem(BaseModel):
+    """One target in a batch trust evaluation.
+
+    The item carries exactly its three declared fields; undeclared fields
+    are rejected rather than silently discarded. Types are strict: booleans
+    never stand in for integers and a number never stands in for a string.
+    ``target_id`` is matched verbatim (surrounding whitespace is part of
+    the identifier rather than trimmed); only a blank-after-strip value is
+    refused. ``min_signers`` is an optional pure decimal integer in
+    1..100, defaulting to 1 -- strings, booleans, fractions, and exponent
+    notation are rejected, never coerced.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_type: Literal["claim", "evidence_bundle"]
+    target_id: StrictStr
+    min_signers: StrictInt = Field(default=1, ge=1, le=100)
+
+    @field_validator("target_id")
+    @classmethod
+    def _target_id_nonblank(cls, v: str) -> str:
+        # Verbatim matching: only a wholly-blank identifier is rejected;
+        # surrounding whitespace on a non-blank id is never stripped.
+        if not v.strip():
+            raise ValueError("target_id must not be empty")
+        return v
+
+
+class TrustEvaluationBatchRequest(BaseModel):
+    """A batch of 1 to 100 trust evaluation targets.
+
+    The body carries exactly an ``items`` array; undeclared top-level
+    fields are rejected. Every element is validated exactly as a single
+    evaluation target before any target is looked up.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[TrustEvaluationBatchItem] = Field(
+        ..., min_length=1, max_length=100
+    )
+
+
+class TrustEvaluationBatchResponse(BaseModel):
+    """Batch result: one assessment per input item, in input order.
+
+    Duplicate targets are never merged: each input item gets its own
+    result entry. ``count`` equals the number of evaluated items
+    (``len(items)``). Like the single-target route, the batch is computed
+    live and creates neither a resource, task, nor audit event.
+    """
+
+    items: list[TrustEvaluationResponse]
+    #: Number of evaluation items (== len(items), duplicates retained).
+    count: int
 
 
 class ActorTrustPolicyCreate(BaseModel):
