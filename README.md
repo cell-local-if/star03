@@ -27,6 +27,19 @@ PROVENANCE_DATABASE_URL=sqlite:///./x.db python -m provenance
 
 The database location is taken from `--database-url`, then the `PROVENANCE_DATABASE_URL` environment variable, then the default. Tables are created automatically on first startup (parent directories included).
 
+## Logical database backup and restore
+
+The same database URL resolution (`--database-url`, then `PROVENANCE_DATABASE_URL`, then `sqlite:///./provenance.db`) drives two offline commands; the service entry point, `--host`, and `--port` are unchanged:
+
+```bash
+python -m provenance export-backup --database-url sqlite:///./provenance.db > backup.json
+python -m provenance restore-backup --database-url sqlite:///./restored.db < backup.json
+```
+
+`export-backup` reads an already-migrated database strictly read-only and writes one backup object to standard output, terminated by a single newline. The object is identified by `backup_version` 1 and `schema_version` 2 and carries every resource family's persisted fields — actors, contents, claims, supersessions, evidence bundles, attestations, revocations, access grants, grant revocations and expiries, key rotations, trust policies, content relations, audit events, exchange/checkpoint import receipts, asynchronous job state, and the migration ledger — each row in its stable persisted order, encoded under the existing UTC ISO-8601, standard-Base64, lowercase-hex-digest, and deterministic canonical-JSON rules. The package's `digest` member is the SHA-256 hex digest of the canonicalized `resources` member only. A backup never contains private keys, credentials, raw signatures, claim payloads, or content bytes. A failed export (missing, unreadable, or unmigrated database) reports `database_unavailable` on standard error, exits non-zero, and never produces half a backup.
+
+`restore-backup` reads exactly one JSON object from standard input. Empty input, invalid JSON, and missing, duplicated, or extra fields are `backup_validation_error`; an unsupported `backup_version`/`schema_version` is `backup_version_unsupported`; a digest that does not match the canonicalized resources is `backup_integrity_mismatch` — all reported on standard error with a non-zero exit. Only an empty target is written: a target holding any resource rows is `restore_target_not_empty`, except that a target already containing exactly the same backup succeeds without rewriting anything. A restore writes every resource, relation, audit event, job, and migration record in a single transaction, preserving the original identifiers, UTC timestamps, stable order, and references; any failure rolls the whole restore back, leaving no half-restored state. Startup migrations, idempotent creation, append-only corrections and revocations, signature verification, authorization isolation, cursor ordering, and the audit trail are unaffected.
+
 ## Initial capability: content identity and source actors
 
 Versioned JSON routes under `/v1`:
