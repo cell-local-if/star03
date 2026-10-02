@@ -3738,6 +3738,55 @@ class TrustEvaluationResponse(BaseModel):
     decision: Literal["trusted", "untrusted"]
 
 
+class TrustEvaluationBatchItem(BaseModel):
+    """One target in a batch trust evaluation.
+
+    An item carries exactly its declared fields; undeclared fields are
+    rejected rather than silently discarded.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_type: Literal["claim", "evidence_bundle"]
+    #: Matched against the stored identifier exactly as received; only a
+    #: blank identifier is rejected, never trimmed or normalized.
+    target_id: str
+    #: Distinct qualified signers required for a ``trusted`` decision. A
+    #: pure decimal integer only: booleans, strings, and fractional or
+    #: exponent-notation numbers are rejected, never coerced.
+    min_signers: StrictInt = Field(default=1, ge=1, le=100)
+
+    @field_validator("target_id")
+    @classmethod
+    def _target_id_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("target_id must not be empty")
+        return v
+
+
+class TrustEvaluationBatchCreate(BaseModel):
+    # A batch request carries exactly its item list; undeclared fields are
+    # rejected rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    #: 1-100 targets, evaluated in request order and never deduplicated.
+    items: list[TrustEvaluationBatchItem] = Field(
+        ..., min_length=1, max_length=100
+    )
+
+
+class TrustEvaluationBatchResponse(BaseModel):
+    """Read-only batch trust assessment, in the request's item order.
+
+    Computed on demand from the attestations already stored for each
+    target: no resource or audit event is created.
+    """
+
+    items: list[TrustEvaluationResponse]
+    #: Number of evaluated items; always equals ``len(items)``.
+    count: int
+
+
 class ActorTrustPolicyCreate(BaseModel):
     # A policy carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.

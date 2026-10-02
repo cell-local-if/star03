@@ -138,6 +138,7 @@ from provenance.schemas import (
     EvidenceBundleImportCreate,
     ImpactReconExchangeImportCreate,
     RevocationImpactImportCreate,
+    TrustEvaluationBatchCreate,
 )
 from provenance.time_utils import utc_now
 
@@ -4943,6 +4944,56 @@ def evaluate_trust(
             else TRUST_DECISION_UNTRUSTED
         ),
     }
+
+
+def evaluate_trust_batch(
+    session: Session, payload: TrustEvaluationBatchCreate
+) -> list[dict]:
+    """Evaluate trust in each requested target, in request order.
+
+    Every item is evaluated exactly as :func:`evaluate_trust` evaluates its
+    single target: only verified, non-revoked attestations of the exact
+    target count, distinct signing actors qualify once, and the decision is
+    ``"trusted"`` when the qualified signer count reaches the item's
+    ``min_signers``. Items are neither reordered nor deduplicated: a
+    repeated target is evaluated again and appears once per request item.
+    The batch is strictly read-only -- it writes no resource and no audit
+    event -- so a repeated call returns the same result.
+
+    The first target, in request order, that does not exist under its
+    declared ``target_type`` fails the whole batch with that type's 404
+    (:class:`ClaimNotFoundError` / :class:`EvidenceBundleNotFoundError`);
+    the error details name the missing ``target_type`` and ``target_id``.
+    """
+    results = []
+    for item in payload.items:
+        try:
+            _require_trust_target(session, item.target_type, item.target_id)
+        except (ClaimNotFoundError, EvidenceBundleNotFoundError) as exc:
+            # The batch 404 identifies the first missing target by its
+            # declared type and id, not by the single-target resource key.
+            exc.details = {
+                "target_type": item.target_type,
+                "target_id": item.target_id,
+            }
+            raise
+        qualified = _qualified_signer_count(
+            session, item.target_type, item.target_id
+        )
+        results.append(
+            {
+                "target_type": item.target_type,
+                "target_id": item.target_id,
+                "min_signers": item.min_signers,
+                "qualified_signer_count": qualified,
+                "decision": (
+                    TRUST_DECISION_TRUSTED
+                    if qualified >= item.min_signers
+                    else TRUST_DECISION_UNTRUSTED
+                ),
+            }
+        )
+    return results
 
 
 def create_actor_trust_policy(

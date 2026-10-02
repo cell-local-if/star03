@@ -216,6 +216,8 @@ from provenance.schemas import (
     ExchangeManifestVerificationResponse,
     ObservabilitySummaryResponse,
     TrustDecisionResponse,
+    TrustEvaluationBatchCreate,
+    TrustEvaluationBatchResponse,
     TrustEvaluationResponse,
 )
 
@@ -6265,6 +6267,32 @@ def evaluate_trust(
         session, target_type, target_id, threshold
     )
     return TrustEvaluationResponse(**result)
+
+
+@router.post(
+    "/trust-evaluation-batches",
+    response_model=TrustEvaluationBatchResponse,
+)
+def evaluate_trust_batch(
+    request: Request,
+    payload: TrustEvaluationBatchCreate,
+    session: DbSession,
+) -> TrustEvaluationBatchResponse:
+    # Read-only reviewer batch evaluation of several targets in one call,
+    # under exactly the single-target evaluation semantics. The route
+    # accepts no query parameters: any (or repeated) parameter is a 422
+    # validation_error. The request model validates the whole body --
+    # malformed JSON, a missing/extra/empty/over-long items list, a
+    # missing or undeclared item field, an unknown target_type, a blank
+    # target_id, and a non-integer or out-of-range min_signers are all a
+    # 422 before any target is read, so a malformed batch never renders
+    # as a target 404. No authentication is required.
+    _reject_any_query_param(request)
+    # Strictly read-only: the evaluation writes no resource, task, or
+    # audit event, so repeated calls return identical results. Results
+    # keep the request order and duplicates are evaluated, never merged.
+    items = service.evaluate_trust_batch(session, payload)
+    return TrustEvaluationBatchResponse(items=items, count=len(items))
 
 
 def _compact_json_response(model, status_code: int) -> Response:
