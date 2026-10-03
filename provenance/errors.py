@@ -424,6 +424,21 @@ class ActorTrustPolicyConflictError(DomainError):
         super().__init__(details={"actor_id": actor_id})
 
 
+class ActorTrustPolicyRevocationNotFoundError(DomainError):
+    """An unknown trust-policy-revocation id on the read route.
+
+    The revocation id is the only lookup key; an unknown id is an explicit,
+    specific 404 and the read writes nothing.
+    """
+
+    status_code = 404
+    code = "not_found"
+    message = "The requested trust policy revocation does not exist."
+
+    def __init__(self, revocation_id: str):
+        super().__init__(details={"revocation_id": revocation_id})
+
+
 class ActorTrustPolicyRevocationConflictError(DomainError):
     """A second, different revocation for a policy that already has one.
 
