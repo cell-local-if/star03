@@ -195,6 +195,10 @@ _ACTOR_TRUST_POLICY_ORDER = (
     ActorTrustPolicy.created_at.asc(),
     ActorTrustPolicy.seq.asc(),
 )
+_ACTOR_TRUST_POLICY_REVOCATION_ORDER = (
+    ActorTrustPolicyRevocation.created_at.asc(),
+    ActorTrustPolicyRevocation.seq.asc(),
+)
 
 
 def create_actor(session: Session, payload: ActorCreate) -> Actor:
@@ -5477,6 +5481,91 @@ def list_actor_trust_policies(
         stmt = stmt.where(ActorTrustPolicy.actor_id == actor_id)
     stmt = stmt.order_by(*_ACTOR_TRUST_POLICY_ORDER)
     return list(session.execute(stmt).scalars().all())
+
+
+def get_actor_trust_policy_revocation(
+    session: Session, revocation_id: str
+) -> ActorTrustPolicyRevocation:
+    """Return one existing trust-policy revocation by its own stable id.
+
+    The revocation id is the only lookup key: the record is never resolved
+    by policy, actor, or reason. An unknown id is an explicit ``404
+    not_found``. The function is strictly read-only: it writes no
+    revocation, policy, resource, or audit event.
+    """
+    revocation = session.execute(
+        select(ActorTrustPolicyRevocation).where(
+            ActorTrustPolicyRevocation.id == revocation_id
+        )
+    ).scalar_one_or_none()
+    if revocation is None:
+        raise ProtectedResourceNotFoundError()
+    return revocation
+
+
+# Trust-policy-revocation search paging bounds.
+DEFAULT_TRUST_POLICY_REVOCATIONS_LIMIT = 50
+MIN_TRUST_POLICY_REVOCATIONS_LIMIT = 1
+MAX_TRUST_POLICY_REVOCATIONS_LIMIT = 100
+
+
+def list_actor_trust_policy_revocations_page(
+    session: Session,
+    revocation_id: str | None = None,
+    policy_id: str | None = None,
+    actor_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+    limit: int = DEFAULT_TRUST_POLICY_REVOCATIONS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[ActorTrustPolicyRevocation], int]:
+    """Return one revocation page and the filtered total, both in SQL.
+
+    ``revocation_id``, ``policy_id``, ``actor_id``, and ``reason`` are
+    non-empty, case- and whitespace-sensitive exact matches that combine as
+    logical AND; ``None`` means unfiltered. ``from_dt``/``to_dt`` are
+    timezone-aware UTC instants applied as inclusive ``created_at`` bounds.
+    Filter values are never resolved for existence, so an unknown id, policy
+    id, actor id, or reason is an empty result rather than a missing
+    resource.
+
+    The total is a SQL ``COUNT`` over the filtered set (independent of the
+    page) and the page is a SQL ``LIMIT``/``OFFSET`` window of that set in
+    stable creation order (``created_at`` then the monotonic ``seq``
+    tiebreaker), so ordering and paging never depend on in-memory sorting and
+    stay stable across restarts. The retrieval is strictly read-only: it
+    writes no revocation, policy, resource, or audit event.
+    """
+    filters = []
+    if revocation_id is not None:
+        filters.append(ActorTrustPolicyRevocation.id == revocation_id)
+    if policy_id is not None:
+        filters.append(ActorTrustPolicyRevocation.policy_id == policy_id)
+    if actor_id is not None:
+        filters.append(ActorTrustPolicyRevocation.actor_id == actor_id)
+    if reason is not None:
+        filters.append(ActorTrustPolicyRevocation.reason == reason)
+    if from_dt is not None:
+        filters.append(ActorTrustPolicyRevocation.created_at >= from_dt)
+    if to_dt is not None:
+        filters.append(ActorTrustPolicyRevocation.created_at <= to_dt)
+
+    total = session.execute(
+        select(func.count())
+        .select_from(ActorTrustPolicyRevocation)
+        .where(*filters)
+    ).scalar_one()
+
+    page_stmt = (
+        select(ActorTrustPolicyRevocation)
+        .where(*filters)
+        .order_by(*_ACTOR_TRUST_POLICY_REVOCATION_ORDER)
+        .limit(limit)
+        .offset(offset)
+    )
+    page = list(session.execute(page_stmt).scalars().all())
+    return page, int(total)
 
 
 # Audit-event search paging bounds.
