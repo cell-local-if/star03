@@ -1300,6 +1300,20 @@ def create_attestation(
     return attestation, True
 
 
+def verify_attestation_signature(payload: AttestationCreate) -> bool:
+    """Statelessly verify an attestation signature, returning the verdict.
+
+    Pure: no session, no lookup, no write. The message is the exact
+    canonical byte string attestation creation signs and verifies, so the
+    same material yields the same conclusion on both paths. A signature
+    that cannot be verified is a ``False`` verdict, never an error.
+    """
+    message = signing.attestation_message_bytes(
+        payload.target_type, payload.target_id, payload.signer_actor_id
+    )
+    return ed25519.verify(payload.public_key, message, payload.signature)
+
+
 def get_attestation(session: Session, attestation_id: str) -> Attestation:
     """Return an attestation by id or raise :class:`AttestationNotFoundError`."""
     attestation = session.execute(

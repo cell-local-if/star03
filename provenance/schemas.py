@@ -1060,6 +1060,22 @@ class AttestationCreate(BaseModel):
         return _decode_base64(v, "signature", SIGNATURE_LENGTH)
 
 
+class AttestationVerificationCreate(AttestationCreate):
+    """A stateless attestation signature verification request.
+
+    Exactly the five declared fields and validation of attestation creation,
+    so any material accepted here is validated identically there; unlike
+    creation, no target, actor, or attestation is ever looked up, created,
+    or recorded.
+    """
+
+
+class AttestationVerificationResponse(BaseModel):
+    """The stateless attestation verification verdict: exactly one field."""
+
+    valid: bool
+
+
 class AttestationResponse(BaseModel):
     """Public attestation view: no raw signature, only its SHA-256 digest."""
 

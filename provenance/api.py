@@ -97,6 +97,8 @@ from provenance.schemas import (
     AttestationRevocationListResponse,
     AttestationRevocationPageResponse,
     AttestationRevocationResponse,
+    AttestationVerificationCreate,
+    AttestationVerificationResponse,
     RevocationImpactPageResponse,
     RevocationImpactResponse,
     RevocationImpactCheckpointResponse,
@@ -3790,6 +3792,39 @@ def create_attestation(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return _attestation_response(attestation)
+
+
+@router.post(
+    "/attestation-verifications",
+    response_model=AttestationVerificationResponse,
+)
+def verify_attestation(
+    payload: AttestationVerificationCreate, request: Request
+) -> Response:
+    # The route accepts no query parameters: any (or repeated) parameter is
+    # a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly stateless: no session is injected, so nothing is queried,
+    # created, or modified, and no resource, audit row, or log is written.
+    # Target and signer identifiers are never resolved against local state,
+    # so unknown identifiers verify exactly like known ones. The request
+    # model rejects missing/extra fields, bad target types, blank or
+    # overlong identifiers, and non-canonical Base64 as a 422 before this
+    # body runs; a well-formed request whose signature does not verify is
+    # a 200 false verdict, not an error.
+    valid = service.verify_attestation_signature(payload)
+    # Compact UTF-8 JSON, exactly {"valid": ...}, one trailing newline; the
+    # public key and signature are never echoed.
+    data = (
+        json.dumps(
+            {"valid": valid},
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=data, media_type="application/json")
 
 
 @router.get(
