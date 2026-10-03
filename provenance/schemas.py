@@ -749,6 +749,53 @@ class ContentExportResponse(BaseModel):
     claims: list[ClaimExportItem]
 
 
+class PrivacyExportEvidenceBundleItem(BaseModel):
+    """Minimal-disclosure evidence bundle view for the privacy export.
+
+    Only the public identity and digest fields: never the metadata object,
+    the attaching claim id, the raw evidence bytes, or any timestamp beyond
+    what the enclosing claim already discloses.
+    """
+
+    evidence_bundle_id: str
+    evidence_type: str
+    digest_algorithm: str
+    digest_hex: str
+    media_type: str
+
+
+class PrivacyExportClaimItem(BaseModel):
+    """Minimal-disclosure claim view for the privacy export.
+
+    Only the claim identity, type, payload digest, and creation time: never
+    the claiming actor id, the raw payload, or any signature or key material.
+    """
+
+    claim_id: str
+    claim_type: str
+    payload_digest_algorithm: str
+    payload_digest_hex: str
+    created_at: datetime
+    evidence_bundles: list[PrivacyExportEvidenceBundleItem]
+
+
+class ContentPrivacyExportResponse(BaseModel):
+    """Minimal-disclosure privacy view of one content.
+
+    Computed on demand from the persisted claims and evidence bundles at
+    read time: no resource, snapshot, audit event, or log is created. Only
+    digest-level public fields appear -- never evidence metadata, actor ids,
+    raw payloads, signatures, private keys, or content bytes.
+    """
+
+    content_id: str
+    #: Claims that directly assert this exact content (== len(claims)).
+    claim_count: int
+    #: The claims in stable creation order, each with its evidence bundles
+    #: in their own stable creation order.
+    claims: list[PrivacyExportClaimItem]
+
+
 class ContentEvidenceCoverageResponse(BaseModel):
     """Read-only evidence-coverage summary of one content.
 

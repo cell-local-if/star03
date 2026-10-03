@@ -189,6 +189,7 @@ from provenance.schemas import (
     ContentLineagePathResponse,
     ContentLineageResponse,
     ContentPageResponse,
+    ContentPrivacyExportResponse,
     ContentRelationCreate,
     ContentRelationListResponse,
     ContentRelationPageResponse,
@@ -222,6 +223,8 @@ from provenance.schemas import (
     ExchangeManifestVerificationCreate,
     ExchangeManifestVerificationResponse,
     ObservabilitySummaryResponse,
+    PrivacyExportClaimItem,
+    PrivacyExportEvidenceBundleItem,
     TrustDecisionResponse,
     TrustEvaluationBatchRequest,
     TrustEvaluationBatchResponse,
@@ -3023,6 +3026,66 @@ def get_content_export(
             for claim in claims
         ],
     )
+
+
+@router.get("/contents/{content_id}/privacy-export")
+async def get_content_privacy_export(
+    content_id: str, request: Request, session: DbSession
+) -> Response:
+    # Read-only minimal-disclosure privacy view of one content. The request
+    # takes no body and no query parameters: any non-empty body (including
+    # whitespace or malformed JSON) and any parameter (unknown, blank, or
+    # repeated) is a 422 validation_error, both rejected before anything is
+    # read. A blank content identifier is a 422 as well; an unknown one is
+    # the existing content_not_found 404, decided only after validation.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    if not content_id.strip():
+        raise _query_validation_error(
+            "content_id", "content_id must not be empty", "value_error"
+        )
+    # Strictly read-only: the view is computed from the persisted claims and
+    # evidence bundles at read time and writes no resource, task, or audit
+    # event. Only digest-level public fields are returned -- never evidence
+    # metadata, actor ids, raw payloads, signatures, private keys, or
+    # content bytes.
+    content, claims, bundles_by_claim = service.get_content_export(
+        session, content_id
+    )
+    response = ContentPrivacyExportResponse(
+        content_id=content.id,
+        claim_count=len(claims),
+        claims=[
+            PrivacyExportClaimItem(
+                claim_id=claim.id,
+                claim_type=claim.claim_type,
+                payload_digest_algorithm=claim.payload_digest_algorithm,
+                payload_digest_hex=claim.payload_digest_hex,
+                created_at=claim.created_at,
+                evidence_bundles=[
+                    PrivacyExportEvidenceBundleItem(
+                        evidence_bundle_id=bundle.id,
+                        evidence_type=bundle.evidence_type,
+                        digest_algorithm=bundle.digest_algorithm,
+                        digest_hex=bundle.digest_hex,
+                        media_type=bundle.media_type,
+                    )
+                    for bundle in bundles_by_claim[claim.id]
+                ],
+            )
+            for claim in claims
+        ],
+    )
+    # Compact UTF-8 JSON, terminated by exactly one newline; members appear
+    # as content_id, claim_count, claims, and each claim and bundle carries
+    # exactly its documented fields in declaration order.
+    return _compact_json_response(response, status.HTTP_200_OK)
 
 
 @router.get("/contents/{content_id}/evidence-coverage")
