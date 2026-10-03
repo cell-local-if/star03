@@ -79,14 +79,15 @@ def test_duplicate_content_returns_existing_resource_not_new_id(client):
     assert body["actor_id"] == "org-1"
 
 
-def test_duplicate_content_with_uppercase_hex_is_idempotent(client):
+def test_uppercase_hex_spelling_is_rejected(client):
     create_actor(client)
-    first = _create_content(client)
+    _create_content(client)
+    # No case normalization: the digest must be spelled in lowercase hex.
     resp = client.post(
         "/v1/contents", json=content_payload(digest=DIGEST_A.upper())
     )
-    assert resp.status_code == 200
-    assert resp.json()["id"] == first["id"]
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
 
 
 def test_get_content_returns_full_fields(client):
@@ -113,13 +114,26 @@ def test_unknown_actor_on_create_is_distinct_error(client):
     assert error["details"]["actor_id"] == "ghost"
 
 
-def test_reject_non_sha256_algorithm(client):
+def test_reject_unsupported_algorithm(client):
     create_actor(client)
-    resp = client.post(
-        "/v1/contents", json=content_payload(algorithm="sha512")
-    )
-    assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "validation_error"
+    for bad in ("md5", "sha1", "sha384", "sha3-256"):
+        resp = client.post(
+            "/v1/contents", json=content_payload(algorithm=bad)
+        )
+        assert resp.status_code == 422, bad
+        assert resp.json()["error"]["code"] == "validation_error"
+
+
+def test_reject_non_exact_algorithm_spelling(client):
+    create_actor(client)
+    # Only the exact lowercase names are recognized: no case or whitespace
+    # normalization is applied.
+    for bad in ("SHA256", "Sha256", "SHA512", " sha256", "sha256 ", ""):
+        resp = client.post(
+            "/v1/contents", json=content_payload(algorithm=bad)
+        )
+        assert resp.status_code == 422, repr(bad)
+        assert resp.json()["error"]["code"] == "validation_error"
 
 
 def test_reject_short_digest(client):
@@ -186,6 +200,15 @@ def test_reject_malformed_json_body(client):
         content="{not valid json",
         headers={"content-type": "application/json"},
     )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+
+
+def test_reject_undeclared_field(client):
+    create_actor(client)
+    payload = content_payload()
+    payload["content_bytes"] = "aGVsbG8="
+    resp = client.post("/v1/contents", json=payload)
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "validation_error"
 

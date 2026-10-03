@@ -11,6 +11,10 @@ DIGEST_A = hashlib.sha256(b"content-a").hexdigest()
 DIGEST_B = hashlib.sha256(b"content-b").hexdigest()
 DIGEST_C = hashlib.sha256(b"content-c").hexdigest()
 
+# sha512 of fixed, tiny inputs: stable and offline.
+DIGEST_512_A = hashlib.sha512(b"content-a").hexdigest()
+DIGEST_512_B = hashlib.sha512(b"content-b").hexdigest()
+
 
 def actor_payload(actor_id="org-1", name="Example Org", type="organization"):
     return {"id": actor_id, "name": name, "type": type}
