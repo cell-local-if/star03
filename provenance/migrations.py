@@ -42,6 +42,12 @@ SCHEMA_VERSION_1 = 1
 #: grants, revocations, attestations, or audit rows.
 SCHEMA_VERSION_2 = 2
 
+#: Third schema generation: the actor trust-policy revocation table.
+#: Fresh databases are created directly at this shape; legacy databases
+#: receive this one table (and its indexes) without touching existing
+#: policies or audit rows.
+SCHEMA_VERSION_3 = 3
+
 #: Name of the AFTER INSERT trigger that assigns display_seq to new actors.
 ACTOR_SEQ_TRIGGER = "trg_actors_display_seq"
 
@@ -141,11 +147,30 @@ def _migration_2_up(cursor, engine, metadata) -> None:
         cursor.execute(str(CreateIndex(index).compile(engine)))
 
 
+def _migration_3_up(cursor, engine, metadata) -> None:
+    """Add the trust-policy revocation table to a pre-existing DB.
+
+    Only a database that already shipped version 2 reaches this function; a
+    fresh database is created directly at the latest shape. Existing
+    policies gain no revocation row -- absence of a row continues to mean
+    "not revoked" -- and no policy, actor, or audit value is changed. The
+    step is individually idempotent in addition to the surrounding
+    transaction, so a re-run after external intervention neither fails nor
+    duplicates the table or its indexes.
+    """
+    table = metadata.tables["actor_trust_policy_revocations"]
+    if table.name not in _existing_tables(cursor):
+        cursor.execute(str(CreateTable(table).compile(engine)))
+    for index in table.indexes:
+        cursor.execute(str(CreateIndex(index).compile(engine)))
+
+
 #: Known versions in application order. A fresh database is baselined past
 #: all of them; a legacy database applies each pending one in turn.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=SCHEMA_VERSION_1, up=_migration_1_up),
     Migration(version=SCHEMA_VERSION_2, up=_migration_2_up),
+    Migration(version=SCHEMA_VERSION_3, up=_migration_3_up),
 )
 
 _CREATE_LEDGER = (

@@ -63,6 +63,7 @@ EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED = (
 EVENT_CONTENT_EXPORT_JOB_CREATED = "content_export_job.created"
 EVENT_CONTENT_EXPORT_JOB_RUN = "content_export_job.run"
 EVENT_ACTOR_TRUST_POLICY_CREATED = "actor_trust_policy.created"
+EVENT_ACTOR_TRUST_POLICY_REVOKED = "actor_trust_policy.revoked"
 EVENT_AUDIT_CHECKPOINT_JOB_CREATED = "audit_checkpoint_job.created"
 EVENT_AUDIT_CHECKPOINT_JOB_RUN = "audit_checkpoint_job.run"
 
@@ -720,6 +721,58 @@ class ActorTrustPolicy(Base):
         UTCDateTime, nullable=False, default=utc_now
     )
 
+    actor: Mapped[Actor] = relationship()
+
+
+class ActorTrustPolicyRevocation(Base):
+    """An immutable revocation of one existing subject trust policy.
+
+    A revocation is an append-only statement by the policy's subject that
+    the policy no longer authorizes trust decisions. It neither mutates nor
+    deletes the policy: the original policy, its creation timestamp, and its
+    ``actor_trust_policy.created`` audit relationship are preserved. Each
+    policy carries at most one revocation: the ``policy_id`` is unique, so a
+    retried submission of the same reason returns the original record and a
+    different reason is a conflict rather than a second record. Revocations
+    are append-only and immutable: there is deliberately no update or
+    delete path.
+    """
+
+    __tablename__ = "actor_trust_policy_revocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "policy_id", name="uq_actor_trust_policy_revocations_policy"
+        ),
+        Index(
+            "ix_actor_trust_policy_revocations_created_order",
+            "created_at",
+            "seq",
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("tpr_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The revoked policy; exactly one revocation per policy.
+    policy_id: Mapped[str] = mapped_column(
+        String(80),
+        ForeignKey("actor_trust_policies.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    #: The actor recording the revocation; must be the policy's subject.
+    actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: Non-empty, human/audit rationale; stored verbatim, never trimmed.
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    policy: Mapped[ActorTrustPolicy] = relationship()
     actor: Mapped[Actor] = relationship()
 
 

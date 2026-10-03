@@ -78,6 +78,8 @@ from provenance.schemas import (
     ActorTrustPolicyCreate,
     ActorTrustPolicyPageResponse,
     ActorTrustPolicyResponse,
+    ActorTrustPolicyRevocationCreate,
+    ActorTrustPolicyRevocationResponse,
     AttestationAccessGrantCreate,
     AttestationAccessGrantExpiryResponse,
     AttestationAccessGrantExpiryStateResponse,
@@ -6902,9 +6904,79 @@ async def list_actor_trust_policies(request: Request, session: DbSession) -> Res
     return _compact_json_response(result, status.HTTP_200_OK)
 
 
+class _DuplicateBodyFieldError(Exception):
+    """A JSON object body member appeared more than once."""
+
+
+def _parse_trust_policy_revocation_body(
+    raw_body: bytes,
+) -> ActorTrustPolicyRevocationCreate:
+    """Parse and validate the revocation body from the exact raw bytes.
+
+    The body must be a JSON object carrying exactly ``policy_id`` and
+    ``reason``; malformed JSON, a non-object value, a duplicated member
+    name, an extra or missing field, and a wrong-typed, blank, or
+    out-of-range value are all a 422 ``validation_error`` before any
+    authentication or policy lookup. Parsing happens against the exact
+    wire bytes the caller signed.
+    """
+
+    def _object_without_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise _DuplicateBodyFieldError
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(
+            raw_body.decode("utf-8"),
+            object_pairs_hook=_object_without_duplicates,
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        _DuplicateBodyFieldError,
+    ):
+        raise LineageValidationError(
+            [{"loc": ["body"], "msg": "invalid JSON body", "type": "json_error"}]
+        ) from None
+    try:
+        return ActorTrustPolicyRevocationCreate.model_validate(parsed)
+    except ValidationError as exc:
+        raise _request_body_validation_error(exc) from None
+
+
+@router.post("/trust-policy-revocations")
+async def create_actor_trust_policy_revocation(
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # The signature covers the exact bytes on the wire; the body is parsed
+    # from those same cached bytes, so body_sha256 matches what the client
+    # signed. Structural body validation precedes authentication, exactly
+    # as the pydantic-validated protected write routes validate before
+    # their handler runs; every authentication or field failure is a 422
+    # and writes nothing.
+    raw_body = await request.body()
+    payload = _parse_trust_policy_revocation_body(raw_body)
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    revocation, created = service.create_actor_trust_policy_revocation(
+        session, payload, caller
+    )
+    # First revocation -> 201; a retried submission of the same reason for
+    # the same policy -> 200 with the original record and no new row, audit
+    # event, or identifier. A different reason is a 409.
+    return _compact_json_response(
+        ActorTrustPolicyRevocationResponse.model_validate(revocation),
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+    )
+
+
 _TRUST_DECISION_PARAMS = frozenset({"target_type", "target_id"})
-
-
 @router.get("/trust-decisions")
 async def get_trust_decision(
     request: Request,
