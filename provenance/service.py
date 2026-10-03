@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from provenance import canonical, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
+    ActorNotFoundError,
     ActorTrustPolicyConflictError,
     ActorTrustPolicyRevocationConflictError,
     AttestationAccessGrantExpiryConflictError,
@@ -269,6 +270,46 @@ def list_actors_page(
     )
     page = list(session.execute(page_stmt).scalars().all())
     return page, int(total)
+
+
+def get_actor_privacy_export(
+    session: Session, actor_id: str
+) -> tuple[Actor, list[Content], list[Claim]]:
+    """Return one actor's minimal-disclosure privacy export.
+
+    The result is ``(actor, contents, claims)``: the actor itself, the
+    contents directly registered by this actor in stable creation order
+    (``created_at`` then the monotonic insertion surrogate), and the claims
+    directly made by this actor in their own stable creation order. Only
+    records directly attributed to the actor appear: no lineage, derivation,
+    supersession, or evidence traversal is performed. The function is
+    strictly read-only: it writes no resource, task, audit event, or log.
+
+    The actor must exist; an unknown actor id is a missing resource, not an
+    empty export.
+    """
+    actor = session.get(Actor, actor_id)
+    if actor is None:
+        raise ActorNotFoundError(actor_id)
+    contents = list(
+        session.execute(
+            select(Content)
+            .where(Content.actor_id == actor_id)
+            .order_by(*_CONTENT_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    claims = list(
+        session.execute(
+            select(Claim)
+            .where(Claim.actor_id == actor_id)
+            .order_by(*_CLAIM_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    return actor, contents, claims
 
 
 def create_content(

@@ -56,6 +56,15 @@ class UnknownActorError(DomainError):
         super().__init__(details={"actor_id": actor_id})
 
 
+class ActorNotFoundError(DomainError):
+    status_code = 404
+    code = "actor_not_found"
+    message = "The requested actor does not exist."
+
+    def __init__(self, actor_id: str):
+        super().__init__(details={"actor_id": actor_id})
+
+
 class ContentNotFoundError(DomainError):
     status_code = 404
     code = "content_not_found"
