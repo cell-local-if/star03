@@ -27,7 +27,15 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from provenance.database import Base, UTCDateTime
 from provenance.time_utils import utc_now
 
-# Allowed content digest algorithms. Only SHA-256 is accepted in this version.
+# Allowed content identity digest algorithms: SHA-256 and SHA-512. The
+# content identity (and its stable id) is derived from the algorithm plus
+# the digest, so the two algorithms name disjoint identity spaces.
+CONTENT_DIGEST_ALGORITHMS = frozenset({"sha256", "sha512"})
+
+# Allowed digest algorithms for evidence bundles. Only SHA-256 is accepted
+# in this version; the content-identity widening above does not extend to
+# evidence digests, claim payload digests, signatures, checkpoints,
+# manifests, or exchange packages.
 SUPPORTED_DIGEST_ALGORITHMS = frozenset({"sha256"})
 
 # Allowed content relation (lineage edge) types.

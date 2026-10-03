@@ -19,16 +19,18 @@ from pydantic import (
     StrictBool,
     StrictInt,
     StrictStr,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
 
 from provenance.canonical import canonical_json_bytes
 from provenance.ed25519 import PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH
-from provenance.models import SUPPORTED_DIGEST_ALGORITHMS
+from provenance.models import CONTENT_DIGEST_ALGORITHMS, SUPPORTED_DIGEST_ALGORITHMS
 from provenance.time_utils import parse_rfc3339_utc
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_HEX128 = re.compile(r"^[0-9a-f]{128}$")
 
 
 def _required_nonempty(value: str, field: str) -> str:
@@ -106,6 +108,11 @@ class ActorPageResponse(BaseModel):
 
 
 class ContentCreate(BaseModel):
+    # A content registration carries exactly its declared fields; undeclared
+    # fields are rejected rather than silently discarded, so no field capable
+    # of carrying raw content bytes can ever enter the request.
+    model_config = ConfigDict(extra="forbid")
+
     digest_algorithm: str = Field(..., min_length=1, max_length=32)
     digest_hex: str = Field(..., min_length=1, max_length=128)
     media_type: str = Field(..., min_length=1, max_length=255)
@@ -115,21 +122,32 @@ class ContentCreate(BaseModel):
     @field_validator("digest_algorithm")
     @classmethod
     def _algorithm_supported(cls, v: str) -> str:
-        normalized = v.strip().lower()
-        if normalized not in SUPPORTED_DIGEST_ALGORITHMS:
-            supported = ", ".join(sorted(SUPPORTED_DIGEST_ALGORITHMS))
+        # Exact lowercase names only: no case folding or trimming, so a
+        # different spelling is a validation error, never a normalization.
+        if v not in CONTENT_DIGEST_ALGORITHMS:
+            supported = ", ".join(sorted(CONTENT_DIGEST_ALGORITHMS))
             raise ValueError(f"unsupported digest algorithm; supported: {supported}")
-        return normalized
+        return v
 
     @field_validator("digest_hex")
     @classmethod
-    def _digest_is_sha256_hex(cls, v: str) -> str:
-        # Normalize case so the same digest cannot be registered twice via
-        # different casing; then enforce exactly 64 lowercase hex chars.
-        normalized = v.strip().lower()
-        if not _HEX64.fullmatch(normalized):
-            raise ValueError("digest_hex must be exactly 64 hexadecimal characters")
-        return normalized
+    def _digest_matches_algorithm(cls, v: str, info: ValidationInfo) -> str:
+        # The digest spelling is algorithm-dependent and already final:
+        # exactly 64 lowercase hex chars for sha256, exactly 128 for
+        # sha512. No case folding or trimming -- an uppercase, padded, or
+        # wrong-length spelling is rejected, never normalized.
+        algorithm = info.data.get("digest_algorithm")
+        if algorithm == "sha256" and not _HEX64.fullmatch(v):
+            raise ValueError(
+                "digest_hex must be exactly 64 lowercase hexadecimal"
+                " characters for sha256"
+            )
+        if algorithm == "sha512" and not _HEX128.fullmatch(v):
+            raise ValueError(
+                "digest_hex must be exactly 128 lowercase hexadecimal"
+                " characters for sha512"
+            )
+        return v
 
     @field_validator("media_type")
     @classmethod

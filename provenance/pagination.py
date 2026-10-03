@@ -30,6 +30,9 @@ from provenance.time_utils import parse_rfc3339_utc
 #: Exactly 64 lowercase hexadecimal characters (a SHA-256 digest spelling).
 _HEX64_LOWER = re.compile(r"[0-9a-f]{64}")
 
+#: Exactly 128 lowercase hexadecimal characters (a SHA-512 digest spelling).
+_HEX128_LOWER = re.compile(r"[0-9a-f]{128}")
+
 #: Legacy lineage cursor format generation. Bump only when the lineage claim
 #: set/encoding changes; cursors carrying any other marker are rejected as
 #: expired/unknown.
@@ -814,14 +817,22 @@ def _validate_contents_claims(claims: dict[str, Any]) -> None:
     _optional_nonempty_str(claims, "actor_id")
     _optional_nonempty_str(claims, "digest_algorithm")
     _optional_nonempty_str(claims, "media_type")
-    # The digest filter is absent (null) or the strict 64 lowercase hex
-    # spelling; an uppercase or trimmed spelling is a different value and is
-    # never normalized.
+    # The digest filter is absent (null) or the strict lowercase hex spelling
+    # for its algorithm: 64 chars for a bare or sha256-bound filter, 128 for
+    # sha512. An uppercase or trimmed spelling is a different value and is
+    # never normalized; a digest bound to any other algorithm is a
+    # combination the server never mints.
     digest = claims["digest_hex"]
-    if digest is not None and (
-        not isinstance(digest, str) or not _HEX64_LOWER.fullmatch(digest)
-    ):
-        raise InvalidCursorError("cursor digest_hex is invalid")
+    if digest is not None:
+        algorithm = claims["digest_algorithm"]
+        if algorithm == "sha512":
+            valid = isinstance(digest, str) and bool(_HEX128_LOWER.fullmatch(digest))
+        elif algorithm is None or algorithm == "sha256":
+            valid = isinstance(digest, str) and bool(_HEX64_LOWER.fullmatch(digest))
+        else:
+            valid = False
+        if not valid:
+            raise InvalidCursorError("cursor digest_hex is invalid")
     for field in ("limit", "offset"):
         if not _is_int(claims[field]):
             raise InvalidCursorError(f"cursor {field} must be an integer")

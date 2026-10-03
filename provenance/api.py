@@ -430,7 +430,7 @@ async def list_contents(request: Request, session: DbSession) -> Response:
 
     actor_id = _parse_nonempty_filter(raw, "actor_id")
     digest_algorithm = _parse_nonempty_filter(raw, "digest_algorithm")
-    digest_hex = _parse_digest_hex_param(raw, "digest_hex")
+    digest_hex = _parse_content_digest_hex_param(raw, digest_algorithm)
     media_type = _parse_nonempty_filter(raw, "media_type")
 
     page_limit = _parse_int_param(
@@ -1125,6 +1125,7 @@ _CLAIMS_PARAMS = frozenset(
 )
 
 _HEX64_LOWER_RE = re.compile(r"[0-9a-f]{64}")
+_HEX128_LOWER_RE = re.compile(r"[0-9a-f]{128}")
 
 _BOOL_LITERALS = {"true": True, "false": False}
 
@@ -1163,6 +1164,47 @@ def _parse_digest_hex_param(raw, field: str) -> str | None:
         raise _query_validation_error(
             field,
             f"{field} must be exactly 64 lowercase hexadecimal characters",
+            "value_error",
+        )
+    return value
+
+
+def _parse_content_digest_hex_param(raw, digest_algorithm: str | None) -> str | None:
+    """Parse the content-search digest filter against the effective algorithm.
+
+    A bare ``digest_hex`` (no ``digest_algorithm``) is interpreted as sha256
+    and must be exactly 64 lowercase hex chars; with an explicit
+    ``digest_algorithm=sha256`` the same 64-char spelling is required, and
+    with ``digest_algorithm=sha512`` exactly 128 chars. Any other
+    algorithm/digest combination is a 422, never a normalization.
+    """
+    value = _parse_once(raw, "digest_hex")
+    if value is None:
+        return None
+    if not value.strip():
+        raise _query_validation_error(
+            "digest_hex", "digest_hex must not be empty", "value_error"
+        )
+    if digest_algorithm is None or digest_algorithm == "sha256":
+        if not _HEX64_LOWER_RE.fullmatch(value):
+            raise _query_validation_error(
+                "digest_hex",
+                "digest_hex must be exactly 64 lowercase hexadecimal"
+                " characters",
+                "value_error",
+            )
+    elif digest_algorithm == "sha512":
+        if not _HEX128_LOWER_RE.fullmatch(value):
+            raise _query_validation_error(
+                "digest_hex",
+                "digest_hex must be exactly 128 lowercase hexadecimal"
+                " characters for sha512",
+                "value_error",
+            )
+    else:
+        raise _query_validation_error(
+            "digest_hex",
+            "digest_hex requires digest_algorithm sha256 or sha512",
             "value_error",
         )
     return value

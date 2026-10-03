@@ -687,3 +687,161 @@ def test_queries_and_failures_write_nothing(client, db_session):
 
     assert _content_ids(db_session) == ids_before == {c["id"] for c in contents}
     assert _audit_count(db_session) == events_before
+
+
+# --- SHA-512 identities in the search ---------------------------------------------
+
+DIGEST_512_A = hashlib.sha512(b"content-512-a").hexdigest()
+DIGEST_512_B = hashlib.sha512(b"content-512-b").hexdigest()
+DIGEST_512_C = hashlib.sha512(b"content-512-c").hexdigest()
+
+
+def _make_sha512(client, digest, actor_id="org-1", media_type="image/png"):
+    resp = client.post(
+        "/v1/contents",
+        json=content_payload(
+            algorithm="sha512", digest=digest, actor_id=actor_id,
+            media_type=media_type,
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def test_sha512_contents_list_in_stable_creation_order(client):
+    create_actor(client)
+    sha256_content = client.post("/v1/contents", json=content_payload()).json()
+    first = _make_sha512(client, DIGEST_512_A)
+    second = _make_sha512(client, DIGEST_512_B)
+
+    body = client.get(CONTENTS_PATH).json()
+    assert body["count"] == 3
+    assert [item["id"] for item in body["items"]] == [
+        sha256_content["id"],
+        first["id"],
+        second["id"],
+    ]
+    sha512_items = body["items"][1:]
+    for item in sha512_items:
+        assert item["digest_algorithm"] == "sha512"
+        assert len(item["digest_hex"]) == 128
+
+
+def test_digest_algorithm_filter_matches_sha512_contents(client):
+    create_actor(client)
+    client.post("/v1/contents", json=content_payload())
+    first = _make_sha512(client, DIGEST_512_A)
+    second = _make_sha512(client, DIGEST_512_B)
+
+    body = client.get(
+        CONTENTS_PATH, params={"digest_algorithm": "sha512"}
+    ).json()
+    assert body["count"] == 2
+    assert [item["id"] for item in body["items"]] == [first["id"], second["id"]]
+
+    sha256_body = client.get(
+        CONTENTS_PATH, params={"digest_algorithm": "sha256"}
+    ).json()
+    assert sha256_body["count"] == 1
+    assert all(
+        item["digest_algorithm"] == "sha256" for item in sha256_body["items"]
+    )
+
+
+def test_sha512_digest_filter_requires_explicit_algorithm(client):
+    create_actor(client)
+    content = _make_sha512(client, DIGEST_512_A)
+
+    # A 128-char digest with an explicit sha512 filter matches exactly.
+    matched = client.get(
+        CONTENTS_PATH,
+        params={"digest_algorithm": "sha512", "digest_hex": DIGEST_512_A},
+    ).json()
+    assert [item["id"] for item in matched["items"]] == [content["id"]]
+    assert matched["count"] == 1
+
+    # A bare digest_hex is interpreted as sha256: the 128-char spelling is
+    # 422, as is the 64-char spelling under an explicit sha512, and any
+    # digest paired with another algorithm name.
+    for params in (
+        {"digest_hex": DIGEST_512_A},
+        {"digest_algorithm": "sha256", "digest_hex": DIGEST_512_A},
+        {"digest_algorithm": "sha512", "digest_hex": DIGEST_A},
+        {"digest_algorithm": "sha512", "digest_hex": DIGEST_512_A.upper()},
+        {"digest_algorithm": "sha512", "digest_hex": "a" * 127},
+        {"digest_algorithm": "md5", "digest_hex": DIGEST_512_A},
+        {"digest_algorithm": "md5", "digest_hex": DIGEST_A},
+    ):
+        resp = client.get(CONTENTS_PATH, params=params)
+        assert resp.status_code == 422, params
+        assert resp.json()["error"]["code"] == "validation_error"
+
+
+def test_sha512_filter_combines_as_logical_and(client):
+    create_actor(client)
+    create_actor(client, actor_id="p-1", name="Alice", type="person")
+    first = _make_sha512(client, DIGEST_512_A, actor_id="org-1")
+    _make_sha512(client, DIGEST_512_B, actor_id="p-1")
+
+    body = client.get(
+        CONTENTS_PATH,
+        params={"digest_algorithm": "sha512", "actor_id": "org-1"},
+    ).json()
+    assert [item["id"] for item in body["items"]] == [first["id"]]
+    assert body["count"] == 1
+
+    miss = client.get(
+        CONTENTS_PATH,
+        params={"digest_algorithm": "sha512", "digest_hex": DIGEST_512_C},
+    ).json()
+    assert miss == {"items": [], "count": 0, "next_cursor": None}
+
+
+def test_sha512_filtered_pages_resume_with_cursor(client):
+    create_actor(client)
+    contents = [
+        _make_sha512(client, digest)
+        for digest in (DIGEST_512_A, DIGEST_512_B, DIGEST_512_C)
+    ]
+    params = {"digest_algorithm": "sha512", "limit": "2"}
+    first = client.get(CONTENTS_PATH, params=params).json()
+    assert first["count"] == 3
+    assert [item["id"] for item in first["items"]] == [
+        contents[0]["id"],
+        contents[1]["id"],
+    ]
+    cursor = first["next_cursor"]
+    assert cursor is not None
+    assert cursor.startswith("ct1.")
+
+    second = client.get(
+        CONTENTS_PATH, params={**params, "cursor": cursor}
+    ).json()
+    assert second["count"] == 3
+    assert [item["id"] for item in second["items"]] == [contents[2]["id"]]
+    assert second["next_cursor"] is None
+
+    # The cursor binds the algorithm filter: resuming under sha256 (or with
+    # the filter dropped) is a 422, never a cross-condition resume.
+    for bad_params in (
+        {"digest_algorithm": "sha256", "limit": "2", "cursor": cursor},
+        {"limit": "2", "cursor": cursor},
+    ):
+        resp = client.get(CONTENTS_PATH, params=bad_params)
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "validation_error"
+
+
+def test_sha512_digest_filtered_pages_resume_with_cursor(client):
+    create_actor(client)
+    for index in range(3):
+        _make_sha512(
+            client, hashlib.sha512(f"bulk-512-{index}".encode()).hexdigest()
+        )
+    # A digest filter that matches nothing still paginates as an empty,
+    # stable, read-only result.
+    body = client.get(
+        CONTENTS_PATH,
+        params={"digest_algorithm": "sha512", "digest_hex": DIGEST_512_C},
+    ).json()
+    assert body == {"items": [], "count": 0, "next_cursor": None}
