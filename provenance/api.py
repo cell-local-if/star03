@@ -74,6 +74,9 @@ from provenance.schemas import (
     REVOCATION_IMPACT_DIGEST_ALGORITHM,
     ActorCreate,
     ActorPageResponse,
+    ActorPrivacyExportClaimItem,
+    ActorPrivacyExportContentItem,
+    ActorPrivacyExportResponse,
     ActorResponse,
     ActorTrustPolicyCreate,
     ActorTrustPolicyPageResponse,
@@ -380,6 +383,70 @@ async def list_actors(request: Request, session: DbSession) -> Response:
         + "\n"
     ).encode("utf-8")
     return Response(content=body, media_type="application/json")
+
+
+@router.get("/actors/{actor_id}/privacy-export")
+async def get_actor_privacy_export(
+    actor_id: str, request: Request, session: DbSession
+) -> Response:
+    # Read-only minimal-disclosure privacy view of one actor. The request
+    # takes no body and no query parameters: any non-empty body (including
+    # whitespace or malformed JSON) and any parameter (unknown, blank, or
+    # repeated) is a 422 validation_error, both rejected before anything is
+    # read. A blank actor identifier is a 422 as well; an unknown one is a
+    # 404 actor_not_found, decided only after validation.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    if not actor_id.strip():
+        raise _query_validation_error(
+            "actor_id", "actor_id must not be empty", "value_error"
+        )
+    # Strictly read-only: the view is computed from the persisted contents
+    # and claims at read time and writes no resource, task, audit event, or
+    # log. Only the records directly attributed to this actor appear -- no
+    # version, derivation, supersession, or evidence expansion -- and only
+    # digest-level public fields: never evidence metadata, raw payloads,
+    # content bytes, signatures, keys, grants, trust policies, audit events,
+    # or other actors' data.
+    actor, contents, claims = service.get_actor_privacy_export(
+        session, actor_id
+    )
+    response = ActorPrivacyExportResponse(
+        actor=ActorResponse.model_validate(actor),
+        content_count=len(contents),
+        contents=[
+            ActorPrivacyExportContentItem(
+                content_id=content.id,
+                digest_algorithm=content.digest_algorithm,
+                digest_hex=content.digest_hex,
+                media_type=content.media_type,
+                created_at=content.created_at,
+            )
+            for content in contents
+        ],
+        claim_count=len(claims),
+        claims=[
+            ActorPrivacyExportClaimItem(
+                claim_id=claim.id,
+                content_id=claim.content_id,
+                claim_type=claim.claim_type,
+                payload_digest_algorithm=claim.payload_digest_algorithm,
+                payload_digest_hex=claim.payload_digest_hex,
+                created_at=claim.created_at,
+            )
+            for claim in claims
+        ],
+    )
+    # Compact UTF-8 JSON, terminated by exactly one newline; members appear
+    # as actor, content_count, contents, claim_count, claims, and each item
+    # carries exactly its documented fields in declaration order.
+    return _compact_json_response(response, status.HTTP_200_OK)
 
 
 @router.post("/contents", response_model=ContentResponse)

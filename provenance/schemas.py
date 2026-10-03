@@ -796,6 +796,59 @@ class ContentPrivacyExportResponse(BaseModel):
     claims: list[PrivacyExportClaimItem]
 
 
+class ActorPrivacyExportContentItem(BaseModel):
+    """Minimal-disclosure content view for the actor privacy export.
+
+    Only the public identity, digest, media type, and creation time: never
+    the title, the registering actor id, or any content bytes.
+    """
+
+    content_id: str
+    digest_algorithm: str
+    digest_hex: str
+    media_type: str
+    created_at: datetime
+
+
+class ActorPrivacyExportClaimItem(BaseModel):
+    """Minimal-disclosure claim view for the actor privacy export.
+
+    Only the claim identity, its content, type, payload digest, and creation
+    time: never the claiming actor id, the raw payload, or any signature or
+    key material.
+    """
+
+    claim_id: str
+    content_id: str
+    claim_type: str
+    payload_digest_algorithm: str
+    payload_digest_hex: str
+    created_at: datetime
+
+
+class ActorPrivacyExportResponse(BaseModel):
+    """Minimal-disclosure privacy view of one actor.
+
+    Computed on demand from the persisted contents and claims at read time:
+    no resource, snapshot, audit event, or log is created. Only the records
+    directly attributed to the actor appear -- no version, derivation,
+    supersession, or evidence expansion -- and only digest-level public
+    fields: never evidence metadata, raw payloads, content bytes,
+    signatures, keys, grants, trust policies, audit events, or other
+    actors' data.
+    """
+
+    actor: ActorResponse
+    #: Contents directly registered by this actor (== len(contents)).
+    content_count: int
+    #: The contents in stable creation order.
+    contents: list[ActorPrivacyExportContentItem]
+    #: Claims directly made by this actor (== len(claims)).
+    claim_count: int
+    #: The claims in stable creation order.
+    claims: list[ActorPrivacyExportClaimItem]
+
+
 class ContentEvidenceCoverageResponse(BaseModel):
     """Read-only evidence-coverage summary of one content.
 

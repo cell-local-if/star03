@@ -22,6 +22,7 @@ from provenance.errors import (
     ActorTrustPolicyConflictError,
     ActorTrustPolicyRevocationConflictError,
     AttestationAccessGrantExpiryConflictError,
+    ActorNotFoundError,
     AuditCheckpointImportNotFoundError,
     AuditCheckpointJobConflictError,
     AuditCheckpointJobNotFoundError,
@@ -269,6 +270,47 @@ def list_actors_page(
     )
     page = list(session.execute(page_stmt).scalars().all())
     return page, int(total)
+
+
+def get_actor_privacy_export(
+    session: Session, actor_id: str
+) -> tuple[Actor, list[Content], list[Claim]]:
+    """Return an actor's minimal-disclosure privacy export.
+
+    The result is ``(actor, contents, claims)``: the actor itself, the
+    contents directly registered by this actor in stable creation order,
+    and the claims directly made by this actor in stable creation order.
+    Only direct attribution counts: no version, derivation, supersession,
+    or evidence relation is traversed, and no other actor's records are
+    included. The function is strictly read-only: it writes no resource,
+    task, audit event, or log, and the same persisted state always yields
+    the same result.
+
+    The actor must exist; an unknown actor id is a missing resource, not
+    an empty export.
+    """
+    actor = session.get(Actor, actor_id)
+    if actor is None:
+        raise ActorNotFoundError(actor_id)
+    contents = list(
+        session.execute(
+            select(Content)
+            .where(Content.actor_id == actor_id)
+            .order_by(*_CONTENT_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    claims = list(
+        session.execute(
+            select(Claim)
+            .where(Claim.actor_id == actor_id)
+            .order_by(*_CLAIM_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    return actor, contents, claims
 
 
 def create_content(
