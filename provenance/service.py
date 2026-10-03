@@ -2247,6 +2247,108 @@ def list_access_grants_for_attestation(
     return list(session.execute(stmt).scalars().all())
 
 
+# Access-grant-state view paging bounds.
+DEFAULT_ATTESTATION_ACCESS_GRANT_STATES_LIMIT = 50
+MIN_ATTESTATION_ACCESS_GRANT_STATES_LIMIT = 1
+MAX_ATTESTATION_ACCESS_GRANT_STATES_LIMIT = 100
+
+#: The only states a grant can render in the access-grant-state view.
+ACCESS_GRANT_STATE_REVOKED = "revoked"
+ACCESS_GRANT_STATE_EXPIRED = "expired"
+ACCESS_GRANT_STATE_SCHEDULED = "scheduled"
+ACCESS_GRANT_STATE_ACTIVE = "active"
+
+#: The only values the state view and its ``state`` filter accept.
+ATTESTATION_ACCESS_GRANT_STATES = (
+    ACCESS_GRANT_STATE_REVOKED,
+    ACCESS_GRANT_STATE_EXPIRED,
+    ACCESS_GRANT_STATE_SCHEDULED,
+    ACCESS_GRANT_STATE_ACTIVE,
+)
+
+
+def list_access_grant_states_for_attestation(
+    session: Session, attestation_id: str, actor_id: str, checked_at: datetime
+) -> list[tuple[AttestationAccessGrant, datetime | None, str]] | None:
+    """Return one attestation's grants with expiry and state at ``checked_at``.
+
+    The caller must be the authenticated ``signer_actor_id`` of an existing
+    attestation; a missing attestation and a caller who is not its signer are
+    indistinguishable to the caller and both return ``None``, so the route
+    renders one opaque 404 and never reveals existence. On success every
+    grant row of the attestation is returned -- grants are append-only and
+    retained even after a revocation or expiry -- in stable creation order
+    (``created_at`` with the monotonic ``seq`` tiebreaker), each paired with
+    its scheduled ``expires_at`` (``None`` when no expiry was ever scheduled)
+    and its derived state at ``checked_at``:
+
+    * ``revoked`` when any revocation record exists for the grant;
+    * otherwise ``expired`` when a scheduled ``expires_at`` is at or before
+      ``checked_at``;
+    * otherwise ``scheduled`` when a future ``expires_at`` is recorded;
+    * otherwise ``active`` (no expiry record at all).
+
+    A revocation wins over any expiry when both hold. An attestation without
+    grants yields an empty list. The function is strictly read-only: it
+    writes no grant, revocation, expiry, resource, or audit event.
+    """
+    attestation = session.execute(
+        select(Attestation).where(Attestation.id == attestation_id)
+    ).scalar_one_or_none()
+    if attestation is None or attestation.signer_actor_id != actor_id:
+        # A missing proof and a caller who is not its signer are
+        # indistinguishable to the caller: both collapse into the route's
+        # single opaque 404.
+        return None
+
+    grants = list(
+        session.execute(
+            select(AttestationAccessGrant)
+            .where(AttestationAccessGrant.attestation_id == attestation_id)
+            .order_by(*_ATTESTATION_ACCESS_GRANT_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    if not grants:
+        return []
+
+    grant_ids = [grant.id for grant in grants]
+    expiry_by_grant = {
+        expiry.grant_id: expiry.expires_at
+        for expiry in session.execute(
+            select(AttestationAccessGrantExpiry).where(
+                AttestationAccessGrantExpiry.grant_id.in_(grant_ids)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    revoked_grant_ids = set(
+        session.execute(
+            select(AttestationAccessGrantRevocation.grant_id).where(
+                AttestationAccessGrantRevocation.grant_id.in_(grant_ids)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    entries = []
+    for grant in grants:
+        expires_at = expiry_by_grant.get(grant.id)
+        if grant.id in revoked_grant_ids:
+            state = ACCESS_GRANT_STATE_REVOKED
+        elif expires_at is not None and expires_at <= checked_at:
+            state = ACCESS_GRANT_STATE_EXPIRED
+        elif expires_at is not None:
+            state = ACCESS_GRANT_STATE_SCHEDULED
+        else:
+            state = ACCESS_GRANT_STATE_ACTIVE
+        entries.append((grant, expires_at, state))
+    return entries
+
+
 DEFAULT_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 50
 MIN_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 1
 MAX_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 100

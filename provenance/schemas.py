@@ -2653,6 +2653,39 @@ class AttestationAccessGrantRevocationPageResponse(BaseModel):
     next_cursor: str | None
 
 
+class AttestationAccessGrantStateItem(BaseModel):
+    """One grant's public view plus its expiry and state at ``checked_at``.
+
+    The first four members are exactly the existing grant public view;
+    ``expires_at`` is the scheduled UTC expiry instant (null when no expiry
+    was ever scheduled) and ``state`` is one of ``revoked``, ``expired``,
+    ``scheduled``, or ``active``.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    attestation_id: str
+    grantee_actor_id: str
+    created_at: datetime
+    expires_at: datetime | None
+    state: str
+
+
+class AttestationAccessGrantStatePageResponse(BaseModel):
+    """A cursor-paginated page of access-grant state views."""
+
+    items: list[AttestationAccessGrantStateItem]
+    #: Total number of grants for the attestation; never changes with the
+    #: state filter or pagination.
+    count: int
+    #: Opaque continuation token; null on the final (or past-the-end) page.
+    next_cursor: str | None
+    #: The UTC instant the states on this page were classified at; carried
+    #: unchanged across a cursor chain.
+    checked_at: datetime
+
+
 class AuditEventItem(BaseModel):
     """Public audit-event view: type, resource, and UTC timestamp only."""
 
