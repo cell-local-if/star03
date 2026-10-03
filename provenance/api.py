@@ -84,6 +84,9 @@ from provenance.schemas import (
     AttestationAccessGrantExpiryCreate,
     AttestationAccessGrantPageResponse,
     AttestationAccessGrantResponse,
+    AttestationAccessGrantStatePageResponse,
+    AttestationAccessGrantStateResponse,
+    ATTESTATION_ACCESS_GRANT_STATES,
     AttestationAccessGrantRevocationCreate,
     AttestationAccessGrantRevocationListResponse,
     AttestationAccessGrantRevocationPageResponse,
@@ -6049,6 +6052,195 @@ async def list_attestation_access_grants(
         count=total,
         next_cursor=next_cursor,
     )
+
+
+_ATTESTATION_ACCESS_GRANT_STATES_PARAMS = frozenset({"state", "limit", "cursor"})
+
+
+@router.get(
+    "/attestations/{attestation_id}/access-grant-states",
+    response_model=AttestationAccessGrantStatePageResponse,
+)
+async def list_attestation_access_grant_states(
+    attestation_id: str,
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # The signer's protected listing of one proof's grants with their
+    # effective states at a single UTC instant. Every validation failure is
+    # a 422, so a malformed request never renders as the opaque 404 below:
+    # the GET body must be empty (any byte is rejected first), only
+    # state/limit/cursor are accepted, raw multi-values are inspected
+    # deliberately (a repeated scalar is rejected instead of silently
+    # taking the last value), state must be one of the four literals, and
+    # limit is a pure decimal integer in 1..100 defaulting to 50.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _ATTESTATION_ACCESS_GRANT_STATES_PARAMS
+    if unknown:
+        # The collection accepts only state/limit/cursor; a typo never
+        # silently changes the page.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    state = _parse_once(raw, "state")
+    if state is not None and state not in ATTESTATION_ACCESS_GRANT_STATES:
+        # Covers blank/whitespace values and every non-literal spelling;
+        # omitting the parameter means unfiltered, not an error.
+        raise _query_validation_error(
+            "state",
+            "state must be one of: revoked, expired, scheduled, active",
+            "value_error.state",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_ATTESTATION_ACCESS_GRANT_STATES_LIMIT,
+        service.MIN_ATTESTATION_ACCESS_GRANT_STATES_LIMIT,
+        service.MAX_ATTESTATION_ACCESS_GRANT_STATES_LIMIT,
+    )
+
+    # The cursor token itself is verified and structurally decoded before
+    # authentication: a forged, malformed, or other-family token is a client
+    # validation error regardless of who presents it. Binding the claims to
+    # this proof and caller happens once the caller is authenticated.
+    cursor = _parse_once(raw, "cursor")
+    claims = None
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.attestation_access_grant_states_cursor_secret,
+                pagination.ATTESTATION_ACCESS_GRANT_STATES_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+
+    # The signed body_sha256 is the digest of zero bytes, exactly as on the
+    # other protected read routes. Missing or unauthenticated credentials
+    # collapse into the same opaque 404 as a missing target or a non-signer;
+    # malformed credentials stay 422.
+    actor = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+
+    # The first page fixes the checked instant; a continuation reuses the
+    # instant bound into its cursor so paging through a time-derived state
+    # is stable and the response's checked_at is the same instant on every
+    # page of one walk.
+    if claims is not None:
+        checked_at = parse_rfc3339_utc(claims["checked_at"])
+        # The family validator already proved this parses.
+        expected = {
+            "attestation_id": attestation_id,
+            "actor_id": actor,
+            "state": state,
+            "limit": page_limit,
+            "checked_at": _audit_time_claim(checked_at),
+        }
+        # The cursor only resumes the query that issued it: the origin proof,
+        # the authenticated caller, the effective state filter (null when
+        # unfiltered), the effective limit, and the checked instant must all
+        # match exactly. A cursor minted for another proof, another signer,
+        # another filter, or a different limit is a client validation error.
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+    else:
+        checked_at = utc_now()
+        offset = 0
+
+    # A missing proof and a caller who is not its signer are indistinguishable
+    # to the caller: both render as the same opaque 404.
+    entries = service.list_access_grant_states_for_attestation(
+        session, attestation_id, actor, checked_at
+    )
+    if entries is None:
+        raise ProtectedResourceNotFoundError()
+
+    # count is the total number of grants for the proof, independent of the
+    # state filter and of pagination; paging walks the filtered subset in
+    # stable creation order.
+    total = len(entries)
+    matching = (
+        entries if state is None else [entry for entry in entries if entry[2] == state]
+    )
+    matching_total = len(matching)
+
+    next_cursor: str | None = None
+    if offset >= matching_total:
+        # At or past the end of the (stable) filtered set: the page is empty,
+        # count is unchanged, and no further cursor can be issued.
+        page = []
+    else:
+        page = matching[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < matching_total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.attestation_access_grant_states_cursor_secret,
+                pagination.ATTESTATION_ACCESS_GRANT_STATES_CURSOR,
+                {
+                    "attestation_id": attestation_id,
+                    "actor_id": actor,
+                    "state": state,
+                    "limit": page_limit,
+                    "checked_at": _audit_time_claim(checked_at),
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the existing grant public view with expires_at (null when
+    # no expiry was ever scheduled) and the effective state appended; no
+    # revocation record, private key, raw signature, authentication header,
+    # payload, content, or evidence byte is ever echoed.
+    result = AttestationAccessGrantStatePageResponse(
+        items=[
+            AttestationAccessGrantStateResponse(
+                id=grant.id,
+                attestation_id=grant.attestation_id,
+                grantee_actor_id=grant.grantee_actor_id,
+                created_at=grant.created_at,
+                expires_at=expires_at,
+                state=grant_state,
+            )
+            for grant, expires_at, grant_state in page
+        ],
+        count=total,
+        next_cursor=next_cursor,
+        checked_at=checked_at,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated by
+    # exactly one newline; members appear as items, count, next_cursor,
+    # checked_at.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 def _rotation_response(rotation) -> AuthenticationKeyRotationResponse:

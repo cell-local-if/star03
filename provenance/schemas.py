@@ -2558,6 +2558,55 @@ class AttestationAccessGrantPageResponse(BaseModel):
     next_cursor: str | None
 
 
+#: The four effective grant states readable through the state listing.
+#: ``revoked`` wins over expiry; otherwise an expiry at or before the
+#: checked instant is ``expired``, a later expiry is ``scheduled``, and a
+#: grant without an expiry record is ``active``.
+ATTESTATION_ACCESS_GRANT_STATES = (
+    "revoked",
+    "expired",
+    "scheduled",
+    "active",
+)
+
+
+class AttestationAccessGrantStateResponse(BaseModel):
+    """One grant's public view plus its effective state at ``checked_at``.
+
+    The grant fields are exactly the existing grant public view; ``expires_at``
+    is the scheduled UTC expiry or null when no expiry has ever been
+    scheduled, and ``state`` is the effective state at the request's
+    ``checked_at`` instant.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    attestation_id: str
+    grantee_actor_id: str
+    created_at: datetime
+    expires_at: datetime | None
+    state: Literal[
+        "revoked",
+        "expired",
+        "scheduled",
+        "active",
+    ]
+
+
+class AttestationAccessGrantStatePageResponse(BaseModel):
+    """A cursor-paginated page of effective access-grant states."""
+
+    items: list[AttestationAccessGrantStateResponse]
+    #: Total number of grants for the attestation, never changed by the
+    #: optional state filter or by pagination.
+    count: int
+    #: Opaque continuation token; null on the final (or past-the-end) page.
+    next_cursor: str | None
+    #: The UTC instant every reported state is evaluated at.
+    checked_at: datetime
+
+
 class AttestationAccessGrantExpiryCreate(BaseModel):
     # An expiry carries exactly its one declared field; undeclared fields
     # are rejected rather than silently discarded.

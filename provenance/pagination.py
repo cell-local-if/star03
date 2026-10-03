@@ -74,6 +74,10 @@ AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION = "ak1"
 #: Marker for cursors that page through one attestation's access grants.
 ATTESTATION_ACCESS_GRANTS_CURSOR_VERSION = "ag1"
 
+#: Marker for cursors that page through one attestation's effective
+#: access-grant states.
+ATTESTATION_ACCESS_GRANT_STATES_CURSOR_VERSION = "as1"
+
 #: Marker for cursors that page through the global access-grant-revocation
 #: search.
 ATTESTATION_ACCESS_GRANT_REVOCATIONS_CURSOR_VERSION = "gr1"
@@ -590,6 +594,56 @@ ATTESTATION_ACCESS_GRANTS_CURSOR = CursorKind(
     version=ATTESTATION_ACCESS_GRANTS_CURSOR_VERSION,
     claim_fields=("attestation_id", "actor_id", "limit", "offset"),
     validate=_validate_attestation_access_grants_claims,
+)
+
+
+def _validate_attestation_access_grant_states_claims(claims: dict[str, Any]) -> None:
+    # The page belongs to exactly one proof and one authenticated caller:
+    # non-empty attestation_id and actor_id bound claims. Matching is case-
+    # and whitespace-sensitive, so the raw path/header values are bound.
+    if not isinstance(claims["attestation_id"], str) or not claims[
+        "attestation_id"
+    ]:
+        raise InvalidCursorError("cursor attestation_id is invalid")
+    if not isinstance(claims["actor_id"], str) or not claims["actor_id"]:
+        raise InvalidCursorError("cursor actor_id is invalid")
+    # The state filter is absent (null, meaning unfiltered) or one of the
+    # four effective-state literals; no other spelling is valid.
+    state = claims["state"]
+    if state is not None and state not in (
+        "revoked",
+        "expired",
+        "scheduled",
+        "active",
+    ):
+        raise InvalidCursorError("cursor state is invalid")
+    # The checked instant binds the page: absent is impossible (every page
+    # is minted at one) and a non-canonical value is structurally invalid.
+    checked_at = claims["checked_at"]
+    if not isinstance(checked_at, str) or parse_rfc3339_utc(checked_at) is None:
+        raise InvalidCursorError("cursor checked_at is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for
+#: ``GET /v1/attestations/{attestation_id}/access-grant-states``.
+ATTESTATION_ACCESS_GRANT_STATES_CURSOR = CursorKind(
+    version=ATTESTATION_ACCESS_GRANT_STATES_CURSOR_VERSION,
+    claim_fields=(
+        "attestation_id",
+        "actor_id",
+        "state",
+        "limit",
+        "checked_at",
+        "offset",
+    ),
+    validate=_validate_attestation_access_grant_states_claims,
 )
 
 
