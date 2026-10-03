@@ -513,3 +513,20 @@ def actor_trust_policy_id(actor_id: str) -> str:
         ensure_ascii=False,
     ).encode("utf-8")
     return "atp_" + hashlib.sha256(material).hexdigest()
+
+
+def actor_trust_policy_revocation_id(policy_id: str) -> str:
+    """Return a stable ``tpr_``-prefixed identifier for a policy revocation.
+
+    The identity is exactly the idempotency key: the revoked policy. Each
+    policy carries at most one revocation, so the id is stable for the same
+    policy and a retried submission maps to the same record. The material is
+    a canonical JSON array so fields containing separators cannot collide
+    with different field splits.
+    """
+    material = json.dumps(
+        ["actor_trust_policy_revocation", policy_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "tpr_" + hashlib.sha256(material).hexdigest()

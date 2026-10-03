@@ -415,6 +415,24 @@ class ActorTrustPolicyConflictError(DomainError):
         super().__init__(details={"actor_id": actor_id})
 
 
+class ActorTrustPolicyRevocationConflictError(DomainError):
+    """A second, different revocation for a policy that already has one.
+
+    A policy carries at most one immutable revocation: a submission carrying
+    a reason different from the policy's existing revocation is a conflict,
+    not a replacement, and writes neither a revocation nor an audit event. A
+    retry carrying the same reason is instead the normal 200 idempotent
+    return of the original record.
+    """
+
+    status_code = 409
+    code = "trust_policy_revocation_conflict"
+    message = "The policy already has a revocation with a different reason."
+
+    def __init__(self, policy_id: str):
+        super().__init__(details={"policy_id": policy_id})
+
+
 class TrustEvaluationBatchTargetNotFoundError(DomainError):
     """The first missing target in a batch trust evaluation.
 

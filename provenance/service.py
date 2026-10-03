@@ -20,6 +20,7 @@ from provenance import canonical, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
     ActorTrustPolicyConflictError,
+    ActorTrustPolicyRevocationConflictError,
     AttestationAccessGrantExpiryConflictError,
     AuditCheckpointImportNotFoundError,
     AuditCheckpointJobConflictError,
@@ -69,6 +70,7 @@ from provenance.models import (
     AUDIT_CHECKPOINT_JOB_SUCCEEDED,
     EVENT_ACTOR_CREATED,
     EVENT_ACTOR_TRUST_POLICY_CREATED,
+    EVENT_ACTOR_TRUST_POLICY_REVOKED,
     EVENT_ATTESTATION_ACCESS_GRANTED,
     EVENT_ATTESTATION_ACCESS_GRANT_REVOKED,
     EVENT_ATTESTATION_ACCESS_GRANT_EXPIRY_SCHEDULED,
@@ -94,6 +96,7 @@ from provenance.models import (
     EVENT_REVOCATION_IMPACT_IMPORTED,
     Actor,
     ActorTrustPolicy,
+    ActorTrustPolicyRevocation,
     Attestation,
     AttestationAccessGrant,
     AttestationAccessGrantExpiry,
@@ -119,6 +122,7 @@ from provenance.models import (
 from provenance.schemas import (
     ActorCreate,
     ActorTrustPolicyCreate,
+    ActorTrustPolicyRevocationCreate,
     AttestationAccessGrantCreate,
     AttestationAccessGrantRevocationCreate,
     AttestationCreate,
@@ -5257,6 +5261,99 @@ def create_actor_trust_policy(
     return policy, True
 
 
+def create_actor_trust_policy_revocation(
+    session: Session,
+    payload: ActorTrustPolicyRevocationCreate,
+    caller_actor_id: str,
+) -> tuple[ActorTrustPolicyRevocation, bool]:
+    """Revoke an existing trust policy, returning ``(record, created)``.
+
+    The authenticated caller must be the policy's subject; the policy must
+    already exist. An unknown policy and a caller who is not the subject are
+    indistinguishable: both raise the same opaque ``404 not_found`` and write
+    nothing. The policy is never mutated or deleted -- the original row, its
+    ``created_at``, and its historical audit events are preserved; only an
+    append-only revocation record is added.
+
+    Each policy carries at most one revocation: a repeat submission of the
+    same reason returns the existing record with ``created=False`` and writes
+    no row or audit event, while a different reason for the same policy is a
+    ``409 trust_policy_revocation_conflict`` and likewise writes nothing. On
+    first creation the revocation row and its ``actor_trust_policy.revoked``
+    audit event commit in a single transaction.
+    """
+    policy = session.execute(
+        select(ActorTrustPolicy).where(
+            ActorTrustPolicy.id == payload.policy_id
+        )
+    ).scalar_one_or_none()
+    # A missing policy and a caller who is not the subject collapse into one
+    # opaque 404 so existence is never revealed to another subject.
+    if policy is None or policy.actor_id != caller_actor_id:
+        raise ProtectedResourceNotFoundError()
+
+    existing = session.execute(
+        select(ActorTrustPolicyRevocation).where(
+            ActorTrustPolicyRevocation.policy_id == policy.id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.reason == payload.reason:
+            # Idempotent retry: the original record, no new write or audit.
+            return existing, False
+        # A revocation is never updated, replaced, or superseded.
+        raise ActorTrustPolicyRevocationConflictError(policy.id)
+
+    revocation = ActorTrustPolicyRevocation(
+        id=ids.actor_trust_policy_revocation_id(policy.id),
+        policy_id=policy.id,
+        actor_id=policy.actor_id,
+        reason=payload.reason,
+    )
+    session.add(revocation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_ACTOR_TRUST_POLICY_REVOKED,
+            resource_id=revocation.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent revocation of the same policy won the race.
+        session.rollback()
+        raced = session.execute(
+            select(ActorTrustPolicyRevocation).where(
+                ActorTrustPolicyRevocation.policy_id == policy.id
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if raced.reason == payload.reason:
+            return raced, False
+        raise ActorTrustPolicyRevocationConflictError(policy.id)
+    session.refresh(revocation)
+    return revocation, True
+
+
+def _policy_missing_decision(target_type: str, target_id: str) -> dict:
+    """The decision rendered when the caller has no effective policy.
+
+    The target is never looked up: its existence is neither checked nor
+    revealed, the qualified signer count stays zero, and both the policy id
+    and the threshold are null.
+    """
+    return {
+        "target_type": target_type,
+        "target_id": target_id,
+        "policy_id": None,
+        "threshold": None,
+        "qualified_signer_count": 0,
+        "decision": TRUST_DECISION_UNTRUSTED,
+        "reason": TRUST_REASON_POLICY_MISSING,
+    }
+
+
 def decide_trust(
     session: Session,
     actor_id: str,
@@ -5265,10 +5362,14 @@ def decide_trust(
 ) -> dict:
     """Decide trust in one target under the calling subject's current policy.
 
-    Only the caller's own stored policy participates. When the caller has no
-    policy the target is never looked up -- its existence is neither checked
-    nor revealed -- and the decision is ``untrusted``/``policy_missing``
-    with a null policy id and threshold. With a policy, the target must
+    Only the caller's own stored policy participates, and only while it is
+    unrevoked. When the caller has no policy -- or the policy's subject has
+    revoked it -- the target is never looked up (its existence is neither
+    checked nor revealed) and the decision is
+    ``untrusted``/``policy_missing`` with a null policy id and threshold. The
+    revoked policy row itself, its ``created_at``, and its historical audit
+    events are preserved; only the decision path ignores it. With an
+    unrevoked policy, the target must
     exist (a missing claim raises :class:`ClaimNotFoundError`, a missing
     evidence bundle :class:`EvidenceBundleNotFoundError`, matched by the
     declared ``target_type`` with no cross-type matching) and the qualified
@@ -5281,15 +5382,18 @@ def decide_trust(
         select(ActorTrustPolicy).where(ActorTrustPolicy.actor_id == actor_id)
     ).scalar_one_or_none()
     if policy is None:
-        return {
-            "target_type": target_type,
-            "target_id": target_id,
-            "policy_id": None,
-            "threshold": None,
-            "qualified_signer_count": 0,
-            "decision": TRUST_DECISION_UNTRUSTED,
-            "reason": TRUST_REASON_POLICY_MISSING,
-        }
+        return _policy_missing_decision(target_type, target_id)
+
+    revoked = session.execute(
+        select(ActorTrustPolicyRevocation.seq).where(
+            ActorTrustPolicyRevocation.policy_id == policy.id
+        )
+    ).first()
+    if revoked is not None:
+        # A revoked policy no longer participates: the decision renders
+        # exactly as if the caller had never registered one, and the target
+        # is never read.
+        return _policy_missing_decision(target_type, target_id)
 
     _require_trust_target(session, target_type, target_id)
     qualified = _qualified_signer_count(session, target_type, target_id)

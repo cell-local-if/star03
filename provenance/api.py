@@ -78,6 +78,8 @@ from provenance.schemas import (
     ActorTrustPolicyCreate,
     ActorTrustPolicyPageResponse,
     ActorTrustPolicyResponse,
+    ActorTrustPolicyRevocationCreate,
+    ActorTrustPolicyRevocationResponse,
     AttestationAccessGrantCreate,
     AttestationAccessGrantExpiryResponse,
     AttestationAccessGrantExpiryStateResponse,
@@ -6790,6 +6792,84 @@ async def create_actor_trust_policy(
     # audit event, or identifier. A different threshold is a 409.
     return _compact_json_response(
         ActorTrustPolicyResponse.model_validate(policy),
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+    )
+
+
+class _DuplicateFieldError(Exception):
+    """A JSON object member name repeated within one object."""
+
+    def __init__(self, field: str):
+        super().__init__(field)
+        self.field = field
+
+
+def _object_pairs_rejecting_duplicates(pairs: list) -> dict:
+    """Build an object from JSON pairs, rejecting any repeated member name.
+
+    A duplicate field makes the whole document ambiguous (which occurrence
+    signed semantics bind to), so it is a 422 rather than a silent
+    last-value-wins coercion.
+    """
+    obj: dict = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateFieldError(key)
+        obj[key] = value
+    return obj
+
+
+@router.post("/trust-policy-revocations")
+async def create_actor_trust_policy_revocation(
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # The body is parsed by hand so a non-object document, malformed JSON,
+    # invalid UTF-8, or a repeated field is a uniform 422 before any
+    # credential or policy is read; the signature still covers the exact
+    # bytes on the wire.
+    raw_body = await request.body()
+    try:
+        parsed = json.loads(
+            raw_body.decode("utf-8"),
+            object_pairs_hook=_object_pairs_rejecting_duplicates,
+        )
+    except _DuplicateFieldError as exc:
+        raise LineageValidationError(
+            [
+                {
+                    "loc": ["body", exc.field],
+                    "msg": f"duplicate field: {exc.field}",
+                    "type": "value_error.duplicate",
+                }
+            ]
+        ) from None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise LineageValidationError(
+            [{"loc": ["body"], "msg": "invalid JSON body", "type": "json_error"}]
+        ) from None
+
+    try:
+        # Exactly the two declared fields: a missing field, a wrong type, a
+        # blank or out-of-range reason, or any extra field is a 422, and the
+        # reason is stored verbatim -- never trimmed or rewritten.
+        payload = ActorTrustPolicyRevocationCreate.model_validate(parsed)
+    except ValidationError as exc:
+        raise _request_body_validation_error(exc) from None
+
+    # Every authentication failure on this write route -- missing, expired,
+    # malformed, or unverifiable credentials -- is a 422 and writes nothing.
+    caller = await _authenticate_protected(
+        request, session, raw_body, read=False
+    )
+    revocation, created = service.create_actor_trust_policy_revocation(
+        session, payload, caller
+    )
+    # First revocation -> 201; a retried submission of the same reason for
+    # the same policy -> 200 with the original record and no new row, audit
+    # event, or identifier. A different reason for the same policy is a 409.
+    return _compact_json_response(
+        ActorTrustPolicyRevocationResponse.model_validate(revocation),
         status.HTTP_201_CREATED if created else status.HTTP_200_OK,
     )
 

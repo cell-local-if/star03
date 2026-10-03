@@ -3946,6 +3946,46 @@ class ActorTrustPolicyPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ActorTrustPolicyRevocationCreate(BaseModel):
+    # A policy revocation carries exactly its declared fields; undeclared
+    # fields are rejected rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The existing trust policy being revoked.
+    policy_id: str = Field(..., min_length=1, max_length=80)
+    #: Non-empty rationale of 1..1000 Unicode characters; stored verbatim --
+    #: never trimmed, coerced, or rewritten. Whitespace-only text is blank
+    #: and rejected.
+    reason: str = Field(..., min_length=1, max_length=1000)
+
+    @field_validator("policy_id")
+    @classmethod
+    def _policy_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "policy_id")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, v: str) -> str:
+        # Reject blank (whitespace-only) text but keep the value byte-exact:
+        # the reason is evidence and is never trimmed or rewritten.
+        if not v.strip():
+            raise ValueError("reason must not be empty")
+        return v
+
+
+class ActorTrustPolicyRevocationResponse(BaseModel):
+    """Public revocation view: policy, subject, verbatim reason, UTC time."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    policy_id: str
+    #: The revoking actor; always the policy's subject.
+    actor_id: str
+    reason: str
+    created_at: datetime
+
+
 class TrustDecisionResponse(BaseModel):
     """Read-only authorization decision under the caller's current policy.
 

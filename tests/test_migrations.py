@@ -91,7 +91,8 @@ def test_fresh_database_is_baselined_with_latest_schema(tmp_path):
     try:
         tables = _table_names(con)
         assert "schema_migrations" in tables
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2]
+        assert "actor_trust_policy_revocations" in tables
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
         assert "display_seq" in _columns(con, "actors")
         triggers = {
             row[0]
@@ -151,7 +152,7 @@ def test_legacy_database_backfills_order_and_preserves_fields(tmp_path):
 
     con = _connect(db_path)
     try:
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
         assert [
             row[0]
             for row in con.execute(
@@ -217,7 +218,7 @@ def test_empty_legacy_table_migrates_and_starts_sequence_at_one(tmp_path):
     assert [item["id"] for item in body["items"]] == ["only-1"]
     con = _connect(db_path)
     try:
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
         assert con.execute(
             "SELECT display_seq FROM actors WHERE id = 'only-1'"
         ).fetchone()[0] == 1
@@ -246,7 +247,7 @@ def test_migration_is_idempotent_across_restarts(tmp_path):
     con = _connect(db_path)
     try:
         # Applied exactly once despite three startups.
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
         assert [
             row[0]
             for row in con.execute(
@@ -308,7 +309,7 @@ def test_failed_migration_rolls_back_and_a_later_startup_succeeds(
     ]
     con = _connect(db_path)
     try:
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
         assert "display_seq" in _columns(con, "actors")
     finally:
         con.close()
@@ -330,7 +331,7 @@ def test_actor_list_writes_no_migration_record(tmp_path):
     con = _connect(db_path)
     try:
         # Still just the single baselined version; reads added nothing.
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
         assert con.execute("SELECT COUNT(*) FROM actors").fetchone()[0] == 0
     finally:
         con.close()
