@@ -1078,6 +1078,33 @@ class AttestationResponse(BaseModel):
     created_at: datetime
 
 
+class AttestationVerificationCreate(AttestationCreate):
+    """Request body for the stateless ``POST /attestation-verifications``.
+
+    Exactly the same five members and acceptance rules as
+    :class:`AttestationCreate` -- the ``claim``/``evidence_bundle`` literal,
+    non-blank ``target_id``/``signer_actor_id`` bounded to 80/255
+    characters (surrounding whitespace trimmed under the same rule), and
+    canonical standard-Base64 32-byte key / 64-byte signature -- so a set
+    of materials is parsed identically whether it is submitted for
+    creation or for independent verification. Unlike creation, neither
+    identifier is required to exist locally; undeclared members are still
+    rejected.
+    """
+
+
+class AttestationVerificationResponse(BaseModel):
+    """The stateless attestation verification verdict.
+
+    The body is exactly ``{"valid": true}`` or ``{"valid": false}``: a
+    signature that fails to verify is a normal ``200`` verdict rather than
+    a service error, and no submitted key or signature material is ever
+    echoed back.
+    """
+
+    valid: bool
+
+
 class ExchangeManifestVerificationSnapshotContent(ContentResponse):
     """The ``content`` member of a snapshot under offline verification.
 

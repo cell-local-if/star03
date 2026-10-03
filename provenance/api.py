@@ -93,6 +93,8 @@ from provenance.schemas import (
     AttestationCreate,
     AttestationListResponse,
     AttestationResponse,
+    AttestationVerificationCreate,
+    AttestationVerificationResponse,
     AttestationRevocationCreate,
     AttestationRevocationListResponse,
     AttestationRevocationPageResponse,
@@ -3790,6 +3792,34 @@ def create_attestation(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return _attestation_response(attestation)
+
+
+@router.post(
+    "/attestation-verifications",
+    response_model=AttestationVerificationResponse,
+)
+async def verify_attestation(
+    payload: AttestationVerificationCreate, request: Request
+) -> AttestationVerificationResponse:
+    # The route accepts no query parameters: any (or repeated) parameter is
+    # a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly stateless: no session is injected, so the target and signing
+    # actor are never resolved against local state, and no attestation,
+    # resource, audit row, or log is created -- even for unknown ids. The
+    # verdict uses the request body alone under the exact same fixed
+    # prefix and field order as attestation creation, so identical material
+    # always yields the identical conclusion. A signature that fails to
+    # verify is a normal {"valid": false} verdict, not a service error;
+    # submitted public key and signature material is never echoed.
+    valid = signing.verify_attestation_signature(
+        payload.target_type,
+        payload.target_id,
+        payload.signer_actor_id,
+        payload.public_key,
+        payload.signature,
+    )
+    return AttestationVerificationResponse(valid=valid)
 
 
 @router.get(

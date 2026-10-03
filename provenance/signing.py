@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 
+from provenance.ed25519 import verify as _ed25519_verify
+
 #: Domain-separation prefix and protocol version of the signed array.
 ATTESTATION_MESSAGE_PREFIX = "provenance-attestation-v1"
 
@@ -33,6 +35,29 @@ def attestation_message_bytes(
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
+
+def verify_attestation_signature(
+    target_type: str,
+    target_id: str,
+    signer_actor_id: str,
+    public_key: bytes,
+    signature: bytes,
+) -> bool:
+    """Verify an attestation signature against the canonical message.
+
+    Single verification contract shared by attestation creation
+    (``POST /v1/attestations``) and the stateless verification endpoint
+    (``POST /v1/attestation-verifications``): both reconstruct the exact
+    bytes from :func:`attestation_message_bytes` and call the same strict
+    RFC 8032 Ed25519 verifier, so the same material always yields the same
+    verdict. Pure with respect to local state: nothing is queried or
+    written.
+    """
+    message = attestation_message_bytes(
+        target_type, target_id, signer_actor_id
+    )
+    return _ed25519_verify(public_key, message, signature)
 
 
 #: Domain-separation prefix and protocol version of a signed audit

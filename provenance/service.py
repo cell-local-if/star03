@@ -16,7 +16,7 @@ from sqlalchemy import exists, func, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from provenance import canonical, ed25519, ids, signing
+from provenance import canonical, ids, signing
 from provenance.errors import (
     ActorAlreadyExistsError,
     ActorTrustPolicyConflictError,
@@ -1256,10 +1256,13 @@ def create_attestation(
     if existing is not None:
         return existing, False
 
-    message = signing.attestation_message_bytes(
-        payload.target_type, payload.target_id, payload.signer_actor_id
-    )
-    if not ed25519.verify(payload.public_key, message, payload.signature):
+    if not signing.verify_attestation_signature(
+        payload.target_type,
+        payload.target_id,
+        payload.signer_actor_id,
+        payload.public_key,
+        payload.signature,
+    ):
         raise AttestationVerificationError(
             details={"reason": "signature_verification_failed"}
         )
