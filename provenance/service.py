@@ -2380,6 +2380,83 @@ def list_authentication_key_rotations_for_actor(
     return list(session.execute(stmt).scalars().all())
 
 
+DEFAULT_AUTHENTICATION_KEYS_LIMIT = 50
+MIN_AUTHENTICATION_KEYS_LIMIT = 1
+MAX_AUTHENTICATION_KEYS_LIMIT = 100
+
+#: A source of a current authentication key: ``(public_key, source_type,
+#: source_id, created_at)``; the public view of one merged key is the key
+#: bytes plus a list of these sources.
+AuthenticationKeySource = tuple[bytes, str, str, datetime]
+
+
+def list_authentication_keys_for_actor(
+    session: Session, actor_id: str
+) -> list[tuple[bytes, list[AuthenticationKeySource]]]:
+    """Return one existing subject's current authentication keys and sources.
+
+    The result is exactly the key set the protected routes authenticate
+    against: the public keys of the subject's non-revoked attestations
+    unioned with the subject's active (non-retired) rotation keys. A revoked
+    attestation and a retired rotation contribute nothing, and no key ever
+    resurrects. Each item is ``(public_key_bytes, sources)`` where
+    ``sources`` lists every valid ``(public_key, source_type, source_id,
+    created_at)`` origin of the key -- the key appears once no matter how
+    many sources carry it.
+
+    Sources follow one stable order across both tables (``created_at``, then
+    attestation-before-rotation, then the monotonic ``seq`` tiebreaker);
+    items are ordered by each key's first valid source and the sources of a
+    key keep the same order. The subject must exist; an unknown actor is a
+    missing resource (``unknown_actor`` 404), not an empty collection. The
+    function is strictly read-only: it writes no resource or audit event.
+    """
+    if session.get(Actor, actor_id) is None:
+        raise UnknownActorError(actor_id)
+    revoked = exists().where(
+        AttestationRevocation.attestation_id == Attestation.id
+    )
+    attestation_rows = session.execute(
+        select(
+            Attestation.public_key,
+            Attestation.id,
+            Attestation.created_at,
+            Attestation.seq,
+        ).where(
+            Attestation.signer_actor_id == actor_id,
+            ~revoked,
+        )
+    ).all()
+    rotation_rows = session.execute(
+        select(
+            AuthenticationKeyRotation.public_key,
+            AuthenticationKeyRotation.id,
+            AuthenticationKeyRotation.created_at,
+            AuthenticationKeyRotation.seq,
+        ).where(
+            AuthenticationKeyRotation.actor_id == actor_id,
+            AuthenticationKeyRotation.active.is_(True),
+        )
+    ).all()
+    # Merge both source kinds into one deterministic order. The per-table
+    # seq values are only comparable within one kind, so the source-kind
+    # rank breaks same-instant cross-table ties before seq does.
+    ranked: list[tuple[datetime, int, int, AuthenticationKeySource]] = [
+        (created_at, 0, seq, (public_key, "attestation", source_id, created_at))
+        for public_key, source_id, created_at, seq in attestation_rows
+    ] + [
+        (created_at, 1, seq, (public_key, "rotation", source_id, created_at))
+        for public_key, source_id, created_at, seq in rotation_rows
+    ]
+    ranked.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
+    # Group by the exact key bytes, preserving first-source order for the
+    # items and the merged source order within each item.
+    grouped: dict[bytes, list[AuthenticationKeySource]] = {}
+    for _, _, _, source in ranked:
+        grouped.setdefault(source[0], []).append(source)
+    return list(grouped.items())
+
+
 def create_authentication_key_rotation(
     session: Session,
     payload: AuthenticationKeyRotationCreate,

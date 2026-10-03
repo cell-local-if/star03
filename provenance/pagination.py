@@ -71,6 +71,10 @@ EVIDENCE_BUNDLES_CURSOR_VERSION = "eb1"
 #: rotations.
 AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION = "ak1"
 
+#: Marker for cursors that page through one actor's current authentication
+#: public keys (the merged attestation/rotation key view).
+AUTHENTICATION_KEYS_CURSOR_VERSION = "au1"
+
 #: Marker for cursors that page through one attestation's access grants.
 ATTESTATION_ACCESS_GRANTS_CURSOR_VERSION = "ag1"
 
@@ -564,6 +568,16 @@ def _validate_authentication_key_rotations_claims(claims: dict[str, Any]) -> Non
 #: ``GET /v1/actors/{actor_id}/authentication-key-rotations``.
 AUTHENTICATION_KEY_ROTATIONS_CURSOR = CursorKind(
     version=AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION,
+    claim_fields=("actor_id", "limit", "offset"),
+    validate=_validate_authentication_key_rotations_claims,
+)
+
+
+#: Cursor family for ``GET /v1/actors/{actor_id}/authentication-keys``. The
+#: merged key view belongs to exactly one subject and pages by limit/offset
+#: under the same claim rules as the rotation history.
+AUTHENTICATION_KEYS_CURSOR = CursorKind(
+    version=AUTHENTICATION_KEYS_CURSOR_VERSION,
     claim_fields=("actor_id", "limit", "offset"),
     validate=_validate_authentication_key_rotations_claims,
 )
