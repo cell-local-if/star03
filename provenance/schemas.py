@@ -3943,3 +3943,36 @@ class AuthenticationKeyRotationPageResponse(BaseModel):
     count: int
     #: Opaque server cursor for the next page, or null on the final page.
     next_cursor: str | None = None
+
+
+class AuthenticationKeySource(BaseModel):
+    """One valid origin of a currently-usable authentication public key."""
+
+    #: Only "attestation" (a non-revoked proof) or "rotation" (an active
+    #: key rotation); revoked and retired records never appear.
+    source_type: Literal["attestation", "rotation"]
+    #: The attestation or rotation identifier carrying the key.
+    source_id: str
+    #: UTC creation time of the source record.
+    created_at: datetime
+
+
+class AuthenticationKeyItem(BaseModel):
+    """One deduplicated current authentication key and all its valid sources."""
+
+    #: Standard Base64 of the 32-byte Ed25519 public key, exactly as stored.
+    public_key: str
+    #: Every valid source of this key, in stable source order.
+    sources: list[AuthenticationKeySource]
+
+
+class AuthenticationKeyPageResponse(BaseModel):
+    """A cursor-paginated page of one subject's current authentication keys."""
+
+    #: The subject whose keys are listed (echoes the path).
+    actor_id: str
+    items: list[AuthenticationKeyItem]
+    #: Total number of deduplicated keys, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None

@@ -76,6 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.authentication_key_rotations_cursor_secret = (
         secrets.token_bytes(32)
     )
+    app.state.authentication_keys_cursor_secret = secrets.token_bytes(32)
     app.state.attestation_access_grants_cursor_secret = secrets.token_bytes(32)
     app.state.attestation_access_grant_revocations_cursor_secret = (
         secrets.token_bytes(32)
