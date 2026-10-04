@@ -552,8 +552,12 @@ class EvidenceBundleExportJobNotFoundError(DomainError):
     code = "evidence_bundle_export_job_not_found"
     message = "The requested evidence bundle export job does not exist."
 
-    def __init__(self, job_id: str):
-        super().__init__(details={"job_id": job_id})
+    def __init__(self, job_id: str | None = None):
+        # A by-id lookup carries the requested job id in the details; a
+        # queue claim with no pending job has no id to report.
+        super().__init__(
+            details={"job_id": job_id} if job_id is not None else None
+        )
 
 
 class EvidenceBundleExportRequestConflictError(DomainError):

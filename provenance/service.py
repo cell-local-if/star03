@@ -78,6 +78,7 @@ from provenance.models import (
     EVIDENCE_BUNDLE_EXPORT_JOB_FAILED_ERROR,
     EVIDENCE_BUNDLE_EXPORT_JOB_PENDING,
     EVIDENCE_BUNDLE_EXPORT_JOB_RUNNING,
+    EVIDENCE_BUNDLE_EXPORT_JOB_STATES,
     EVIDENCE_BUNDLE_EXPORT_JOB_SUCCEEDED,
     EVENT_ACTOR_CREATED,
     EVENT_ACTOR_TRUST_POLICY_CREATED,
@@ -210,6 +211,10 @@ _CONTENT_EXPORT_JOB_ORDER = (
 _AUDIT_CHECKPOINT_JOB_ORDER = (
     AuditCheckpointJob.created_at.asc(),
     AuditCheckpointJob.seq.asc(),
+)
+_EVIDENCE_BUNDLE_EXPORT_JOB_ORDER = (
+    EvidenceBundleExportJob.created_at.asc(),
+    EvidenceBundleExportJob.seq.asc(),
 )
 _ACTOR_TRUST_POLICY_ORDER = (
     ActorTrustPolicy.created_at.asc(),
@@ -3533,20 +3538,11 @@ def run_evidence_bundle_export_job(
     """Atomically claim a pending bundle export job (looked up by id) and run it.
 
     The job must exist or :class:`EvidenceBundleExportJobNotFoundError` is
-    raised. Only a ``pending`` job can be claimed, so a concurrent or
-    repeated run is a :class:`EvidenceBundleExportJobConflictError` rather
-    than a second execution.
-
-    The pending-to-running transition is a single conditional
-    ``UPDATE ... WHERE status = 'pending'``, so exactly one concurrent run
-    wins and any other request observes zero updated rows and conflicts
-    without writing a state change. The winning run stamps UTC
-    ``started_at`` while claiming, builds the existing read-only exchange
-    package, and settles the job in the SAME transaction: on success it
-    stamps UTC ``finished_at`` and stores the ``{"snapshot", "manifest"}``
-    package as ``result`` with status ``succeeded``; if the build raises, it
-    stamps UTC ``finished_at``, leaves ``result`` null, records the stable
-    ``evidence_bundle_export_failed`` error, and sets status ``failed``.
+    raised. Claim and settlement follow
+    :func:`_claim_and_run_evidence_bundle_export_job`: only a ``pending``
+    job can be claimed, so a concurrent or repeated run is a
+    :class:`EvidenceBundleExportJobConflictError` rather than a second
+    execution.
     """
     job = session.execute(
         select(EvidenceBundleExportJob).where(
@@ -3555,7 +3551,69 @@ def run_evidence_bundle_export_job(
     ).scalar_one_or_none()
     if job is None:
         raise EvidenceBundleExportJobNotFoundError(job_id)
+    return _claim_and_run_evidence_bundle_export_job(session, job, build_result)
 
+
+def run_next_evidence_bundle_export_job(
+    session: Session,
+    build_result: EvidenceBundleExportResultBuilder,
+) -> EvidenceBundleExportJob:
+    """Claim the oldest pending bundle export job and run it to completion.
+
+    The queue candidate is the single oldest job still ``pending`` under the
+    stable creation order (``created_at`` with the monotonic ``seq``
+    tiebreaker, which survives restarts); other pending jobs are left
+    untouched in the queue. When no job is pending,
+    :class:`EvidenceBundleExportJobNotFoundError` is raised with zero writes:
+    no job is claimed or created and no audit event is recorded.
+
+    The selected job is claimed and settled through exactly the same atomic
+    path as :func:`run_evidence_bundle_export_job`. If a concurrent caller
+    claims the same oldest job (or it otherwise stops being pending) between
+    selection and the claim, the conditional update matches zero rows and
+    this call raises :class:`EvidenceBundleExportJobConflictError` without
+    modifying any job, creating any resource, or writing an audit event; this
+    loser never falls through to a different (younger) pending job.
+    """
+    job = session.execute(
+        select(EvidenceBundleExportJob)
+        .where(
+            EvidenceBundleExportJob.status == EVIDENCE_BUNDLE_EXPORT_JOB_PENDING
+        )
+        .order_by(*_EVIDENCE_BUNDLE_EXPORT_JOB_ORDER)
+        .limit(1)
+    ).scalar_one_or_none()
+    if job is None:
+        # An empty queue is a missing runnable resource, not an execution:
+        # nothing is claimed, created, or written and no audit event is
+        # recorded.
+        raise EvidenceBundleExportJobNotFoundError()
+    return _claim_and_run_evidence_bundle_export_job(session, job, build_result)
+
+
+def _claim_and_run_evidence_bundle_export_job(
+    session: Session,
+    job: EvidenceBundleExportJob,
+    build_result: EvidenceBundleExportResultBuilder,
+) -> EvidenceBundleExportJob:
+    """Atomically flip one already-selected job pending->running and settle it.
+
+    The pending-to-running transition is a single conditional
+    ``UPDATE ... WHERE status = 'pending'``, so exactly one concurrent run
+    wins and any other request -- a concurrent loser, or a repeat run after
+    the job has settled -- observes zero updated rows and raises
+    :class:`EvidenceBundleExportJobConflictError` without writing a state
+    change or audit event.
+
+    The winning run stamps UTC ``started_at`` while claiming, builds the
+    existing read-only exchange package, and settles the job in the SAME
+    transaction: on success it stamps UTC ``finished_at`` and stores the
+    ``{"snapshot", "manifest"}`` package as ``result`` with status
+    ``succeeded``; if the build raises, it stamps UTC ``finished_at``,
+    leaves ``result`` null, records the stable
+    ``evidence_bundle_export_failed`` error, and sets status ``failed``.
+    """
+    job_id = job.id
     # Atomic claim: the status predicate makes the pending->running flip a
     # compare-and-set. Row locking serializes concurrent writers; the loser
     # (the row is no longer pending) updates zero rows.
@@ -3563,7 +3621,7 @@ def run_evidence_bundle_export_job(
     claimed = session.execute(
         sa_update(EvidenceBundleExportJob)
         .where(
-            EvidenceBundleExportJob.id == job.id,
+            EvidenceBundleExportJob.id == job_id,
             EvidenceBundleExportJob.status == EVIDENCE_BUNDLE_EXPORT_JOB_PENDING,
         )
         .values(
@@ -3627,6 +3685,107 @@ def run_evidence_bundle_export_job(
     # onto the identity-map object before returning it.
     session.refresh(job)
     return job
+
+
+def summarize_evidence_bundle_export_jobs(
+    session: Session,
+) -> tuple[dict[str, int], EvidenceBundleExportJob | None]:
+    """Return per-status counts over all bundle export jobs and the oldest pending.
+
+    The counts cover every existing job keyed by the four lifecycle states
+    (``pending``/``running``/``succeeded``/``failed``), each defaulting to
+    zero; settled jobs remain in their ``succeeded``/``failed`` counts. The
+    second element is the single oldest ``pending`` job under the stable
+    creation order (``created_at`` with the monotonic ``seq`` tiebreaker,
+    which survives restarts), or ``None`` when no job is pending. Both are
+    computed from the current persisted state at call time -- nothing is
+    frozen, claimed, or settled.
+
+    The function is strictly read-only: it only ever issues ``SELECT``
+    queries and writes no job and no audit event. An unreadable database or
+    any internal failure of the summary queries raises
+    :class:`ObservabilityUnavailableError` (``503 service_unavailable``)
+    carrying a machine-readable reason instead of returning a partial
+    summary, and the half-open read transaction is rolled back.
+    """
+    try:
+        rows = session.execute(
+            select(EvidenceBundleExportJob.status, func.count()).group_by(
+                EvidenceBundleExportJob.status
+            )
+        ).all()
+        counts = {state: 0 for state in EVIDENCE_BUNDLE_EXPORT_JOB_STATES}
+        for status_value, total in rows:
+            # An unknown lifecycle value in anomalous history is ignored for
+            # the four named counters rather than surfacing as a fifth key.
+            if status_value in counts:
+                counts[status_value] = int(total)
+        oldest_pending = session.execute(
+            select(EvidenceBundleExportJob)
+            .where(
+                EvidenceBundleExportJob.status
+                == EVIDENCE_BUNDLE_EXPORT_JOB_PENDING
+            )
+            .order_by(*_EVIDENCE_BUNDLE_EXPORT_JOB_ORDER)
+            .limit(1)
+        ).scalar_one_or_none()
+    except SQLAlchemyError:
+        # An unreadable database (connection, schema, statement failure):
+        # drop any half-open read transaction; a summary failure must leave
+        # no transaction side effect behind. The summary itself never
+        # writes, so rollback cannot discard any application mutation.
+        session.rollback()
+        raise ObservabilityUnavailableError("database_unavailable")
+    except Exception:
+        # Any other internal failure assembling the summary is still a
+        # service unavailability for this read-only route, never a partial
+        # body or a 500, and the read has nothing to commit.
+        session.rollback()
+        raise ObservabilityUnavailableError("internal_error")
+    return counts, oldest_pending
+
+
+# Reviewer evidence bundle export job search paging bounds.
+DEFAULT_EVIDENCE_BUNDLE_EXPORT_JOBS_LIMIT = 50
+MIN_EVIDENCE_BUNDLE_EXPORT_JOBS_LIMIT = 1
+MAX_EVIDENCE_BUNDLE_EXPORT_JOBS_LIMIT = 100
+
+
+def list_evidence_bundle_export_jobs(
+    session: Session,
+    evidence_bundle_id: str | None = None,
+    request_id: str | None = None,
+    status: str | None = None,
+    from_dt=None,
+    to_dt=None,
+) -> list[EvidenceBundleExportJob]:
+    """Return bundle export jobs in stable creation order, optionally filtered.
+
+    ``evidence_bundle_id`` and ``request_id`` are exact, combinable string
+    matches (case- and whitespace-sensitive); ``status`` is one of the four
+    lifecycle literals when supplied. ``from_dt``/``to_dt`` are
+    timezone-aware UTC instants applied as inclusive ``created_at`` bounds.
+    Filter values are never resolved for existence, so an unknown bundle or
+    request id is simply an empty match set rather than an error. Results
+    follow the jobs' stable creation order (``created_at`` with the
+    monotonic ``seq`` tiebreaker, which stays stable across a restart). The
+    function is strictly read-only: it writes no job and no audit event.
+    """
+    stmt = select(EvidenceBundleExportJob)
+    if evidence_bundle_id is not None:
+        stmt = stmt.where(
+            EvidenceBundleExportJob.evidence_bundle_id == evidence_bundle_id
+        )
+    if request_id is not None:
+        stmt = stmt.where(EvidenceBundleExportJob.request_id == request_id)
+    if status is not None:
+        stmt = stmt.where(EvidenceBundleExportJob.status == status)
+    if from_dt is not None:
+        stmt = stmt.where(EvidenceBundleExportJob.created_at >= from_dt)
+    if to_dt is not None:
+        stmt = stmt.where(EvidenceBundleExportJob.created_at <= to_dt)
+    stmt = stmt.order_by(*_EVIDENCE_BUNDLE_EXPORT_JOB_ORDER)
+    return list(session.execute(stmt).scalars().all())
 
 
 #: Builds the stored export result for one audit checkpoint job: the

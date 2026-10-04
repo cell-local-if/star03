@@ -1179,6 +1179,42 @@ class EvidenceBundleExportJobResponse(BaseModel):
     error: str | None
 
 
+class EvidenceBundleExportJobPageResponse(BaseModel):
+    """A cursor-paginated page of evidence bundle export job public views.
+
+    Each item is exactly the existing single-job public view (including its
+    settled ``result`` package, which itself carries only the existing
+    exchange snapshot/manifest public views -- never raw content, claim
+    payloads, or evidence bytes).
+    """
+
+    items: list[EvidenceBundleExportJobResponse]
+    #: Total number of jobs after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
+class EvidenceBundleExportJobSummaryResponse(BaseModel):
+    """Read-only queue summary over all existing evidence bundle export jobs.
+
+    Exactly six members: the four per-status counts (covering every existing
+    job, settled ones included), plus the stable id of the oldest ``pending``
+    job and the whole seconds it has waited so far. On an empty queue every
+    count is zero and both oldest-pending members are null. All numbers are
+    integers.
+    """
+
+    pending: int
+    running: int
+    succeeded: int
+    failed: int
+    #: Stable id of the oldest pending job, or null when none is pending.
+    oldest_pending_id: str | None
+    #: Whole seconds the oldest pending job has waited, or null when none.
+    oldest_pending_wait_seconds: int | None
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)
