@@ -2402,6 +2402,128 @@ def list_access_grant_states_for_attestation(
     return entries
 
 
+#: The states in which a grant still authorizes its grantee to read the
+#: attestation; ``expired`` and ``revoked`` do not.
+_ACCESS_GRANT_READABLE_STATES = (
+    ACCESS_GRANT_STATE_ACTIVE,
+    ACCESS_GRANT_STATE_SCHEDULED,
+)
+
+
+def get_attestation_access_grant_revocation_impact(
+    session: Session, revocation_id: str
+) -> dict:
+    """Describe the read-authorization loss of one existing grant revocation.
+
+    The revocation is located by its exact, case- and whitespace-sensitive
+    identifier; an unknown identifier raises
+    :class:`AttestationAccessGrantRevocationNotFoundError`. The impact is
+    derived from the persisted records alone, judged at the instant of this
+    revocation's own ``created_at``:
+
+    * ``before_state`` is the grant's state the instant before this
+      revocation was persisted: only revocations of the same grant persisted
+      strictly earlier -- in stable persistence order (``created_at``, then
+      the monotonic ``seq``, so same-instant records order by insertion) --
+      count, alongside the grant's expiry when the expiry record itself was
+      persisted no later than this revocation, evaluated at the revocation's
+      instant;
+    * ``after_state`` is the state the instant after, with this revocation
+      included (a revocation wins over any expiry, so it is always
+      ``revoked``).
+
+    Records persisted later never rewrite this revocation's historical
+    before/after judgment: an earlier revocation or an already-reached expiry
+    leaves ``changed`` false while the record itself is preserved, and an
+    expiry scheduled only after this revocation does not exist for it. ``changed``
+    is true exactly when the before state still authorized the grantee
+    (``active`` or ``scheduled``) and the after state does not. The function
+    is strictly read-only: it writes no revocation, grant, expiry, resource,
+    or audit event.
+    """
+    revocation = session.execute(
+        select(AttestationAccessGrantRevocation).where(
+            AttestationAccessGrantRevocation.id == revocation_id
+        )
+    ).scalar_one_or_none()
+    if revocation is None:
+        raise AttestationAccessGrantRevocationNotFoundError(revocation_id)
+
+    # The revoked grant always exists: the revocation's grant reference is a
+    # protected foreign key and grants are never deleted.
+    grant = session.execute(
+        select(AttestationAccessGrant).where(
+            AttestationAccessGrant.id == revocation.grant_id
+        )
+    ).scalar_one()
+
+    expires_at = session.execute(
+        select(AttestationAccessGrantExpiry.expires_at).where(
+            AttestationAccessGrantExpiry.grant_id == grant.id
+        )
+    ).scalar_one_or_none()
+
+    # The expiry figures in this revocation's historical judgment only when
+    # the expiry record itself already existed at the revocation's instant;
+    # an expiry scheduled later never rewrites the judgment. The response's
+    # ``expires_at`` member still reports the grant's current scheduled
+    # expiry (null when none was ever set).
+    expiry_created_at = session.execute(
+        select(AttestationAccessGrantExpiry.created_at).where(
+            AttestationAccessGrantExpiry.grant_id == grant.id
+        )
+    ).scalar_one_or_none()
+    effective_expires_at = (
+        expires_at
+        if expiry_created_at is not None
+        and expiry_created_at <= revocation.created_at
+        else None
+    )
+
+    # Every revocation of the same grant in stable persistence order; the
+    # ones strictly before this record are the only earlier revocations the
+    # before state may consider.
+    history = list(
+        session.execute(
+            select(AttestationAccessGrantRevocation.id)
+            .where(AttestationAccessGrantRevocation.grant_id == grant.id)
+            .order_by(*_ATTESTATION_ACCESS_GRANT_REVOCATION_ORDER)
+        )
+        .scalars()
+        .all()
+    )
+    earlier = history[: history.index(revocation.id)]
+
+    def _state(revoked: bool) -> str:
+        if revoked:
+            return ACCESS_GRANT_STATE_REVOKED
+        if (
+            effective_expires_at is not None
+            and effective_expires_at <= revocation.created_at
+        ):
+            return ACCESS_GRANT_STATE_EXPIRED
+        if effective_expires_at is not None:
+            return ACCESS_GRANT_STATE_SCHEDULED
+        return ACCESS_GRANT_STATE_ACTIVE
+
+    before_state = _state(bool(earlier))
+    after_state = _state(True)
+    changed = (
+        before_state in _ACCESS_GRANT_READABLE_STATES
+        and after_state not in _ACCESS_GRANT_READABLE_STATES
+    )
+
+    return {
+        "revocation": revocation,
+        "grant": grant,
+        "expires_at": expires_at,
+        "before_state": before_state,
+        "after_state": after_state,
+        "changed": changed,
+        "effective_at": revocation.created_at,
+    }
+
+
 DEFAULT_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 50
 MIN_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 1
 MAX_AUTHENTICATION_KEY_ROTATIONS_LIMIT = 100

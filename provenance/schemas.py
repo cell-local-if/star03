@@ -2780,6 +2780,44 @@ class AttestationAccessGrantRevocationPageResponse(BaseModel):
     next_cursor: str | None
 
 
+class AttestationAccessGrantRevocationImpactResponse(BaseModel):
+    """Read-only access-loss impact of one existing grant revocation.
+
+    Computed on demand from the persisted records: ``before_state`` is the
+    grant's state the instant before this revocation was persisted (only
+    revocations persisted earlier -- in ``created_at`` then ``seq`` order --
+    and the scheduled expiry apply), ``after_state`` the instant after (this
+    revocation included). Later records never rewrite the historical
+    judgment. ``changed`` is true exactly when the before state still
+    authorized the grantee (``active`` or ``scheduled``) and the after state
+    does not. No private key, raw signature, authentication header, claim
+    payload, content, or evidence byte is ever part of this view.
+    """
+
+    #: The existing revocation public view: id, grant_id, revoker_actor_id,
+    #: reason, created_at.
+    revocation: AttestationAccessGrantRevocationResponse
+    #: The existing grant public view: id, attestation_id, grantee_actor_id,
+    #: created_at.
+    grant: AttestationAccessGrantResponse
+    #: The attestation whose read authorization was revoked.
+    attestation_id: str
+    #: The actor whose read authorization was revoked.
+    grantee_actor_id: str
+    #: The grant's scheduled UTC expiry instant (null when none was set).
+    expires_at: datetime | None
+    #: The grant's state the instant before this revocation: ``active``,
+    #: ``scheduled``, ``expired``, or ``revoked``.
+    before_state: str
+    #: The grant's state the instant after this revocation.
+    after_state: str
+    #: True only when the before state still authorized reads and the after
+    #: state does not.
+    changed: bool
+    #: The instant the revocation took effect: its ``created_at``.
+    effective_at: datetime
+
+
 class AttestationAccessGrantStateItem(BaseModel):
     """One grant's public view plus its expiry and state at ``checked_at``.
 
