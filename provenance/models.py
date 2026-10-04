@@ -41,6 +41,7 @@ EVENT_CONTENT_CREATED = "content.created"
 EVENT_CLAIM_CREATED = "claim.created"
 EVENT_CLAIM_SUPERSEDED = "claim.superseded"
 EVENT_EVIDENCE_BUNDLE_CREATED = "evidence_bundle.created"
+EVENT_EVIDENCE_BUNDLE_REVOKED = "evidence_bundle.revoked"
 EVENT_ATTESTATION_CREATED = "attestation.created"
 EVENT_ATTESTATION_REVOKED = "attestation.revoked"
 EVENT_ATTESTATION_ACCESS_GRANTED = "attestation.access_granted"
@@ -351,6 +352,59 @@ class EvidenceBundle(Base):
     )
 
     claim: Mapped[Claim] = relationship()
+
+
+class EvidenceBundleRevocation(Base):
+    """An immutable revocation record for an existing evidence bundle.
+
+    A revocation is an append-only statement that an evidence bundle is no
+    longer relied upon. It neither mutates nor deletes the bundle: the
+    original digest-level record and its ``evidence_bundle.created`` audit
+    relationship are preserved. Revocations are append-only; there is
+    deliberately no update or delete path.
+    """
+
+    __tablename__ = "evidence_bundle_revocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "evidence_bundle_id",
+            "revoker_actor_id",
+            "reason",
+            name="uq_evidence_bundle_revocations_identity",
+        ),
+        Index(
+            "ix_evidence_bundle_revocations_bundle_order",
+            "evidence_bundle_id",
+            "created_at",
+            "seq",
+        ),
+        Index(
+            "ix_evidence_bundle_revocations_created_order", "created_at", "seq"
+        ),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable resource identifier ("ebr_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    evidence_bundle_id: Mapped[str] = mapped_column(
+        String(80), ForeignKey("evidence_bundles.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    #: The actor recording the revocation; need not be a bundle signer.
+    revoker_actor_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("actors.id", ondelete="RESTRICT"), nullable=False
+    )
+    #: Non-empty, human/audit rationale; stored verbatim (trimmed) text.
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+
+    evidence_bundle: Mapped[EvidenceBundle] = relationship()
+    revoker_actor: Mapped[Actor] = relationship()
 
 
 class Attestation(Base):

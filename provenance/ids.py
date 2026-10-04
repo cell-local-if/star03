@@ -220,6 +220,31 @@ def attestation_revocation_id(
     return "rev_" + hashlib.sha256(material).hexdigest()
 
 
+def evidence_bundle_revocation_id(
+    evidence_bundle_id: str,
+    revoker_actor_id: str,
+    reason: str,
+) -> str:
+    """Return a stable ``ebr_``-prefixed identifier for a bundle revocation.
+
+    The identity is exactly the idempotency key: the revoked evidence
+    bundle, the revoking actor, and the (trimmed) reason text. The material
+    is a canonical JSON array so fields containing separators cannot
+    collide with different field splits.
+    """
+    material = json.dumps(
+        [
+            "evidence_bundle_revocation",
+            evidence_bundle_id,
+            revoker_actor_id,
+            reason,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "ebr_" + hashlib.sha256(material).hexdigest()
+
+
 def authentication_key_rotation_id(
     actor_id: str, public_key_hex: str
 ) -> str:

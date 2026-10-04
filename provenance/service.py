@@ -51,6 +51,7 @@ from provenance.errors import (
     EvidenceBundleExportJobNotFoundError,
     EvidenceBundleExportRequestConflictError,
     EvidenceBundleNotFoundError,
+    EvidenceBundleRevocationNotFoundError,
     ImpactImportNotFoundError,
     ImpactReconExchangeImportNotFoundError,
     ImpactReconExchangeImportValidationError,
@@ -103,6 +104,7 @@ from provenance.models import (
     EVENT_EVIDENCE_BUNDLE_CREATED,
     EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
     EVENT_EVIDENCE_BUNDLE_EXPORT_JOB_CREATED,
+    EVENT_EVIDENCE_BUNDLE_REVOKED,
     EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED,
     EVENT_REVOCATION_IMPACT_IMPORTED,
     Actor,
@@ -127,6 +129,7 @@ from provenance.models import (
     CspImportRecord,
     EvidenceBundle,
     EvidenceBundleExportJob,
+    EvidenceBundleRevocation,
     ExchangeImportRecord,
     ImpactImportRecord,
     ImpactReconExchangeImportRecord,
@@ -154,6 +157,7 @@ from provenance.schemas import (
     EvidenceBundleCreate,
     EvidenceBundleExportJobCreate,
     EvidenceBundleImportCreate,
+    EvidenceBundleRevocationCreate,
     ImpactReconExchangeImportCreate,
     RevocationImpactImportCreate,
     TrustEvaluationBatchRequest,
@@ -176,6 +180,10 @@ _CLAIM_SUPERSESSION_ORDER = (
 _EVIDENCE_BUNDLE_ORDER = (
     EvidenceBundle.created_at.asc(),
     EvidenceBundle.seq.asc(),
+)
+_EVIDENCE_BUNDLE_REVOCATION_ORDER = (
+    EvidenceBundleRevocation.created_at.asc(),
+    EvidenceBundleRevocation.seq.asc(),
 )
 _ATTESTATION_ORDER = (Attestation.created_at.asc(), Attestation.seq.asc())
 _ATTESTATION_REVOCATION_ORDER = (
@@ -1497,6 +1505,116 @@ def list_revocations_for_attestation(
         select(AttestationRevocation)
         .where(AttestationRevocation.attestation_id == attestation_id)
         .order_by(*_ATTESTATION_REVOCATION_ORDER)
+    )
+    return list(session.execute(stmt).scalars().all())
+
+
+def _bundle_revocation_identity_select(payload: EvidenceBundleRevocationCreate):
+    return select(EvidenceBundleRevocation).where(
+        EvidenceBundleRevocation.evidence_bundle_id
+        == payload.evidence_bundle_id,
+        EvidenceBundleRevocation.revoker_actor_id == payload.revoker_actor_id,
+        EvidenceBundleRevocation.reason == payload.reason,
+    )
+
+
+def create_evidence_bundle_revocation(
+    session: Session, payload: EvidenceBundleRevocationCreate
+) -> tuple[EvidenceBundleRevocation, bool]:
+    """Create an immutable evidence bundle revocation, returning ``(record, created)``.
+
+    The revoked evidence bundle and the revoking actor must already exist;
+    the revoking actor need not be a signer of the bundle. The bundle is
+    never mutated or deleted -- only an append-only revocation record is
+    added. A repeat submission of the same bundle, revoking actor, and
+    (trimmed) reason returns the existing record with ``created=False`` and
+    writes no row or audit event. Any other field combination forms an
+    independent record. On first creation the revocation row and its
+    ``evidence_bundle.revoked`` audit event commit in a single transaction.
+    """
+    # Missing references are missing resources, distinct from validation
+    # errors; check the bundle first, then the revoking actor.
+    bundle = session.execute(
+        select(EvidenceBundle).where(
+            EvidenceBundle.id == payload.evidence_bundle_id
+        )
+    ).scalar_one_or_none()
+    if bundle is None:
+        raise EvidenceBundleNotFoundError(payload.evidence_bundle_id)
+
+    actor = session.get(Actor, payload.revoker_actor_id)
+    if actor is None:
+        raise UnknownActorError(payload.revoker_actor_id)
+
+    existing = session.execute(
+        _bundle_revocation_identity_select(payload)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+
+    revocation = EvidenceBundleRevocation(
+        id=ids.evidence_bundle_revocation_id(
+            payload.evidence_bundle_id,
+            payload.revoker_actor_id,
+            payload.reason,
+        ),
+        evidence_bundle_id=payload.evidence_bundle_id,
+        revoker_actor_id=payload.revoker_actor_id,
+        reason=payload.reason,
+    )
+    session.add(revocation)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_EVIDENCE_BUNDLE_REVOKED, resource_id=revocation.id
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # Concurrent identical revocation won the race: return its record.
+        session.rollback()
+        raced = session.execute(
+            _bundle_revocation_identity_select(payload)
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        return raced, False
+    session.refresh(revocation)
+    return revocation, True
+
+
+def get_evidence_bundle_revocation(
+    session: Session, revocation_id: str
+) -> EvidenceBundleRevocation:
+    """Return a revocation by id or raise
+    :class:`EvidenceBundleRevocationNotFoundError`."""
+    revocation = session.execute(
+        select(EvidenceBundleRevocation).where(
+            EvidenceBundleRevocation.id == revocation_id
+        )
+    ).scalar_one_or_none()
+    if revocation is None:
+        raise EvidenceBundleRevocationNotFoundError(revocation_id)
+    return revocation
+
+
+def list_revocations_for_evidence_bundle(
+    session: Session, evidence_bundle_id: str
+) -> list[EvidenceBundleRevocation]:
+    """Return revocation records for one evidence bundle in stable creation order.
+
+    The evidence bundle must exist; an unknown bundle id is a missing
+    resource, not an empty collection.
+    """
+    bundle = session.execute(
+        select(EvidenceBundle).where(EvidenceBundle.id == evidence_bundle_id)
+    ).scalar_one_or_none()
+    if bundle is None:
+        raise EvidenceBundleNotFoundError(evidence_bundle_id)
+    stmt = (
+        select(EvidenceBundleRevocation)
+        .where(EvidenceBundleRevocation.evidence_bundle_id == evidence_bundle_id)
+        .order_by(*_EVIDENCE_BUNDLE_REVOCATION_ORDER)
     )
     return list(session.execute(stmt).scalars().all())
 

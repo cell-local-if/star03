@@ -1727,6 +1727,51 @@ class AttestationRevocationListResponse(BaseModel):
     count: int
 
 
+class EvidenceBundleRevocationCreate(BaseModel):
+    # A revocation carries exactly its declared fields; undeclared fields
+    # are rejected rather than silently discarded.
+    model_config = ConfigDict(extra="forbid")
+
+    #: The existing evidence bundle being revoked.
+    evidence_bundle_id: str = Field(..., min_length=1, max_length=80)
+    #: An already-registered actor recording the revocation.
+    revoker_actor_id: str = Field(..., min_length=1, max_length=255)
+    #: Non-empty rationale; surrounding whitespace is trimmed.
+    reason: str = Field(..., min_length=1, max_length=4096)
+
+    @field_validator("evidence_bundle_id")
+    @classmethod
+    def _evidence_bundle_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "evidence_bundle_id")
+
+    @field_validator("revoker_actor_id")
+    @classmethod
+    def _revoker_actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "revoker_actor_id")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "reason")
+
+
+class EvidenceBundleRevocationResponse(BaseModel):
+    """Public revocation view: associations, reason text, and timestamp."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    evidence_bundle_id: str
+    revoker_actor_id: str
+    reason: str
+    created_at: datetime
+
+
+class EvidenceBundleRevocationListResponse(BaseModel):
+    items: list[EvidenceBundleRevocationResponse]
+    count: int
+
+
 class AttestationRevocationPageResponse(BaseModel):
     """A cursor-paginated page of revocation public views."""
 
