@@ -49,6 +49,11 @@ from provenance.models import (
     CONTENT_EXPORT_JOB_RUNNING,
     CONTENT_EXPORT_JOB_STATES,
     CONTENT_EXPORT_JOB_SUCCEEDED,
+    EVIDENCE_BUNDLE_EXPORT_JOB_FAILED,
+    EVIDENCE_BUNDLE_EXPORT_JOB_PENDING,
+    EVIDENCE_BUNDLE_EXPORT_JOB_RUNNING,
+    EVIDENCE_BUNDLE_EXPORT_JOB_STATES,
+    EVIDENCE_BUNDLE_EXPORT_JOB_SUCCEEDED,
     RELATION_DERIVED_FROM,
     RELATION_VERSION_OF,
 )
@@ -224,7 +229,9 @@ from provenance.schemas import (
     EvidenceBundleExchangePackageResponse,
     EvidenceBundleExchangeResponse,
     EvidenceBundleExportJobCreate,
+    EvidenceBundleExportJobPageResponse,
     EvidenceBundleExportJobResponse,
+    EvidenceBundleExportJobSummaryResponse,
     EvidenceBundleImportCreate,
     EvidenceBundleImportResponse,
     EvidenceBundleListResponse,
@@ -2605,6 +2612,238 @@ def _evidence_bundle_export_job_response(
         result=job.result,
         error=job.error,
     )
+
+
+_EVIDENCE_BUNDLE_EXPORT_JOBS_PARAMS = frozenset(
+    {"evidence_bundle_id", "request_id", "status", "from", "to",
+     "limit", "cursor"}
+)
+
+
+@router.get("/evidence-bundle-export-jobs")
+async def list_evidence_bundle_export_jobs(
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # Read-only reviewer search over evidence bundle export jobs. The GET
+    # request body must be empty: carrying any bytes (even whitespace) is a
+    # 422 validated before any parameter or job is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    # Raw multi-values are inspected deliberately: a repeated scalar is
+    # rejected instead of silently taking the last value, undeclared
+    # parameters are rejected rather than ignored, and a blank filter/limit
+    # is never coerced to a default.
+    raw = request.query_params
+
+    unknown = set(raw) - _EVIDENCE_BUNDLE_EXPORT_JOBS_PARAMS
+    if unknown:
+        # A typo never silently changes the search.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    evidence_bundle_id = _parse_nonempty_filter(raw, "evidence_bundle_id")
+    request_id = _parse_nonempty_filter(raw, "request_id")
+    status = _parse_literal_filter(
+        raw, "status", EVIDENCE_BUNDLE_EXPORT_JOB_STATES
+    )
+
+    from_dt = _parse_rfc3339_param(raw, "from")
+    to_dt = _parse_rfc3339_param(raw, "to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise _query_validation_error(
+            "from",
+            "from must not be later than to",
+            "value_error.range",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_EVIDENCE_BUNDLE_EXPORT_JOBS_LIMIT,
+        service.MIN_EVIDENCE_BUNDLE_EXPORT_JOBS_LIMIT,
+        service.MAX_EVIDENCE_BUNDLE_EXPORT_JOBS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.evidence_bundle_export_jobs_cursor_secret,
+                pagination.EVIDENCE_BUNDLE_EXPORT_JOBS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: every effective
+        # filter (null when unfiltered) and the effective limit must match.
+        expected = {
+            "evidence_bundle_id": evidence_bundle_id,
+            "request_id": request_id,
+            "status": status,
+            "from": _audit_time_claim(from_dt),
+            "to": _audit_time_claim(to_dt),
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the search writes no job and no audit event. No
+    # filter value is resolved for existence, so an unknown bundle or
+    # request id is an empty collection rather than a 404. Items reuse the
+    # single-job public view; result packages carry only existing public
+    # exchange views, never raw content, claim payloads, or evidence bytes.
+    items = service.list_evidence_bundle_export_jobs(
+        session, evidence_bundle_id, request_id, status, from_dt, to_dt
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.evidence_bundle_export_jobs_cursor_secret,
+                pagination.EVIDENCE_BUNDLE_EXPORT_JOBS_CURSOR,
+                {
+                    "evidence_bundle_id": evidence_bundle_id,
+                    "request_id": request_id,
+                    "status": status,
+                    "from": _audit_time_claim(from_dt),
+                    "to": _audit_time_claim(to_dt),
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    result = EvidenceBundleExportJobPageResponse(
+        items=[
+            _evidence_bundle_export_job_response(item) for item in page
+        ],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    # Compact UTF-8 JSON, booleans/null literal, integral numbers only,
+    # terminated by exactly one newline.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
+
+
+@router.get("/evidence-bundle-export-jobs/summary")
+async def get_evidence_bundle_export_jobs_summary(
+    request: Request, session: DbSession
+) -> Response:
+    # Registered before "/evidence-bundle-export-jobs/{job_id}" so the
+    # literal "summary" segment is never captured as a job id. The summary
+    # takes no body and no query parameters: any non-empty body (including
+    # whitespace or malformed JSON) and any parameter (unknown, blank, or
+    # repeated) is a 422 validation_error, both rejected before any job is
+    # read -- an invalid request never produces a partial summary.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # Strictly read-only: the four counts and the oldest pending job are
+    # computed from the current persisted state at read time; nothing is
+    # frozen, claimed, settled, created, or audited, and the job lifecycle
+    # is unchanged.
+    counts, oldest = service.summarize_evidence_bundle_export_jobs(session)
+    wait_seconds: int | None = None
+    if oldest is not None:
+        # Whole seconds waited so far: the current UTC instant minus the
+        # job's creation time, floored to an integer.
+        wait_seconds = math.floor(
+            (utc_now() - oldest.created_at).total_seconds()
+        )
+    result = EvidenceBundleExportJobSummaryResponse(
+        pending=counts[EVIDENCE_BUNDLE_EXPORT_JOB_PENDING],
+        running=counts[EVIDENCE_BUNDLE_EXPORT_JOB_RUNNING],
+        succeeded=counts[EVIDENCE_BUNDLE_EXPORT_JOB_SUCCEEDED],
+        failed=counts[EVIDENCE_BUNDLE_EXPORT_JOB_FAILED],
+        oldest_pending_id=oldest.id if oldest is not None else None,
+        oldest_pending_wait_seconds=wait_seconds,
+    )
+    # Compact UTF-8 JSON, null literal, integral numbers only, terminated by
+    # exactly one newline.
+    body = (
+        json.dumps(
+            result.model_dump(mode="json"),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return Response(content=body, media_type="application/json")
+
+
+@router.post(
+    "/evidence-bundle-export-jobs/run-next",
+    response_model=EvidenceBundleExportJobResponse,
+)
+async def run_next_evidence_bundle_export_job(
+    request: Request, session: DbSession
+) -> EvidenceBundleExportJobResponse:
+    # The queue claim takes no body and no query parameters: any non-empty
+    # body (including whitespace, malformed JSON, a JSON object, or any
+    # extra field) and any parameter (unknown, blank, or repeated) is a 422
+    # validation_error, rejected before any job is read -- so a malformed
+    # request never claims, creates, modifies, or audits anything.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # Server-side queue claim: the single oldest pending job in stable
+    # creation order is atomically claimed and settled exactly through the
+    # single-job run path. An empty queue is a 404
+    # evidence_bundle_export_job_not_found with zero writes; losing the
+    # claim to a concurrent caller (the chosen job was claimed first or is
+    # no longer pending) is a 409
+    # evidence_bundle_export_job_state_conflict that touches no job, creates
+    # no resource, and writes no audit event.
+    job = service.run_next_evidence_bundle_export_job(
+        session, _evidence_bundle_export_result_payload
+    )
+    return _evidence_bundle_export_job_response(job)
 
 
 @router.post(

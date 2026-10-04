@@ -85,6 +85,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         secrets.token_bytes(32)
     )
     app.state.content_export_jobs_cursor_secret = secrets.token_bytes(32)
+    app.state.evidence_bundle_export_jobs_cursor_secret = (
+        secrets.token_bytes(32)
+    )
     app.state.claim_supersession_lineage_cursor_secret = (
         secrets.token_bytes(32)
     )
