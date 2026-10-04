@@ -4049,6 +4049,33 @@ class ActorTrustPolicyRevocationPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ActorTrustPolicyRevocationImpactResponse(BaseModel):
+    """Read-only authorization-loss impact of one trust-policy revocation.
+
+    Computed on demand from the current evidence state: the ``before`` counts
+    are the counterfactual number of existing targets that would reach the
+    revoked policy's threshold if this revocation were ignored (every other
+    revocation still applies); the ``after`` counts are always zero because a
+    revoked policy no longer participates in any decision. No raw evidence,
+    signature, or key material is ever part of this view.
+    """
+
+    #: The existing revocation public view: id, policy_id, actor_id, reason,
+    #: created_at.
+    revocation: ActorTrustPolicyRevocationResponse
+    #: The revoked policy's signer threshold.
+    threshold: int
+    #: Existing claims whose qualified signer count reaches ``threshold``.
+    before_authorized_claim_count: int
+    #: Existing evidence bundles whose qualified signer count reaches
+    #: ``threshold``.
+    before_authorized_evidence_bundle_count: int
+    #: Always zero: the revoked policy authorizes nothing.
+    after_authorized_claim_count: int
+    #: Always zero: the revoked policy authorizes nothing.
+    after_authorized_evidence_bundle_count: int
+
+
 class TrustDecisionResponse(BaseModel):
     """Read-only authorization decision under the caller's current policy.
 

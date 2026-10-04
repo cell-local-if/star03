@@ -82,6 +82,7 @@ from provenance.schemas import (
     ActorTrustPolicyPageResponse,
     ActorTrustPolicyResponse,
     ActorTrustPolicyRevocationCreate,
+    ActorTrustPolicyRevocationImpactResponse,
     ActorTrustPolicyRevocationPageResponse,
     ActorTrustPolicyRevocationResponse,
     AttestationAccessGrantCreate,
@@ -7171,6 +7172,53 @@ async def list_actor_trust_policy_revocations(
         next_cursor=next_cursor,
     )
     return _compact_json_response(result, status.HTTP_200_OK)
+
+
+@router.get("/trust-policy-revocations/{revocation_id}/impact")
+async def get_actor_trust_policy_revocation_impact(
+    revocation_id: str, request: Request, session: DbSession
+) -> Response:
+    # Read-only authorization-loss impact of one existing revocation. The GET
+    # request body must be empty: carrying any bytes (even whitespace or
+    # malformed JSON) is a 422 validated before any parameter or record is
+    # read. The path takes no query parameters: any parameter -- known,
+    # unknown, blank, or repeated -- is the same 422 before the lookup.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # Strictly read-only: the impact is computed live from the current
+    # evidence state and writes no resource and no audit event, so repeated
+    # reads of unchanged state return identical results. The identifier must
+    # match a stored revocation verbatim; an unknown id is an explicit,
+    # specific 404. PUT/PATCH/DELETE and every other non-GET method on this
+    # path is the framework's 405 method_not_allowed.
+    result = service.get_actor_trust_policy_revocation_impact(
+        session, revocation_id
+    )
+    response = ActorTrustPolicyRevocationImpactResponse(
+        revocation=ActorTrustPolicyRevocationResponse.model_validate(
+            result["revocation"]
+        ),
+        threshold=result["threshold"],
+        before_authorized_claim_count=result["before_authorized_claim_count"],
+        before_authorized_evidence_bundle_count=result[
+            "before_authorized_evidence_bundle_count"
+        ],
+        after_authorized_claim_count=result["after_authorized_claim_count"],
+        after_authorized_evidence_bundle_count=result[
+            "after_authorized_evidence_bundle_count"
+        ],
+    )
+    # Compact UTF-8 JSON terminated by exactly one newline; members appear as
+    # revocation, threshold, the two before counts, then the two after
+    # counts -- never raw evidence, a signature, or key material.
+    return _compact_json_response(response, status.HTTP_200_OK)
 
 
 _TRUST_DECISION_PARAMS = frozenset({"target_type", "target_id"})

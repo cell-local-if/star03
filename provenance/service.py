@@ -22,6 +22,7 @@ from provenance.errors import (
     ActorNotFoundError,
     ActorTrustPolicyConflictError,
     ActorTrustPolicyRevocationConflictError,
+    ActorTrustPolicyRevocationNotFoundError,
     AttestationAccessGrantExpiryConflictError,
     AuditCheckpointImportNotFoundError,
     AuditCheckpointJobConflictError,
@@ -5455,6 +5456,68 @@ def decide_trust(
         "reason": (
             TRUST_REASON_THRESHOLD_MET if met else TRUST_REASON_BELOW_THRESHOLD
         ),
+    }
+
+
+def get_actor_trust_policy_revocation_impact(
+    session: Session, revocation_id: str
+) -> dict:
+    """Quantify the authorization loss of one existing policy revocation.
+
+    The revocation is located by its exact, case- and whitespace-sensitive
+    identifier; an unknown identifier raises
+    :class:`ActorTrustPolicyRevocationNotFoundError`. The impact is computed
+    live from the current evidence state -- no historical state is
+    reconstructed: the ``before`` counts are the counterfactual number of
+    existing claims and evidence bundles that would be authorized if this
+    revocation were ignored, i.e. the targets whose qualified signer count
+    (verified, non-revoked attestations of the exact target, deduplicated by
+    signing actor, exactly as in :func:`evaluate_trust`) reaches the revoked
+    policy's threshold. Every other revocation still applies. The ``after``
+    counts are always zero: a revoked policy no longer participates in
+    :func:`decide_trust`, so it authorizes nothing. The function is strictly
+    read-only: it writes no resource and no audit event.
+    """
+    revocation = session.execute(
+        select(ActorTrustPolicyRevocation).where(
+            ActorTrustPolicyRevocation.id == revocation_id
+        )
+    ).scalar_one_or_none()
+    if revocation is None:
+        raise ActorTrustPolicyRevocationNotFoundError(revocation_id)
+
+    # The revoked policy always exists: the revocation's policy reference is
+    # a protected foreign key and policies are never deleted.
+    policy = session.execute(
+        select(ActorTrustPolicy).where(ActorTrustPolicy.id == revocation.policy_id)
+    ).scalar_one()
+    threshold = policy.threshold
+
+    before_claims = 0
+    for claim_id in session.execute(select(Claim.id)).scalars().all():
+        if (
+            _qualified_signer_count(session, signing.TARGET_CLAIM, claim_id)
+            >= threshold
+        ):
+            before_claims += 1
+
+    before_bundles = 0
+    for bundle_id in session.execute(select(EvidenceBundle.id)).scalars().all():
+        if (
+            _qualified_signer_count(
+                session, signing.TARGET_EVIDENCE_BUNDLE, bundle_id
+            )
+            >= threshold
+        ):
+            before_bundles += 1
+
+    return {
+        "revocation": revocation,
+        "threshold": threshold,
+        "before_authorized_claim_count": before_claims,
+        "before_authorized_evidence_bundle_count": before_bundles,
+        "after_authorized_claim_count": 0,
+        "after_authorized_evidence_bundle_count": 0,
     }
 
 
