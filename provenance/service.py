@@ -5694,6 +5694,82 @@ def evaluate_trust_batch(
     return results
 
 
+# Trust-evaluation-signer retrieval paging bounds.
+DEFAULT_TRUST_EVALUATION_SIGNERS_LIMIT = 50
+MIN_TRUST_EVALUATION_SIGNERS_LIMIT = 1
+MAX_TRUST_EVALUATION_SIGNERS_LIMIT = 100
+
+
+def list_trust_evaluation_signers(
+    session: Session, target_type: str, target_id: str
+) -> list[dict]:
+    """List one existing target's qualified signers with their proofs.
+
+    The qualified-signer definition is exactly the one
+    :func:`_qualified_signer_count` counts: verified, non-revoked
+    attestations of the exact target (every stored attestation is a
+    verified one; a revoked attestation is retained for history but no
+    longer qualifies), deduplicated by signing actor -- a subject attesting
+    under several keys, or with several proofs, appears exactly once. Each
+    item carries the subject's qualified attestation ids in stable creation
+    order (``created_at`` with the monotonic ``seq`` tiebreaker), their
+    count, and the earliest and latest UTC creation times among them.
+    Signers are ordered by their earliest qualified attestation, with
+    ``signer_actor_id`` breaking same-instant ties lexicographically.
+
+    The target must exist: a missing claim raises
+    :class:`ClaimNotFoundError` and a missing evidence bundle raises
+    :class:`EvidenceBundleNotFoundError`, matched by the declared
+    ``target_type`` with no cross-type matching. The result is computed
+    live from the persisted state and the function is strictly read-only:
+    it writes no resource, task, revocation, or audit event.
+    """
+    _require_trust_target(session, target_type, target_id)
+    revoked = exists().where(
+        AttestationRevocation.attestation_id == Attestation.id
+    )
+    rows = session.execute(
+        select(
+            Attestation.id,
+            Attestation.signer_actor_id,
+            Attestation.created_at,
+        )
+        .where(
+            Attestation.target_type == target_type,
+            Attestation.target_id == target_id,
+            ~revoked,
+        )
+        .order_by(*_ATTESTATION_ORDER)
+    ).all()
+
+    # Rows arrive in stable creation order, so the first row seen for a
+    # subject is its earliest qualified attestation and the last its
+    # latest; the id list accumulates in that same order.
+    by_signer: dict[str, dict] = {}
+    for attestation_id, signer_actor_id, created_at in rows:
+        entry = by_signer.get(signer_actor_id)
+        if entry is None:
+            entry = by_signer[signer_actor_id] = {
+                "signer_actor_id": signer_actor_id,
+                "attestation_ids": [],
+                "first_attested_at": created_at,
+                "latest_attested_at": created_at,
+            }
+        entry["attestation_ids"].append(attestation_id)
+        entry["latest_attested_at"] = created_at
+
+    items = sorted(
+        by_signer.values(),
+        key=lambda entry: (
+            entry["first_attested_at"],
+            entry["signer_actor_id"],
+        ),
+    )
+    for entry in items:
+        entry["attestation_count"] = len(entry["attestation_ids"])
+    return items
+
+
 def create_actor_trust_policy(
     session: Session,
     payload: ActorTrustPolicyCreate,

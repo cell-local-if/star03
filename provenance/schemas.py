@@ -4096,6 +4096,37 @@ class TrustEvaluationBatchResponse(BaseModel):
     count: int
 
 
+class TrustEvaluationSignerItem(BaseModel):
+    """One qualified signing subject's supporting proofs for a target.
+
+    A subject appears once however many public keys or attestations it
+    qualified with; ``attestation_ids`` lists its qualified (verified,
+    non-revoked) proofs of the exact target in stable creation order.
+    """
+
+    signer_actor_id: str
+    #: The subject's qualified attestation ids in stable creation order.
+    attestation_ids: list[str]
+    #: Number of qualified attestations (== len(attestation_ids)).
+    attestation_count: int
+    #: UTC creation time of the subject's earliest qualified attestation.
+    first_attested_at: datetime
+    #: UTC creation time of the subject's latest qualified attestation.
+    latest_attested_at: datetime
+
+
+class TrustEvaluationSignerPageResponse(BaseModel):
+    """A cursor-paginated page of one target's qualified signing subjects."""
+
+    target_type: Literal["claim", "evidence_bundle"]
+    target_id: str
+    items: list[TrustEvaluationSignerItem]
+    #: Total number of qualified signing subjects, independent of the page.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class ActorTrustPolicyCreate(BaseModel):
     # A policy carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.
