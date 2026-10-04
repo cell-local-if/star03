@@ -498,6 +498,26 @@ def audit_checkpoint_job_id(
     return "acj_" + hashlib.sha256(material).hexdigest()
 
 
+def evidence_bundle_export_job_id(
+    evidence_bundle_id: str, request_id: str
+) -> str:
+    """Return a stable ``exj_``-prefixed id for an evidence bundle export job.
+
+    The identity is exactly the idempotency key: the exported evidence
+    bundle and the client-supplied request id. A retry of the same pair maps
+    to the same job; the same request id for a different bundle maps to a
+    different job (and is rejected as a conflict). The material is a
+    canonical JSON array so fields containing separators cannot collide with
+    different field splits.
+    """
+    material = json.dumps(
+        ["evidence_bundle_export_job", evidence_bundle_id, request_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "exj_" + hashlib.sha256(material).hexdigest()
+
+
 def actor_trust_policy_id(actor_id: str) -> str:
     """Return a stable ``atp_``-prefixed identifier for a trust policy.
 
