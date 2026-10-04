@@ -442,6 +442,15 @@ class ActorTrustPolicyRevocationConflictError(DomainError):
         super().__init__(details={"policy_id": policy_id})
 
 
+class ActorTrustPolicyRevocationNotFoundError(DomainError):
+    status_code = 404
+    code = "actor_trust_policy_revocation_not_found"
+    message = "The requested actor trust policy revocation does not exist."
+
+    def __init__(self, revocation_id: str):
+        super().__init__(details={"revocation_id": revocation_id})
+
+
 class TrustEvaluationBatchTargetNotFoundError(DomainError):
     """The first missing target in a batch trust evaluation.
 

@@ -82,6 +82,7 @@ from provenance.schemas import (
     ActorTrustPolicyPageResponse,
     ActorTrustPolicyResponse,
     ActorTrustPolicyRevocationCreate,
+    ActorTrustPolicyRevocationImpactResponse,
     ActorTrustPolicyRevocationPageResponse,
     ActorTrustPolicyRevocationResponse,
     AttestationAccessGrantCreate,
@@ -7171,6 +7172,60 @@ async def list_actor_trust_policy_revocations(
         next_cursor=next_cursor,
     )
     return _compact_json_response(result, status.HTTP_200_OK)
+
+
+@router.get("/trust-policy-revocations/{revocation_id}/impact")
+async def get_actor_trust_policy_revocation_impact(
+    revocation_id: str, request: Request, session: DbSession
+) -> Response:
+    # Read-only quantification of one revocation's authorization loss. The
+    # GET request body must be empty: carrying any bytes (even whitespace,
+    # arbitrary bytes, or malformed JSON) is a 422 validated before any
+    # query parameter or revocation record is read. The path takes no query
+    # parameters: any (unknown, blank, or repeated) parameter is the same
+    # 422 before the lookup. PUT/PATCH/DELETE and every other non-GET
+    # method on this path is the framework's 405 method_not_allowed.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # Strictly read-only: the impact is computed from the current evidence
+    # state and writes no revocation, policy, resource, or audit event, so
+    # repeated reads of unchanged state (including across a restart) return
+    # identical results. The revocation id is matched verbatim; an unknown
+    # id is the actor_trust_policy_revocation_not_found 404.
+    impact = service.get_actor_trust_policy_revocation_impact(
+        session, revocation_id
+    )
+    # The response carries only the existing revocation public view, the
+    # policy threshold, and the four counts: no raw evidence, signature,
+    # authentication header, or key byte is ever part of the view.
+    result = ActorTrustPolicyRevocationImpactResponse(
+        revocation=ActorTrustPolicyRevocationResponse.model_validate(
+            impact["revocation"]
+        ),
+        threshold=impact["threshold"],
+        before_authorized_claim_count=impact[
+            "before_authorized_claim_count"
+        ],
+        before_authorized_evidence_bundle_count=impact[
+            "before_authorized_evidence_bundle_count"
+        ],
+        after_authorized_claim_count=impact["after_authorized_claim_count"],
+        after_authorized_evidence_bundle_count=impact[
+            "after_authorized_evidence_bundle_count"
+        ],
+    )
+    # Compact UTF-8 JSON, integral numbers only, terminated by exactly one
+    # newline; members appear as revocation, threshold,
+    # before_authorized_claim_count, before_authorized_evidence_bundle_count,
+    # after_authorized_claim_count, after_authorized_evidence_bundle_count.
+    return _render_compact_json(result.model_dump(mode="json"))
 
 
 _TRUST_DECISION_PARAMS = frozenset({"target_type", "target_id"})

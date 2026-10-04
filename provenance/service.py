@@ -22,6 +22,7 @@ from provenance.errors import (
     ActorNotFoundError,
     ActorTrustPolicyConflictError,
     ActorTrustPolicyRevocationConflictError,
+    ActorTrustPolicyRevocationNotFoundError,
     AttestationAccessGrantExpiryConflictError,
     AuditCheckpointImportNotFoundError,
     AuditCheckpointJobConflictError,
@@ -5532,6 +5533,94 @@ def list_actor_trust_policy_revocations_page(
     )
     page = list(session.execute(page_stmt).scalars().all())
     return page, int(total)
+
+
+def _authorized_target_count(
+    session: Session, target_model, target_type: str, threshold: int
+) -> int:
+    """Existing targets of one type whose qualified signer count reaches ``threshold``.
+
+    The counting caliber is exactly :func:`_qualified_signer_count`'s: only
+    attestations of the exact target count, every stored attestation is a
+    verified one, an attestation carrying any recorded revocation does not
+    count, and distinct signing actors count once no matter how many
+    attestations they made. Only targets that still exist (a row in the
+    target type's table) are counted.
+    """
+    revoked = exists().where(
+        AttestationRevocation.attestation_id == Attestation.id
+    )
+    qualifying = (
+        select(Attestation.target_id)
+        .join(target_model, target_model.id == Attestation.target_id)
+        .where(
+            Attestation.target_type == target_type,
+            ~revoked,
+        )
+        .group_by(Attestation.target_id)
+        .having(
+            func.count(func.distinct(Attestation.signer_actor_id)) >= threshold
+        )
+        .subquery()
+    )
+    return int(
+        session.execute(select(func.count()).select_from(qualifying)).scalar_one()
+    )
+
+
+def get_actor_trust_policy_revocation_impact(
+    session: Session, revocation_id: str
+) -> dict:
+    """Quantify the authorization loss of one existing policy revocation.
+
+    ``revocation_id`` is a verbatim, case- and whitespace-sensitive match on
+    the stored revocation id; an unknown id raises
+    :class:`ActorTrustPolicyRevocationNotFoundError`. The revocation's
+    original policy supplies the threshold.
+
+    The "before" counts are the counterfactual numbers of existing claims
+    and evidence bundles the policy would still authorize had this
+    revocation not happened: each target's qualified signer count (verified,
+    non-revoked attestations of the exact target, deduplicated by signing
+    actor, exactly as in :func:`_qualified_signer_count`) is compared
+    against the policy threshold under the current evidence state, with
+    every other revocation still in effect. The "after" counts are always
+    zero: a revoked policy no longer participates in any trust decision. The
+    result reflects the current evidence state only -- no historical state
+    is reconstructed -- and the function is strictly read-only: it writes no
+    resource and no audit event.
+    """
+    revocation = session.execute(
+        select(ActorTrustPolicyRevocation).where(
+            ActorTrustPolicyRevocation.id == revocation_id
+        )
+    ).scalar_one_or_none()
+    if revocation is None:
+        raise ActorTrustPolicyRevocationNotFoundError(revocation_id)
+
+    # The revoked policy always exists: the revocation's foreign key
+    # guarantees it and policies are never deleted.
+    policy = session.execute(
+        select(ActorTrustPolicy).where(
+            ActorTrustPolicy.id == revocation.policy_id
+        )
+    ).scalar_one()
+
+    return {
+        "revocation": revocation,
+        "threshold": policy.threshold,
+        "before_authorized_claim_count": _authorized_target_count(
+            session, Claim, signing.TARGET_CLAIM, policy.threshold
+        ),
+        "before_authorized_evidence_bundle_count": _authorized_target_count(
+            session,
+            EvidenceBundle,
+            signing.TARGET_EVIDENCE_BUNDLE,
+            policy.threshold,
+        ),
+        "after_authorized_claim_count": 0,
+        "after_authorized_evidence_bundle_count": 0,
+    }
 
 
 # Audit-event search paging bounds.
