@@ -4096,6 +4096,38 @@ class TrustEvaluationBatchResponse(BaseModel):
     count: int
 
 
+class TrustEvaluationSignerItem(BaseModel):
+    """One qualified signer of a trust-evaluation target.
+
+    A signing actor appears exactly once no matter how many keys or
+    attestations it qualified with; the item carries only the public proof
+    identifiers and their UTC creation-time bounds -- never a private key,
+    raw signature, payload, evidence, or content bytes.
+    """
+
+    signer_actor_id: str
+    #: The actor's qualifying attestations in stable creation order.
+    attestation_ids: list[str]
+    #: Number of qualifying attestations (== len(attestation_ids)).
+    attestation_count: int
+    #: UTC creation time of the actor's earliest qualifying attestation.
+    first_attested_at: datetime
+    #: UTC creation time of the actor's latest qualifying attestation.
+    latest_attested_at: datetime
+
+
+class TrustEvaluationSignerPageResponse(BaseModel):
+    """A cursor-paginated page of one target's qualified signers."""
+
+    target_type: Literal["claim", "evidence_bundle"]
+    target_id: str
+    items: list[TrustEvaluationSignerItem]
+    #: Total number of qualified signers, identical on every page.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class ActorTrustPolicyCreate(BaseModel):
     # A policy carries exactly its declared fields; undeclared fields are
     # rejected rather than silently discarded.

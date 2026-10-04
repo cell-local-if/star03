@@ -242,6 +242,8 @@ from provenance.schemas import (
     TrustEvaluationBatchRequest,
     TrustEvaluationBatchResponse,
     TrustEvaluationResponse,
+    TrustEvaluationSignerItem,
+    TrustEvaluationSignerPageResponse,
 )
 
 router = APIRouter(prefix="/v1")
@@ -7089,6 +7091,149 @@ def _compact_json_response(model, status_code: int) -> Response:
     return Response(
         content=body, status_code=status_code, media_type="application/json"
     )
+
+
+_TRUST_EVALUATION_SIGNERS_PARAMS = frozenset(
+    {"target_type", "target_id", "limit", "cursor"}
+)
+
+
+@router.get("/trust-evaluation-signers")
+async def list_trust_evaluation_signers(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only reviewer trace from a target's qualified signer count to the
+    # supporting proofs; no authentication is required. The GET request body
+    # must be empty: carrying any bytes (even whitespace or malformed JSON)
+    # is a 422 validated before any parameter or target is read. Raw
+    # multi-values are inspected deliberately: a repeated scalar is rejected
+    # instead of silently taking the last value, undeclared parameters are
+    # rejected rather than ignored, and a blank target_id or limit is never
+    # coerced to a default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _TRUST_EVALUATION_SIGNERS_PARAMS
+    if unknown:
+        # A typo (e.g. ``target_ids``) never silently changes the retrieval.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    target_type = _parse_once(raw, "target_type")
+    if target_type is None:
+        raise _query_validation_error(
+            "target_type", "Field required", "value_error.missing"
+        )
+    if target_type not in ATTESTATION_TARGET_TYPES:
+        # Covers missing values, whitespace/blank strings, casing variants,
+        # and anything other than the two literal target types.
+        raise _query_validation_error(
+            "target_type",
+            "target_type must be 'claim' or 'evidence_bundle'",
+            "value_error",
+        )
+
+    target_id = _parse_once(raw, "target_id")
+    if target_id is None:
+        raise _query_validation_error(
+            "target_id", "Field required", "value_error.missing"
+        )
+    if not target_id.strip():
+        # A blank identifier is invalid rather than a lookup of the empty
+        # string (which would merely 404).
+        raise _query_validation_error(
+            "target_id", "target_id must not be empty", "value_error"
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_TRUST_EVALUATION_SIGNERS_LIMIT,
+        service.MIN_TRUST_EVALUATION_SIGNERS_LIMIT,
+        service.MAX_TRUST_EVALUATION_SIGNERS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.trust_evaluation_signers_cursor_secret,
+                pagination.TRUST_EVALUATION_SIGNERS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the exact target
+        # and the effective limit must match exactly. A cursor minted by
+        # another endpoint family already fails decoding above.
+        expected = {
+            "target_type": target_type,
+            "target_id": target_id,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # All parameters (including the cursor) are validated before any
+    # existence lookup: a malformed request is a 422 even when the target
+    # also happens to be missing. Strictly read-only: the retrieval writes
+    # no resource, task, revocation, or audit event.
+    items = service.list_trust_evaluation_signers(
+        session, target_type, target_id
+    )
+    total = len(items)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        page = items[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.trust_evaluation_signers_cursor_secret,
+                pagination.TRUST_EVALUATION_SIGNERS_CURSOR,
+                {
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the qualified signer's public proof trace only: the actor
+    # id, its qualifying attestation ids, their count, and the UTC creation
+    # bounds. No private key, raw signature, payload, evidence, or content
+    # byte is ever part of that view.
+    result = TrustEvaluationSignerPageResponse(
+        target_type=target_type,
+        target_id=target_id,
+        items=[TrustEvaluationSignerItem(**item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    return _compact_json_response(result, status.HTTP_200_OK)
 
 
 @router.post("/trust-policies")

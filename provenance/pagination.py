@@ -103,6 +103,10 @@ TRUST_POLICIES_CURSOR_VERSION = "tp1"
 #: retrieval.
 TRUST_POLICY_REVOCATIONS_CURSOR_VERSION = "tr1"
 
+#: Marker for cursors that page through one target's qualified trust
+#: signers.
+TRUST_EVALUATION_SIGNERS_CURSOR_VERSION = "ts1"
+
 #: Marker for cursors that page through the reviewer actor retrieval.
 ACTORS_CURSOR_VERSION = "ac1"
 
@@ -890,6 +894,31 @@ TRUST_POLICY_REVOCATIONS_CURSOR = CursorKind(
     version=TRUST_POLICY_REVOCATIONS_CURSOR_VERSION,
     claim_fields=("policy_id", "actor_id", "limit", "offset"),
     validate=_validate_trust_policy_revocations_claims,
+)
+
+
+def _validate_trust_evaluation_signers_claims(claims: dict[str, Any]) -> None:
+    # The page belongs to exactly one target: a literal target type and a
+    # non-empty target id, bound exactly as the request carried them
+    # (matching is case- and whitespace-sensitive, so the raw values bind).
+    if claims["target_type"] not in ("claim", "evidence_bundle"):
+        raise InvalidCursorError("cursor target_type is invalid")
+    if not isinstance(claims["target_id"], str) or not claims["target_id"]:
+        raise InvalidCursorError("cursor target_id is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for ``GET /v1/trust-evaluation-signers``.
+TRUST_EVALUATION_SIGNERS_CURSOR = CursorKind(
+    version=TRUST_EVALUATION_SIGNERS_CURSOR_VERSION,
+    claim_fields=("target_type", "target_id", "limit", "offset"),
+    validate=_validate_trust_evaluation_signers_claims,
 )
 
 
