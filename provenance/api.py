@@ -82,6 +82,7 @@ from provenance.schemas import (
     ActorTrustPolicyPageResponse,
     ActorTrustPolicyResponse,
     ActorTrustPolicyRevocationCreate,
+    ActorTrustPolicyRevocationPageResponse,
     ActorTrustPolicyRevocationResponse,
     AttestationAccessGrantCreate,
     AttestationAccessGrantExpiryResponse,
@@ -7044,6 +7045,128 @@ async def list_actor_trust_policies(request: Request, session: DbSession) -> Res
     # of that view.
     result = ActorTrustPolicyPageResponse(
         items=[ActorTrustPolicyResponse.model_validate(item) for item in page],
+        count=total,
+        next_cursor=next_cursor,
+    )
+    return _compact_json_response(result, status.HTTP_200_OK)
+
+
+_TRUST_POLICY_REVOCATIONS_PARAMS = frozenset(
+    {"policy_id", "actor_id", "limit", "cursor"}
+)
+
+
+@router.get("/trust-policy-revocations")
+async def list_actor_trust_policy_revocations(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only retrieval of the existing immutable trust-policy revocation
+    # records. The GET request body must be empty: carrying any bytes (even
+    # whitespace or malformed JSON) is a 422 validated before any parameter
+    # or revocation record is read. Raw multi-values are inspected
+    # deliberately: a repeated scalar is rejected instead of silently taking
+    # the last value, undeclared parameters are rejected rather than
+    # ignored, and a blank filter/limit is never coerced to a default.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _TRUST_POLICY_REVOCATIONS_PARAMS
+    if unknown:
+        # A typo (e.g. ``policy_ids``) never silently changes the retrieval.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    policy_id = _parse_nonempty_filter(raw, "policy_id")
+    actor_id = _parse_nonempty_filter(raw, "actor_id")
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_TRUST_POLICY_REVOCATIONS_LIMIT,
+        service.MIN_TRUST_POLICY_REVOCATIONS_LIMIT,
+        service.MAX_TRUST_POLICY_REVOCATIONS_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.trust_policy_revocations_cursor_secret,
+                pagination.TRUST_POLICY_REVOCATIONS_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the effective
+        # filters (null when unfiltered) and the effective limit must match
+        # exactly. A cursor minted by another endpoint family already fails
+        # decoding above.
+        expected = {
+            "policy_id": policy_id,
+            "actor_id": actor_id,
+            "limit": page_limit,
+        }
+        if any(claims[key] != value for key, value in expected.items()):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Strictly read-only: the retrieval writes no revocation, policy,
+    # resource, or audit event, and never re-interprets policy state. The
+    # total is a SQL COUNT over the filtered set (covering every page) and
+    # the page is a SQL LIMIT/OFFSET window ordered in SQL by created_at
+    # then the monotonic insertion sequence, so ordering and paging survive
+    # a restart. Filter values are never resolved for existence, so an
+    # unknown policy id or subject is an empty collection rather than a 404.
+    page, total = service.list_actor_trust_policy_revocations_page(
+        session, policy_id, actor_id, page_limit, offset
+    )
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty
+        # and no further cursor can be issued.
+        page = []
+    else:
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.trust_policy_revocations_cursor_secret,
+                pagination.TRUST_POLICY_REVOCATIONS_CURSOR,
+                {
+                    "policy_id": policy_id,
+                    "actor_id": actor_id,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is the existing revocation public view only: the stable id,
+    # the revoked policy, the subject, the verbatim stored reason, and the
+    # UTC timestamp. No private key, raw signature, claim payload, content,
+    # or evidence byte is ever part of that view.
+    result = ActorTrustPolicyRevocationPageResponse(
+        items=[
+            ActorTrustPolicyRevocationResponse.model_validate(item)
+            for item in page
+        ],
         count=total,
         next_cursor=next_cursor,
     )

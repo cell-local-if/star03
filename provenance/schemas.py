@@ -4039,6 +4039,16 @@ class ActorTrustPolicyRevocationResponse(BaseModel):
     created_at: datetime
 
 
+class ActorTrustPolicyRevocationPageResponse(BaseModel):
+    """A cursor-paginated page of trust-policy-revocation public views."""
+
+    items: list[ActorTrustPolicyRevocationResponse]
+    #: Total number of revocations after filtering, independent of pagination.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None
+
+
 class TrustDecisionResponse(BaseModel):
     """Read-only authorization decision under the caller's current policy.
 
