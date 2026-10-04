@@ -66,6 +66,7 @@ EVENT_ACTOR_TRUST_POLICY_CREATED = "actor_trust_policy.created"
 EVENT_ACTOR_TRUST_POLICY_REVOKED = "actor_trust_policy.revoked"
 EVENT_AUDIT_CHECKPOINT_JOB_CREATED = "audit_checkpoint_job.created"
 EVENT_AUDIT_CHECKPOINT_JOB_RUN = "audit_checkpoint_job.run"
+EVENT_EVIDENCE_BUNDLE_EXPORT_JOB_CREATED = "evidence_bundle_export_job.created"
 
 # Content export job lifecycle states. A job is created ``pending``; a run
 # atomically claims it into ``running`` and then settles it as
@@ -104,6 +105,25 @@ AUDIT_CHECKPOINT_JOB_STATES = frozenset(
 )
 # Stable error recorded on a failed audit checkpoint export run.
 AUDIT_CHECKPOINT_JOB_FAILED_ERROR = "audit_checkpoint_export_failed"
+
+# Evidence bundle export job lifecycle states. A job is created ``pending``;
+# a run atomically claims it into ``running`` and then settles it as
+# ``succeeded`` or ``failed``. There is deliberately no path back to an
+# earlier state: a non-pending job can never be claimed or re-run.
+EVIDENCE_BUNDLE_EXPORT_JOB_PENDING = "pending"
+EVIDENCE_BUNDLE_EXPORT_JOB_RUNNING = "running"
+EVIDENCE_BUNDLE_EXPORT_JOB_SUCCEEDED = "succeeded"
+EVIDENCE_BUNDLE_EXPORT_JOB_FAILED = "failed"
+EVIDENCE_BUNDLE_EXPORT_JOB_STATES = frozenset(
+    {
+        EVIDENCE_BUNDLE_EXPORT_JOB_PENDING,
+        EVIDENCE_BUNDLE_EXPORT_JOB_RUNNING,
+        EVIDENCE_BUNDLE_EXPORT_JOB_SUCCEEDED,
+        EVIDENCE_BUNDLE_EXPORT_JOB_FAILED,
+    }
+)
+# Stable error recorded on a failed evidence bundle export run.
+EVIDENCE_BUNDLE_EXPORT_JOB_FAILED_ERROR = "evidence_bundle_export_failed"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
@@ -1421,3 +1441,64 @@ class AuditCheckpointJob(Base):
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     #: Stable failure code on a failed audit checkpoint run; null otherwise.
     error: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class EvidenceBundleExportJob(Base):
+    """An asynchronous job that exports one evidence bundle's exchange package.
+
+    A job is registered with a client-chosen ``request_id`` idempotency key
+    and an existing ``evidence_bundle_id``. It starts ``pending`` with no run
+    timestamps, result, or error. A run atomically claims a pending job into
+    ``running`` (stamping UTC ``started_at``) and then settles it exactly once
+    as ``succeeded`` -- stamping UTC ``finished_at`` and storing the existing
+    read-only exchange package (``{"snapshot", "manifest"}``) as its
+    ``result`` -- or ``failed`` -- stamping ``finished_at``, leaving ``result``
+    null and recording the stable ``evidence_bundle_export_failed`` error. The
+    state machine is monotonic: only a ``pending`` job can be claimed, so a
+    concurrent or repeated run is a conflict rather than a second execution.
+
+    ``request_id`` is unique: a retried submission for the same key returns
+    the original job; the same key reused for a different evidence bundle is
+    a conflict. The result is the only field that carries export data; it
+    holds only the existing public snapshot and manifest views, never raw
+    content, claim payloads, or evidence bytes.
+    """
+
+    __tablename__ = "evidence_bundle_export_jobs"
+    __table_args__ = (
+        Index("ix_evidence_bundle_export_jobs_created_order", "created_at", "seq"),
+    )
+
+    #: Monotonic insertion surrogate; the primary key for stable ordering.
+    seq: Mapped[int] = mapped_column(
+        _surrogate_key, primary_key=True, autoincrement=True
+    )
+    #: Server-generated stable job identifier ("exj_" + 64 hex chars).
+    id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    #: The evidence bundle this job exports; must exist at creation.
+    evidence_bundle_id: Mapped[str] = mapped_column(
+        String(80),
+        ForeignKey("evidence_bundles.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    #: Client-supplied idempotency key; unique across all jobs.
+    request_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    #: "pending", "running", "succeeded", or "failed".
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, nullable=False, default=utc_now
+    )
+    #: Set when a run claims the job; null while pending.
+    started_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+    #: Set when the run settles (succeeded or failed); null beforehand.
+    finished_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+    #: The exchange package ({"snapshot", "manifest"}) on success; null.
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: Stable failure code on a failed run; null otherwise.
+    error: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    evidence_bundle: Mapped[EvidenceBundle] = relationship()

@@ -47,6 +47,9 @@ from provenance.errors import (
     ContentRelationValidationError,
     CspImportNotFoundError,
     EvidenceBundleExchangeImportNotFoundError,
+    EvidenceBundleExportJobNotFoundError,
+    EvidenceBundleExportJobStateConflictError,
+    EvidenceBundleExportRequestConflictError,
     EvidenceBundleNotFoundError,
     ImpactImportNotFoundError,
     ImpactReconExchangeImportNotFoundError,
@@ -64,6 +67,11 @@ from provenance.models import (
     CONTENT_EXPORT_JOB_RUNNING,
     CONTENT_EXPORT_JOB_STATES,
     CONTENT_EXPORT_JOB_SUCCEEDED,
+    EVIDENCE_BUNDLE_EXPORT_JOB_FAILED,
+    EVIDENCE_BUNDLE_EXPORT_JOB_FAILED_ERROR,
+    EVIDENCE_BUNDLE_EXPORT_JOB_PENDING,
+    EVIDENCE_BUNDLE_EXPORT_JOB_RUNNING,
+    EVIDENCE_BUNDLE_EXPORT_JOB_SUCCEEDED,
     AUDIT_CHECKPOINT_JOB_FAILED,
     AUDIT_CHECKPOINT_JOB_FAILED_ERROR,
     AUDIT_CHECKPOINT_JOB_PENDING,
@@ -94,6 +102,7 @@ from provenance.models import (
     EVENT_CSP_CHECKPOINT_IMPORTED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
     EVENT_EVIDENCE_BUNDLE_EXCHANGE_IMPORTED,
+    EVENT_EVIDENCE_BUNDLE_EXPORT_JOB_CREATED,
     EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED,
     EVENT_REVOCATION_IMPACT_IMPORTED,
     Actor,
@@ -117,6 +126,7 @@ from provenance.models import (
     ContentRelation,
     CspImportRecord,
     EvidenceBundle,
+    EvidenceBundleExportJob,
     ExchangeImportRecord,
     ImpactImportRecord,
     ImpactReconExchangeImportRecord,
@@ -142,6 +152,7 @@ from provenance.schemas import (
     CspImportCreate,
     EvidenceBundleExchangeImportCreate,
     EvidenceBundleCreate,
+    EvidenceBundleExportJobCreate,
     EvidenceBundleImportCreate,
     ImpactReconExchangeImportCreate,
     RevocationImpactImportCreate,
@@ -191,6 +202,10 @@ _CONTENT_EXPORT_JOB_ORDER = (
 _AUDIT_CHECKPOINT_JOB_ORDER = (
     AuditCheckpointJob.created_at.asc(),
     AuditCheckpointJob.seq.asc(),
+)
+_EVIDENCE_BUNDLE_EXPORT_JOB_ORDER = (
+    EvidenceBundleExportJob.created_at.asc(),
+    EvidenceBundleExportJob.seq.asc(),
 )
 _ACTOR_TRUST_POLICY_ORDER = (
     ActorTrustPolicy.created_at.asc(),
@@ -3548,6 +3563,212 @@ def _claim_and_run_audit_checkpoint_job(
         .where(AuditCheckpointJob.id == job_id)
         .values(
             status=AUDIT_CHECKPOINT_JOB_SUCCEEDED,
+            finished_at=finished_at,
+            result=result,
+        )
+    )
+    session.commit()
+    # The Core UPDATEs bypassed the ORM unit of work; reload the final state
+    # onto the identity-map object before returning it.
+    session.refresh(job)
+    return job
+
+
+#: Builds the stored export result for one evidence bundle export job: the
+#: wire-shaped ``{"snapshot", "manifest"}`` package served by the read-only
+#: exchange package route for the job's evidence bundle. Injected by the API
+#: layer so the service stays free of response schemas and the failure path
+#: remains independently exercisable in tests.
+EvidenceBundleExportResultBuilder = Callable[[Session, str], dict]
+
+
+def create_evidence_bundle_export_job(
+    session: Session, payload: EvidenceBundleExportJobCreate
+) -> tuple[EvidenceBundleExportJob, bool]:
+    """Register one asynchronous evidence bundle export job, returning ``(job, created)``.
+
+    The referenced evidence bundle must exist; an unknown bundle is a missing
+    resource. ``request_id`` is the client idempotency key and is unique. A
+    repeat submission for the same ``request_id`` and ``evidence_bundle_id``
+    returns the existing job with ``created=False`` and writes no row or
+    audit event, regardless of the job's current lifecycle state. The same
+    ``request_id`` reused for a *different* ``evidence_bundle_id`` is an
+    :class:`EvidenceBundleExportRequestConflictError` and writes nothing.
+
+    A first submission creates the job ``pending`` with null
+    ``started_at``/``finished_at``/``result``/``error``; the job row and its
+    ``evidence_bundle_export_job.created`` audit event commit in a single
+    transaction.
+    """
+    bundle = session.execute(
+        select(EvidenceBundle).where(
+            EvidenceBundle.id == payload.evidence_bundle_id
+        )
+    ).scalar_one_or_none()
+    if bundle is None:
+        raise EvidenceBundleNotFoundError(payload.evidence_bundle_id)
+
+    existing = session.execute(
+        select(EvidenceBundleExportJob).where(
+            EvidenceBundleExportJob.request_id == payload.request_id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.evidence_bundle_id != payload.evidence_bundle_id:
+            raise EvidenceBundleExportRequestConflictError(payload.request_id)
+        return existing, False
+
+    job = EvidenceBundleExportJob(
+        id=ids.evidence_bundle_export_job_id(
+            payload.evidence_bundle_id, payload.request_id
+        ),
+        evidence_bundle_id=payload.evidence_bundle_id,
+        request_id=payload.request_id,
+        status=EVIDENCE_BUNDLE_EXPORT_JOB_PENDING,
+    )
+    session.add(job)
+    session.add(
+        AuditEvent(
+            event_type=EVENT_EVIDENCE_BUNDLE_EXPORT_JOB_CREATED,
+            resource_id=job.id,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent request registered this request_id first: roll back
+        # and reconcile against that job instead of duplicating it or
+        # writing a second audit event.
+        session.rollback()
+        raced = session.execute(
+            select(EvidenceBundleExportJob).where(
+                EvidenceBundleExportJob.request_id == payload.request_id
+            )
+        ).scalar_one_or_none()
+        if raced is None:  # pragma: no cover - defensive
+            raise
+        if raced.evidence_bundle_id != payload.evidence_bundle_id:
+            raise EvidenceBundleExportRequestConflictError(
+                payload.request_id
+            ) from None
+        return raced, False
+    session.refresh(job)
+    return job, True
+
+
+def get_evidence_bundle_export_job(
+    session: Session, job_id: str
+) -> EvidenceBundleExportJob:
+    """Return an evidence bundle export job by id or raise the 404 domain error.
+
+    Strictly read-only: the read writes no job and no audit event.
+    """
+    job = session.execute(
+        select(EvidenceBundleExportJob).where(
+            EvidenceBundleExportJob.id == job_id
+        )
+    ).scalar_one_or_none()
+    if job is None:
+        raise EvidenceBundleExportJobNotFoundError(job_id)
+    return job
+
+
+def run_evidence_bundle_export_job(
+    session: Session,
+    job_id: str,
+    build_result: EvidenceBundleExportResultBuilder,
+) -> EvidenceBundleExportJob:
+    """Atomically claim a pending evidence bundle export job and run it once.
+
+    The job must exist or :class:`EvidenceBundleExportJobNotFoundError` is
+    raised. The pending-to-running transition is a single conditional
+    ``UPDATE ... WHERE status = 'pending'``, so exactly one concurrent run
+    wins and any other request -- a concurrent loser, or a repeat run after
+    the job has settled -- observes zero updated rows and raises
+    :class:`EvidenceBundleExportJobStateConflictError` without writing a
+    state change.
+
+    The winning run stamps UTC ``started_at`` while claiming, builds the
+    existing read-only exchange package, and settles the job in the SAME
+    transaction: on success it stamps UTC ``finished_at`` and stores the
+    ``{"snapshot", "manifest"}`` package as ``result`` with status
+    ``succeeded``; if the build raises, it stamps UTC ``finished_at``, leaves
+    ``result`` null, records the stable ``evidence_bundle_export_failed``
+    error, and sets status ``failed``.
+    """
+    job = session.execute(
+        select(EvidenceBundleExportJob).where(
+            EvidenceBundleExportJob.id == job_id
+        )
+    ).scalar_one_or_none()
+    if job is None:
+        raise EvidenceBundleExportJobNotFoundError(job_id)
+
+    # Atomic claim: the status predicate makes the pending->running flip a
+    # compare-and-set. Row locking serializes concurrent writers; the loser
+    # (the row is no longer pending) updates zero rows.
+    started_at = utc_now()
+    claimed = session.execute(
+        sa_update(EvidenceBundleExportJob)
+        .where(
+            EvidenceBundleExportJob.id == job_id,
+            EvidenceBundleExportJob.status
+            == EVIDENCE_BUNDLE_EXPORT_JOB_PENDING,
+        )
+        .values(
+            status=EVIDENCE_BUNDLE_EXPORT_JOB_RUNNING, started_at=started_at
+        )
+    )
+    if claimed.rowcount != 1:
+        # A concurrent run claimed it first, or it already settled: this
+        # request is a conflict, not an execution, so it writes no state.
+        # Reload to report the job's current status.
+        session.rollback()
+        current = session.execute(
+            select(EvidenceBundleExportJob).where(
+                EvidenceBundleExportJob.id == job_id
+            )
+        ).scalar_one_or_none()
+        current_status = (
+            current.status
+            if current is not None
+            else EVIDENCE_BUNDLE_EXPORT_JOB_PENDING
+        )
+        raise EvidenceBundleExportJobStateConflictError(
+            job_id, current_status
+        )
+
+    try:
+        result = build_result(session, job.evidence_bundle_id)
+    except Exception:
+        # The export failed: settle as failed in the SAME transaction that
+        # holds the claim, so the job is never left stuck in ``running``.
+        # Both settlement timestamps are explicit UTC instants: started_at
+        # is the claim instant re-stamped here so a failed row always
+        # carries it even if the claim write were missing, and finished_at
+        # is the failure instant.
+        finished_at = utc_now()
+        session.execute(
+            sa_update(EvidenceBundleExportJob)
+            .where(EvidenceBundleExportJob.id == job_id)
+            .values(
+                status=EVIDENCE_BUNDLE_EXPORT_JOB_FAILED,
+                started_at=started_at,
+                finished_at=finished_at,
+                result=None,
+                error=EVIDENCE_BUNDLE_EXPORT_JOB_FAILED_ERROR,
+            )
+        )
+        session.commit()
+        session.refresh(job)
+        return job
+
+    finished_at = utc_now()
+    session.execute(
+        sa_update(EvidenceBundleExportJob)
+        .where(EvidenceBundleExportJob.id == job_id)
+        .values(
+            status=EVIDENCE_BUNDLE_EXPORT_JOB_SUCCEEDED,
             finished_at=finished_at,
             result=result,
         )

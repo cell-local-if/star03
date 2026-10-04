@@ -657,7 +657,8 @@ def _downgrade_to_v2(db_path):
     con = sqlite3.connect(db_path)
     try:
         con.execute("DROP TABLE actor_trust_policy_revocations")
-        con.execute("DELETE FROM schema_migrations WHERE version = 3")
+        con.execute("DROP TABLE evidence_bundle_export_jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version >= 3")
         con.commit()
     finally:
         con.close()
@@ -695,7 +696,7 @@ def test_legacy_v2_upgrade_preserves_policies_and_audits(tmp_path):
         try:
             assert _snapshot(con, "actor_trust_policies") == policies_before
             assert _snapshot(con, "audit_events") == audits_before
-            assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
+            assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3, 4]
             assert "actor_trust_policy_revocations" in {
                 row[0]
                 for row in con.execute(
@@ -769,7 +770,7 @@ def test_failed_v3_migration_rolls_back_and_keeps_old_data(tmp_path, monkeypatch
         pass
     con = sqlite3.connect(db_path)
     try:
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3, 4]
         assert _snapshot(con, "actor_trust_policies") == policies_before
         assert _snapshot(con, "audit_events") == audits_before
     finally:

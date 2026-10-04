@@ -223,6 +223,8 @@ from provenance.schemas import (
     EvidenceBundleExchangeManifestResponse,
     EvidenceBundleExchangePackageResponse,
     EvidenceBundleExchangeResponse,
+    EvidenceBundleExportJobCreate,
+    EvidenceBundleExportJobResponse,
     EvidenceBundleImportCreate,
     EvidenceBundleImportResponse,
     EvidenceBundleListResponse,
@@ -2565,6 +2567,95 @@ def get_evidence_bundle_exchange_package(
     return EvidenceBundleExchangePackageResponse(
         snapshot=snapshot, manifest=manifest
     )
+
+
+def _evidence_bundle_export_result_payload(
+    session: Session, evidence_bundle_id: str
+) -> dict:
+    """Wire-shaped ``{"snapshot", "manifest"}`` package persisted as a job result.
+
+    Both halves come from the same read state, exactly as served by
+    ``GET /v1/evidence-bundles/{evidence_bundle_id}/exchange/package``: the
+    snapshot is read exactly once and the manifest digests exactly that
+    snapshot object under the existing canonical SHA-256 rules.
+    ``model_dump(mode="json")`` yields exactly the body served by that
+    route, so a successful job's result is byte-for-byte that package and
+    carries only existing public views -- never raw content, claim payloads,
+    or evidence bytes.
+    """
+    snapshot = _exchange_snapshot_response(evidence_bundle_id, session)
+    manifest = _exchange_manifest_response(evidence_bundle_id, snapshot)
+    return EvidenceBundleExchangePackageResponse(
+        snapshot=snapshot, manifest=manifest
+    ).model_dump(mode="json")
+
+
+def _evidence_bundle_export_job_response(
+    job,
+) -> EvidenceBundleExportJobResponse:
+    return EvidenceBundleExportJobResponse(
+        id=job.id,
+        evidence_bundle_id=job.evidence_bundle_id,
+        request_id=job.request_id,
+        status=job.status,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        result=job.result,
+        error=job.error,
+    )
+
+
+@router.post(
+    "/evidence-bundle-export-jobs",
+    response_model=EvidenceBundleExportJobResponse,
+)
+def create_evidence_bundle_export_job(
+    payload: EvidenceBundleExportJobCreate,
+    session: DbSession,
+    response: Response,
+) -> EvidenceBundleExportJobResponse:
+    job, created = service.create_evidence_bundle_export_job(session, payload)
+    # First registration -> 201; a retried submission for the same
+    # (request_id, evidence_bundle_id) -> 200 with the original job and no
+    # new audit event. The same request_id for a different evidence bundle
+    # is a 409; an unknown evidence bundle is a 404.
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _evidence_bundle_export_job_response(job)
+
+
+@router.get(
+    "/evidence-bundle-export-jobs/{job_id}",
+    response_model=EvidenceBundleExportJobResponse,
+)
+def get_evidence_bundle_export_job(
+    job_id: str, session: DbSession
+) -> EvidenceBundleExportJobResponse:
+    # Strictly read-only: the read returns one job's public view and writes
+    # no job and no audit event. An unknown id is an explicit, specific 404.
+    job = service.get_evidence_bundle_export_job(session, job_id)
+    return _evidence_bundle_export_job_response(job)
+
+
+@router.post(
+    "/evidence-bundle-export-jobs/{job_id}/run",
+    response_model=EvidenceBundleExportJobResponse,
+)
+def run_evidence_bundle_export_job(
+    job_id: str, session: DbSession
+) -> EvidenceBundleExportJobResponse:
+    # Atomically claim the pending job (running + UTC started_at), then build
+    # the existing read-only exchange package and settle it as succeeded
+    # (result + UTC finished_at) or failed (null result,
+    # evidence_bundle_export_failed) in one transaction. A job that is not
+    # pending is a 409 evidence_bundle_export_job_state_conflict; an unknown
+    # id is a 404 evidence_bundle_export_job_not_found.
+    job = service.run_evidence_bundle_export_job(
+        session, job_id, _evidence_bundle_export_result_payload
+    )
+    return _evidence_bundle_export_job_response(job)
 
 
 @router.post(

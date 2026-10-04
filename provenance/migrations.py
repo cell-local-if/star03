@@ -48,6 +48,12 @@ SCHEMA_VERSION_2 = 2
 #: audit rows.
 SCHEMA_VERSION_3 = 3
 
+#: Fourth schema generation: the evidence bundle export job table. Fresh
+#: databases are created directly at this shape; legacy databases receive
+#: this one table (and its index) without touching existing bundles, jobs,
+#: or audit rows.
+SCHEMA_VERSION_4 = 4
+
 #: Name of the AFTER INSERT trigger that assigns display_seq to new actors.
 ACTOR_SEQ_TRIGGER = "trg_actors_display_seq"
 
@@ -166,12 +172,31 @@ def _migration_3_up(cursor, engine, metadata) -> None:
         cursor.execute(str(CreateIndex(index).compile(engine)))
 
 
+def _migration_4_up(cursor, engine, metadata) -> None:
+    """Add the evidence bundle export job table to a pre-existing DB.
+
+    Only a database that already shipped version 3 reaches this function; a
+    fresh database is created directly at the latest shape. Existing bundles
+    gain no job row and no bundle, content-export, checkpoint-job, or audit
+    value is changed. The step is individually idempotent in addition to the
+    surrounding transaction, so a re-run after external intervention neither
+    fails nor duplicates the table or its index, and any failure rolls the
+    whole batch back to the pre-startup state with the old data intact.
+    """
+    table = metadata.tables["evidence_bundle_export_jobs"]
+    if table.name not in _existing_tables(cursor):
+        cursor.execute(str(CreateTable(table).compile(engine)))
+    for index in table.indexes:
+        cursor.execute(str(CreateIndex(index).compile(engine)))
+
+
 #: Known versions in application order. A fresh database is baselined past
 #: all of them; a legacy database applies each pending one in turn.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=SCHEMA_VERSION_1, up=_migration_1_up),
     Migration(version=SCHEMA_VERSION_2, up=_migration_2_up),
     Migration(version=SCHEMA_VERSION_3, up=_migration_3_up),
+    Migration(version=SCHEMA_VERSION_4, up=_migration_4_up),
 )
 
 _CREATE_LEDGER = (

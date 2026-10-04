@@ -92,7 +92,8 @@ def test_fresh_database_is_baselined_with_latest_schema(tmp_path):
         tables = _table_names(con)
         assert "schema_migrations" in tables
         assert "actor_trust_policy_revocations" in tables
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
+        assert "evidence_bundle_export_jobs" in tables
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3, 4]
         assert "display_seq" in _columns(con, "actors")
         triggers = {
             row[0]
@@ -152,7 +153,7 @@ def test_legacy_database_backfills_order_and_preserves_fields(tmp_path):
 
     con = _connect(db_path)
     try:
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3, 4]
         assert [
             row[0]
             for row in con.execute(
@@ -218,7 +219,7 @@ def test_empty_legacy_table_migrates_and_starts_sequence_at_one(tmp_path):
     assert [item["id"] for item in body["items"]] == ["only-1"]
     con = _connect(db_path)
     try:
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3, 4]
         assert con.execute(
             "SELECT display_seq FROM actors WHERE id = 'only-1'"
         ).fetchone()[0] == 1
@@ -247,7 +248,7 @@ def test_migration_is_idempotent_across_restarts(tmp_path):
     con = _connect(db_path)
     try:
         # Applied exactly once despite three startups.
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3, 4]
         assert [
             row[0]
             for row in con.execute(
@@ -309,14 +310,13 @@ def test_failed_migration_rolls_back_and_a_later_startup_succeeds(
     ]
     con = _connect(db_path)
     try:
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3, 4]
         assert "display_seq" in _columns(con, "actors")
     finally:
         con.close()
 
 
 # --- Read-only migration ledger ----------------------------------------------
-
 
 def test_actor_list_writes_no_migration_record(tmp_path):
     db_path = tmp_path / "ro.db"
@@ -331,7 +331,48 @@ def test_actor_list_writes_no_migration_record(tmp_path):
     con = _connect(db_path)
     try:
         # Still just the single baselined version; reads added nothing.
-        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3]
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3, 4]
         assert con.execute("SELECT COUNT(*) FROM actors").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+# --- Version 4: evidence bundle export jobs -----------------------------------
+
+
+def test_legacy_v3_database_gains_the_export_job_table(tmp_path):
+    """A pre-v4 database gains only the export job table; old data is intact."""
+    db_path = tmp_path / "legacy-v3.db"
+    url = f"sqlite:///{db_path.as_posix()}"
+    with TestClient(create_app(Settings(database_url=url))) as client:
+        create_actor(client, actor_id="org-1", name="Org", type="organization")
+
+    # Simulate a version-3 database: drop the v4 table and its ledger row.
+    con = _connect(db_path)
+    try:
+        con.execute("DROP TABLE evidence_bundle_export_jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version = 4")
+        con.commit()
+        actors_before = con.execute(
+            "SELECT * FROM actors ORDER BY display_seq"
+        ).fetchall()
+        assert "evidence_bundle_export_jobs" not in _table_names(con)
+    finally:
+        con.close()
+
+    with TestClient(create_app(Settings(database_url=url))):
+        pass
+
+    con = _connect(db_path)
+    try:
+        assert "evidence_bundle_export_jobs" in _table_names(con)
+        assert [row[0] for row in con.execute("SELECT version FROM schema_migrations")] == [1, 2, 3, 4]
+        # Existing rows are untouched by the upgrade.
+        assert con.execute(
+            "SELECT * FROM actors ORDER BY display_seq"
+        ).fetchall() == actors_before
+        assert con.execute(
+            "SELECT COUNT(*) FROM evidence_bundle_export_jobs"
+        ).fetchone()[0] == 0
     finally:
         con.close()
