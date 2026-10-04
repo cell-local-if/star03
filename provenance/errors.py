@@ -92,6 +92,15 @@ class EvidenceBundleNotFoundError(DomainError):
         super().__init__(details={"evidence_bundle_id": evidence_bundle_id})
 
 
+class EvidenceBundleRevocationNotFoundError(DomainError):
+    status_code = 404
+    code = "evidence_bundle_revocation_not_found"
+    message = "The requested evidence bundle revocation does not exist."
+
+    def __init__(self, revocation_id: str):
+        super().__init__(details={"revocation_id": revocation_id})
+
+
 class AttestationNotFoundError(DomainError):
     status_code = 404
     code = "attestation_not_found"

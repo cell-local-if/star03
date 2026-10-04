@@ -230,6 +230,9 @@ from provenance.schemas import (
     EvidenceBundleListResponse,
     EvidenceBundlePageResponse,
     EvidenceBundleResponse,
+    EvidenceBundleRevocationCreate,
+    EvidenceBundleRevocationListResponse,
+    EvidenceBundleRevocationResponse,
     ExchangeManifestVerificationCreate,
     ExchangeManifestVerificationResponse,
     ObservabilitySummaryResponse,
@@ -2651,6 +2654,119 @@ def run_evidence_bundle_export_job(
         session, job_id, _evidence_bundle_export_result_payload
     )
     return _evidence_bundle_export_job_response(job)
+
+
+@router.post("/evidence-bundle-revocations")
+async def create_evidence_bundle_revocation(
+    request: Request, session: DbSession
+) -> Response:
+    # The body is parsed by hand so a non-object document, malformed JSON,
+    # invalid UTF-8, or a repeated field is a uniform 422 before any bundle
+    # or actor is read; nothing is written on any validation failure.
+    raw_body = await request.body()
+    try:
+        parsed = json.loads(
+            raw_body.decode("utf-8"),
+            object_pairs_hook=_object_pairs_rejecting_duplicates,
+        )
+    except _DuplicateFieldError as exc:
+        raise LineageValidationError(
+            [
+                {
+                    "loc": ["body", exc.field],
+                    "msg": f"duplicate field: {exc.field}",
+                    "type": "value_error.duplicate",
+                }
+            ]
+        ) from None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise LineageValidationError(
+            [{"loc": ["body"], "msg": "invalid JSON body", "type": "json_error"}]
+        ) from None
+
+    try:
+        # Exactly the three declared fields: a missing field, a wrong type, a
+        # blank value, or any extra field is a 422; the reason is stored as
+        # its trimmed text.
+        payload = EvidenceBundleRevocationCreate.model_validate(parsed)
+    except ValidationError as exc:
+        raise _request_body_validation_error(exc) from None
+
+    revocation, created = service.create_evidence_bundle_revocation(
+        session, payload
+    )
+    # First creation -> 201; a retried submission of the same bundle,
+    # revoker, and (trimmed) reason -> 200 with the original record and no
+    # new row, audit event, or identifier. A different revoker or reason is
+    # an independent record. The bundle itself is never mutated or deleted,
+    # and raw evidence bytes never enter the request, storage, or logs.
+    return _compact_json_response(
+        EvidenceBundleRevocationResponse.model_validate(revocation),
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+    )
+
+
+@router.get("/evidence-bundle-revocations/{revocation_id}")
+async def get_evidence_bundle_revocation(
+    revocation_id: str, request: Request, session: DbSession
+) -> Response:
+    # Read-only retrieval of one immutable revocation record. The request
+    # takes no body and no query parameters: any non-empty body (including
+    # whitespace or malformed JSON) and any parameter (unknown, blank, or
+    # repeated) is a 422 validation_error, both rejected before the lookup.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # Strictly read-only: the lookup writes no record and no audit event. An
+    # unknown id is an explicit 404; PUT/PATCH/DELETE and every other
+    # non-GET method on this path is the framework's 405 method_not_allowed.
+    revocation = service.get_evidence_bundle_revocation(session, revocation_id)
+    return _compact_json_response(
+        EvidenceBundleRevocationResponse.model_validate(revocation),
+        status.HTTP_200_OK,
+    )
+
+
+@router.get("/evidence-bundles/{evidence_bundle_id}/revocations")
+async def list_evidence_bundle_revocations(
+    evidence_bundle_id: str, request: Request, session: DbSession
+) -> Response:
+    # Read-only listing of one bundle's revocation records in stable
+    # creation order. The request takes no body and no query parameters:
+    # any non-empty body (including whitespace or malformed JSON) and any
+    # parameter (unknown, blank, or repeated) is a 422 validation_error,
+    # both rejected before the bundle is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # Strictly read-only: the listing writes no record and no audit event.
+    # An unknown bundle is 404 evidence_bundle_not_found; an existing bundle
+    # with no revocations is an empty collection, not a 404.
+    items = service.list_revocations_for_evidence_bundle(
+        session, evidence_bundle_id
+    )
+    return _compact_json_response(
+        EvidenceBundleRevocationListResponse(
+            items=[
+                EvidenceBundleRevocationResponse.model_validate(item)
+                for item in items
+            ],
+            count=len(items),
+        ),
+        status.HTTP_200_OK,
+    )
 
 
 @router.post(

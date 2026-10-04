@@ -727,6 +727,59 @@ class EvidenceBundlePageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class EvidenceBundleRevocationCreate(BaseModel):
+    """A revocation statement for an existing evidence bundle.
+
+    Exactly the three declared fields are accepted: a missing, blank, or
+    wrong-typed field, and any undeclared field, is a 422. ``reason`` is
+    trimmed of surrounding whitespace and stored as the trimmed text; the
+    trimmed text is the idempotency identity together with the bundle and
+    the revoking actor.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The existing evidence bundle being revoked.
+    evidence_bundle_id: str = Field(..., min_length=1, max_length=80)
+    #: An already-registered actor recording the revocation; it need not be
+    #: a party of the bundle's claim.
+    revoker_actor_id: str = Field(..., min_length=1, max_length=255)
+    #: Non-empty rationale; surrounding whitespace is trimmed.
+    reason: str = Field(..., min_length=1, max_length=4096)
+
+    @field_validator("evidence_bundle_id")
+    @classmethod
+    def _evidence_bundle_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "evidence_bundle_id")
+
+    @field_validator("revoker_actor_id")
+    @classmethod
+    def _revoker_actor_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "revoker_actor_id")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "reason")
+
+
+class EvidenceBundleRevocationResponse(BaseModel):
+    """Public revocation view: associations, reason text, and timestamp."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    evidence_bundle_id: str
+    revoker_actor_id: str
+    reason: str
+    created_at: datetime
+
+
+class EvidenceBundleRevocationListResponse(BaseModel):
+    items: list[EvidenceBundleRevocationResponse]
+    count: int
+
+
 class ClaimExportItem(ClaimResponse):
     """A claim in a content export: the full public view plus its evidence.
 

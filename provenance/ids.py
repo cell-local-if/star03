@@ -200,6 +200,33 @@ def attestation_access_grant_expiry_id(
     return "aage_" + hashlib.sha256(material).hexdigest()
 
 
+def evidence_bundle_revocation_id(
+    evidence_bundle_id: str,
+    revoker_actor_id: str,
+    reason: str,
+) -> str:
+    """Return a stable ``ebr_``-prefixed id for an evidence bundle revocation.
+
+    The identity is exactly the idempotency key: the revoked evidence bundle,
+    the revoking actor, and the (trimmed) reason text. A retry of the same
+    three fields maps to the same record; a different revoker or reason is a
+    distinct record with its own id. The material is a canonical JSON array
+    so fields containing separators cannot collide with different field
+    splits.
+    """
+    material = json.dumps(
+        [
+            "evidence_bundle_revocation",
+            evidence_bundle_id,
+            revoker_actor_id,
+            reason,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "ebr_" + hashlib.sha256(material).hexdigest()
+
+
 def attestation_revocation_id(
     attestation_id: str,
     revoker_actor_id: str,
