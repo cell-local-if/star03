@@ -2780,6 +2780,35 @@ class AttestationAccessGrantRevocationPageResponse(BaseModel):
     next_cursor: str | None
 
 
+class AttestationAccessGrantRevocationImpactResponse(BaseModel):
+    """Read-only impact of one access-grant revocation on one grantee's read.
+
+    ``revocation`` and ``grant`` are exactly the existing public views;
+    ``attestation_id`` and ``grantee_actor_id`` name the proof and the actor
+    whose grant-based read the revocation concerns. ``expires_at`` is the
+    grant's scheduled expiry as it stood when the revocation was persisted
+    (null when none had been scheduled by then). ``before_state`` and
+    ``after_state`` classify the grant at the instants immediately before
+    and after the revocation -- one of ``active``, ``scheduled``,
+    ``expired``, or ``revoked``; ``active`` and ``scheduled`` still
+    authorize the read. ``changed`` is true only when the revocation flipped
+    the grant from readable to unreadable. ``effective_at`` is the
+    revocation's own ``created_at``. No private key, raw signature,
+    authentication header, claim payload, content, or evidence byte is ever
+    part of this view.
+    """
+
+    revocation: AttestationAccessGrantRevocationResponse
+    grant: AttestationAccessGrantResponse
+    attestation_id: str
+    grantee_actor_id: str
+    expires_at: datetime | None
+    before_state: str
+    after_state: str
+    changed: bool
+    effective_at: datetime
+
+
 class AttestationAccessGrantStateItem(BaseModel):
     """One grant's public view plus its expiry and state at ``checked_at``.
 

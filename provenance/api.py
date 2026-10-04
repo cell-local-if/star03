@@ -92,6 +92,7 @@ from provenance.schemas import (
     AttestationAccessGrantPageResponse,
     AttestationAccessGrantResponse,
     AttestationAccessGrantRevocationCreate,
+    AttestationAccessGrantRevocationImpactResponse,
     AttestationAccessGrantRevocationListResponse,
     AttestationAccessGrantRevocationPageResponse,
     AttestationAccessGrantRevocationResponse,
@@ -5956,6 +5957,57 @@ def get_attestation_access_grant_revocation(
         session, revocation_id
     )
     return AttestationAccessGrantRevocationResponse.model_validate(revocation)
+
+
+@router.get("/attestation-access-grant-revocations/{revocation_id}/impact")
+async def get_attestation_access_grant_revocation_impact(
+    revocation_id: str, request: Request, session: DbSession
+) -> Response:
+    # Read-only impact of one existing grant revocation: whose read of which
+    # proof the revocation cut off. The GET request body must be empty:
+    # carrying any bytes (even whitespace or malformed JSON) is a 422
+    # validated before any parameter or record is read. The path takes no
+    # query parameters: any parameter -- known, unknown, blank, or repeated
+    # -- is the same 422 before the lookup, so a malformed request never
+    # renders as a 404.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # Strictly read-only: the impact is derived from the records persisted
+    # at or before the revocation and writes no revocation, grant, expiry,
+    # resource, or audit event, so repeated reads of unchanged state return
+    # identical results. The identifier must match a stored revocation
+    # verbatim; an unknown id is an explicit, specific 404. PUT/PATCH/DELETE
+    # and every other non-GET method on this path is the framework's 405
+    # method_not_allowed.
+    result = service.get_attestation_access_grant_revocation_impact(
+        session, revocation_id
+    )
+    response = AttestationAccessGrantRevocationImpactResponse(
+        revocation=AttestationAccessGrantRevocationResponse.model_validate(
+            result["revocation"]
+        ),
+        grant=AttestationAccessGrantResponse.model_validate(result["grant"]),
+        attestation_id=result["attestation_id"],
+        grantee_actor_id=result["grantee_actor_id"],
+        expires_at=result["expires_at"],
+        before_state=result["before_state"],
+        after_state=result["after_state"],
+        changed=result["changed"],
+        effective_at=result["effective_at"],
+    )
+    # Compact UTF-8 JSON terminated by exactly one newline; members appear
+    # as revocation, grant, attestation_id, grantee_actor_id, expires_at,
+    # before_state, after_state, changed, effective_at -- never a private
+    # key, raw signature, authentication header, claim payload, content, or
+    # evidence byte.
+    return _compact_json_response(response, status.HTTP_200_OK)
 
 
 @router.get(
