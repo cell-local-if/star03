@@ -36,6 +36,7 @@ from provenance.errors import (
     AttestationNotFoundError,
     AttestationRevocationNotFoundError,
     AttestationVerificationError,
+    AuthenticationKeyRotationNotFoundError,
     ClaimNotFoundError,
     ClaimSupersessionNotFoundError,
     ClaimSupersessionValidationError,
@@ -2837,6 +2838,27 @@ def list_authentication_keys_for_actor(
             entries.append(entry)
         entry[1].append((source_type, source_id, created_at))
     return entries
+
+
+def get_authentication_key_rotation(
+    session: Session, rotation_id: str
+) -> AuthenticationKeyRotation:
+    """Return one existing key rotation by its own stable id.
+
+    The rotation id is the only lookup key: the record is never resolved by
+    actor, public key, or any other field, and the requested value is matched
+    verbatim (case- and whitespace-sensitive, no normalization). An unknown
+    id is an explicit, specific 404 carrying the requested id. The function
+    is strictly read-only: it writes no rotation, resource, or audit event.
+    """
+    rotation = session.execute(
+        select(AuthenticationKeyRotation).where(
+            AuthenticationKeyRotation.id == rotation_id
+        )
+    ).scalar_one_or_none()
+    if rotation is None:
+        raise AuthenticationKeyRotationNotFoundError(rotation_id)
+    return rotation
 
 
 def create_authentication_key_rotation(

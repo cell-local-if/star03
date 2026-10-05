@@ -7192,6 +7192,38 @@ async def retire_authentication_key_rotation(
     return _rotation_response(rotation)
 
 
+@router.get(
+    "/authentication-key-rotations/{rotation_id}",
+    response_model=AuthenticationKeyRotationResponse,
+)
+async def get_authentication_key_rotation(
+    rotation_id: str, request: Request, session: DbSession
+) -> AuthenticationKeyRotationResponse:
+    # Public read-only retrieval of one existing rotation by its own stable
+    # id; no X-PA/X-PT/X-PS credentials are required or consulted. The GET
+    # request body must be empty and the route takes no query parameters:
+    # any bytes or any parameter (known, unknown, blank, or repeated) is a
+    # 422 validated before the record is read, so a malformed request never
+    # renders as a 404.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # Strictly read-only: the read returns the existing rotation public view
+    # and writes no rotation, resource, or audit event, so repeated reads of
+    # unchanged state return identical results. The id is the only lookup
+    # key, matched verbatim -- never a reverse lookup by actor or key, and
+    # no Base64 or format normalization; an unknown id is an explicit,
+    # specific 404. POST/PUT/PATCH/DELETE on this path are the framework's
+    # 405 method_not_allowed.
+    rotation = service.get_authentication_key_rotation(session, rotation_id)
+    return _rotation_response(rotation)
+
+
 _ACTOR_ROTATIONS_PARAMS = frozenset({"limit", "cursor"})
 
 

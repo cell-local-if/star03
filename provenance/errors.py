@@ -130,6 +130,15 @@ class AttestationAccessGrantRevocationNotFoundError(DomainError):
         super().__init__(details={"revocation_id": revocation_id})
 
 
+class AuthenticationKeyRotationNotFoundError(DomainError):
+    status_code = 404
+    code = "authentication_key_rotation_not_found"
+    message = "The requested authentication key rotation does not exist."
+
+    def __init__(self, rotation_id: str):
+        super().__init__(details={"rotation_id": rotation_id})
+
+
 class EvidenceBundleExchangeImportNotFoundError(DomainError):
     status_code = 404
     code = "evidence_bundle_exchange_import_not_found"
