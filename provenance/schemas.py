@@ -261,6 +261,58 @@ class ClaimResponse(BaseModel):
     created_at: datetime
 
 
+class ClaimVerificationCreate(BaseModel):
+    """Request body for the read-only ``POST /claim-verifications``.
+
+    Exactly two members -- a non-empty ``claim_id`` referencing an existing
+    claim and a ``payload`` JSON object -- with undeclared members rejected
+    rather than ignored. The payload is accepted under the same
+    canonicalizability rule as claim creation: a JSON object whose numbers
+    are all finite, so NaN/Infinity have no canonical form and are refused.
+    Structural validation happens before any claim lookup, so an invalid
+    request never reads the target claim; the payload itself is used only
+    for the in-request digest comparison and is never persisted, echoed, or
+    logged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Must reference an existing claim; any non-empty string is structurally
+    #: accepted (surrounding whitespace trimmed under the shared identifier
+    #: rule), with an unknown id resolved as a 404 rather than a 422.
+    claim_id: str = Field(..., min_length=1)
+    #: Candidate payload to canonicalize and compare with the stored digest.
+    payload: dict[str, Any]
+
+    @field_validator("claim_id")
+    @classmethod
+    def _claim_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "claim_id")
+
+    @field_validator("payload")
+    @classmethod
+    def _payload_canonicalizable(cls, v: dict[str, Any]) -> dict[str, Any]:
+        try:
+            canonical_json_bytes(v)
+        except (TypeError, ValueError):
+            # Non-finite numbers (NaN/Infinity) have no canonical JSON form.
+            raise ValueError(
+                "payload must be a JSON object with finite numbers"
+            ) from None
+        return v
+
+
+class ClaimVerificationResponse(BaseModel):
+    """The read-only claim payload verification verdict.
+
+    The body is exactly ``{"valid": true}`` or ``{"valid": false}``: a
+    digest mismatch on an existing claim is a normal ``200`` verdict rather
+    than a service error, and no submitted payload material is ever echoed.
+    """
+
+    valid: bool
+
+
 class ClaimListResponse(BaseModel):
     items: list[ClaimResponse]
     count: int

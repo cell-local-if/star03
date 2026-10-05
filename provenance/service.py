@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 from datetime import datetime
 from typing import Callable
 
@@ -530,6 +531,25 @@ def get_claim(session: Session, claim_id: str) -> Claim:
     if claim is None:
         raise ClaimNotFoundError(claim_id)
     return claim
+
+
+def verify_claim_payload(session: Session, claim_id: str, payload: object) -> bool:
+    """Return whether ``payload`` commits to the same digest as the claim.
+
+    Strictly read-only: the claim is looked up (raising
+    :class:`ClaimNotFoundError` when absent) and its stored
+    ``payload_digest_algorithm``/``payload_digest_hex`` are compared with the
+    SHA-256 of the payload canonicalized under the exact same deterministic
+    rules as claim creation. The verdict is a plain boolean -- a mismatch on
+    an existing claim is a normal false result, not an error. Nothing is
+    created, updated, committed, or audited, and the payload is never
+    persisted or logged.
+    """
+    claim = get_claim(session, claim_id)
+    if claim.payload_digest_algorithm != canonical.CANONICAL_DIGEST_ALGORITHM:
+        return False
+    candidate_hex = canonical.payload_digest_hex(payload)
+    return hmac.compare_digest(candidate_hex, claim.payload_digest_hex)
 
 
 def list_claims_for_content(session: Session, content_id: str) -> list[Claim]:

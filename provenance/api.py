@@ -181,6 +181,8 @@ from provenance.schemas import (
     ClaimListResponse,
     ClaimPageResponse,
     ClaimResponse,
+    ClaimVerificationCreate,
+    ClaimVerificationResponse,
     ClaimSupersessionCreate,
     ClaimSupersessionListResponse,
     ClaimSupersessionPageResponse,
@@ -1146,6 +1148,33 @@ def create_claim(
 def get_claim(claim_id: str, session: DbSession) -> ClaimResponse:
     claim = service.get_claim(session, claim_id)
     return ClaimResponse.model_validate(claim)
+
+
+@router.post(
+    "/claim-verifications",
+    response_model=ClaimVerificationResponse,
+)
+def verify_claim(
+    payload: ClaimVerificationCreate, request: Request, session: DbSession
+) -> ClaimVerificationResponse:
+    # The route accepts no query parameters: any (or repeated) parameter is
+    # a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly read-only third-party payload verification. Request-body
+    # structure (exactly claim_id and a canonicalizable JSON object payload)
+    # is validated before this handler and before the claim lookup below, so
+    # an invalid request never reads the target claim. The stored
+    # payload_digest_algorithm/payload_digest_hex are then compared against
+    # the SHA-256 of the payload canonicalized under the exact same
+    # deterministic rules as claim creation. A mismatch on an existing claim
+    # is a normal {"valid": false} verdict rather than a service error; an
+    # unknown claim_id is the familiar 404 claim_not_found. Nothing is
+    # created, updated, or audited, and the submitted payload is never
+    # echoed, persisted, or logged.
+    valid = service.verify_claim_payload(
+        session, payload.claim_id, payload.payload
+    )
+    return ClaimVerificationResponse(valid=valid)
 
 
 _CLAIMS_PARAMS = frozenset(
