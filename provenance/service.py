@@ -1285,6 +1285,71 @@ def list_revocations_for_evidence_bundle(
     return list(session.execute(stmt).scalars().all())
 
 
+# Global evidence-bundle-revocation search paging bounds.
+DEFAULT_EVIDENCE_BUNDLE_REVOCATIONS_LIMIT = 50
+MIN_EVIDENCE_BUNDLE_REVOCATIONS_LIMIT = 1
+MAX_EVIDENCE_BUNDLE_REVOCATIONS_LIMIT = 100
+
+
+def list_evidence_bundle_revocations_page(
+    session: Session,
+    evidence_bundle_id: str | None = None,
+    revoker_actor_id: str | None = None,
+    reason: str | None = None,
+    from_dt=None,
+    to_dt=None,
+    limit: int | None = DEFAULT_EVIDENCE_BUNDLE_REVOCATIONS_LIMIT,
+    offset: int = 0,
+) -> tuple[list[EvidenceBundleRevocation], int]:
+    """Return one revocation page and the filtered total, both in SQL.
+
+    ``evidence_bundle_id``, ``revoker_actor_id``, and ``reason`` are
+    non-empty, case- and whitespace-sensitive exact matches that combine as
+    logical AND; ``None`` means unfiltered. ``from_dt``/``to_dt`` are
+    timezone-aware UTC instants applied as inclusive ``created_at`` bounds.
+    Filter values are never resolved for existence, so an unknown id or
+    reason is an empty result rather than a missing resource.
+
+    The total is a SQL ``COUNT`` over the filtered set (independent of the
+    page) and the page is a SQL ``LIMIT``/``OFFSET`` window of that set in
+    stable creation order (``created_at`` then the monotonic ``seq``
+    tiebreaker), so ordering and paging never depend on in-memory sorting
+    and stay stable across restarts. The retrieval is strictly read-only:
+    it writes no revocation, evidence bundle, or audit event.
+    """
+    filters = []
+    if evidence_bundle_id is not None:
+        filters.append(
+            EvidenceBundleRevocation.evidence_bundle_id == evidence_bundle_id
+        )
+    if revoker_actor_id is not None:
+        filters.append(
+            EvidenceBundleRevocation.revoker_actor_id == revoker_actor_id
+        )
+    if reason is not None:
+        filters.append(EvidenceBundleRevocation.reason == reason)
+    if from_dt is not None:
+        filters.append(EvidenceBundleRevocation.created_at >= from_dt)
+    if to_dt is not None:
+        filters.append(EvidenceBundleRevocation.created_at <= to_dt)
+
+    total = session.execute(
+        select(func.count())
+        .select_from(EvidenceBundleRevocation)
+        .where(*filters)
+    ).scalar_one()
+
+    page_stmt = (
+        select(EvidenceBundleRevocation)
+        .where(*filters)
+        .order_by(*_EVIDENCE_BUNDLE_REVOCATION_ORDER)
+        .limit(limit)
+        .offset(offset)
+    )
+    page = list(session.execute(page_stmt).scalars().all())
+    return page, int(total)
+
+
 def list_evidence_bundles_for_claim(
     session: Session, claim_id: str
 ) -> list[EvidenceBundle]:

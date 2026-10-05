@@ -780,6 +780,16 @@ class EvidenceBundleRevocationListResponse(BaseModel):
     count: int
 
 
+class EvidenceBundleRevocationPageResponse(BaseModel):
+    """A cursor-paginated page of revocation public views."""
+
+    items: list[EvidenceBundleRevocationResponse]
+    #: Total number of revocations after filtering, independent of pagination.
+    count: int
+    #: Opaque continuation token; null on the final (or past-the-end) page.
+    next_cursor: str | None = None
+
+
 class ClaimExportItem(ClaimResponse):
     """A claim in a content export: the full public view plus its evidence.
 
