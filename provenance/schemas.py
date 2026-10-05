@@ -1074,6 +1074,51 @@ class ObservabilitySummaryResponse(BaseModel):
     checked_at: datetime
 
 
+class TaskQueueSummaryResponse(BaseModel):
+    """Read-only summary of one asynchronous task queue.
+
+    Exactly nine members in fixed order: the four per-status counts covering
+    every existing task (settled ones included, each a non-negative
+    integer), the stable id of the oldest ``pending`` task together with its
+    UTC creation time, and the stable id of the oldest ``running`` task
+    together with the UTC time its run started. When no task occupies the
+    given state, both members of that pair are null (a pending task has no
+    start time; a running task always carries a non-null ``started_at``).
+    "Oldest" follows the stable creation order (``created_at`` with the
+    monotonic insertion tiebreaker), so it is identical across reads and
+    restarts for unchanged persisted state.
+    """
+
+    pending: int
+    running: int
+    succeeded: int
+    failed: int
+    #: Stable id of the oldest pending task, or null when none is pending.
+    oldest_pending_id: str | None
+    #: UTC creation time of the oldest pending task, or null when none.
+    oldest_pending_created_at: datetime | None
+    #: Stable id of the oldest running task, or null when none is running.
+    oldest_running_id: str | None
+    #: UTC time the oldest running task was claimed, or null when none.
+    oldest_running_started_at: datetime | None
+
+
+class TaskQueuesSummaryResponse(BaseModel):
+    """Read-only summary of the three asynchronous task queues.
+
+    Exactly two members in fixed order: ``task_queues`` holding the
+    content-export, audit-checkpoint, and evidence-bundle-export queues
+    under their fixed keys (each an existing nine-field
+    :class:`TaskQueueSummaryResponse`), and the UTC time at which the summary
+    was assembled. Every number is an integer; an empty database yields
+    three all-zero queues with all oldest members null, never a
+    missing-resource error.
+    """
+
+    task_queues: dict[str, TaskQueueSummaryResponse]
+    checked_at: datetime
+
+
 class EvidenceBundleExchangeResponse(BaseModel):
     """An interoperability snapshot of one evidence bundle for external verifiers.
 

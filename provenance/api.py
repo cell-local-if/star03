@@ -245,6 +245,8 @@ from provenance.schemas import (
     ObservabilitySummaryResponse,
     PrivacyExportClaimItem,
     PrivacyExportEvidenceBundleItem,
+    TaskQueueSummaryResponse,
+    TaskQueuesSummaryResponse,
     TrustDecisionResponse,
     TrustEvaluationBatchRequest,
     TrustEvaluationBatchResponse,
@@ -4086,6 +4088,80 @@ async def get_observability_summary(
     # Compact UTF-8 JSON, UTC timestamps, integral numbers only, terminated
     # by exactly one newline; members appear in the fixed service/database/
     # counts/tasks/audit/checked order.
+    return _render_compact_json(result.model_dump(mode="json"))
+
+
+@router.get("/observability/task-queues")
+async def get_observability_task_queues(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only summary of the three asynchronous task queues. The request
+    # takes no body and no query parameters: any non-empty body (including
+    # whitespace, arbitrary bytes, or malformed JSON) and any parameter
+    # (unknown, blank, or repeated) is a 422 validation_error, rejected
+    # before any state is read -- an invalid request never produces a
+    # partial summary, and no task, resource, or audit event is created,
+    # modified, or deleted.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # The three queues' four lifecycle counts and their oldest pending and
+    # running tasks come from the current persisted state in one read-only
+    # pass: an empty database yields three all-zero queues with null oldest
+    # members (never a missing-resource error), and an unreadable database
+    # or an internal summary-query failure is the existing-structure 503
+    # service_unavailable carrying a reason, never a partial body.
+    queues = service.get_task_queue_summaries(session)
+
+    def _queue_view(key: str) -> TaskQueueSummaryResponse:
+        data = queues[key]
+        counts = data["counts"]
+        oldest_pending = data["oldest_pending"]
+        oldest_running = data["oldest_running"]
+        # All three queues share the literal pending/running/succeeded/
+        # failed state names, so the content-export constants name the
+        # shared keys for every queue.
+        return TaskQueueSummaryResponse(
+            pending=counts[CONTENT_EXPORT_JOB_PENDING],
+            running=counts[CONTENT_EXPORT_JOB_RUNNING],
+            succeeded=counts[CONTENT_EXPORT_JOB_SUCCEEDED],
+            failed=counts[CONTENT_EXPORT_JOB_FAILED],
+            oldest_pending_id=(
+                oldest_pending.id if oldest_pending is not None else None
+            ),
+            oldest_pending_created_at=(
+                oldest_pending.created_at
+                if oldest_pending is not None
+                else None
+            ),
+            oldest_running_id=(
+                oldest_running.id if oldest_running is not None else None
+            ),
+            oldest_running_started_at=(
+                oldest_running.started_at
+                if oldest_running is not None
+                else None
+            ),
+        )
+
+    # Compact UTF-8 JSON, UTC timestamps, integral numbers only, terminated
+    # by exactly one newline; the root members appear in the fixed
+    # task_queues/checked_at order and the three queues in their fixed
+    # content/audit/evidence order. The dict is built in that order and the
+    # model preserves it on a single dump (no revalidation round trip).
+    result = TaskQueuesSummaryResponse(
+        task_queues={key: _queue_view(key) for key in (
+            "content_export",
+            "audit_checkpoint",
+            "evidence_bundle_export",
+        )},
+        checked_at=utc_now(),
+    )
     return _render_compact_json(result.model_dump(mode="json"))
 
 

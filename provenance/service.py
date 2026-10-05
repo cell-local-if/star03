@@ -4317,6 +4317,152 @@ def get_observability_summary(session: Session) -> dict:
     }
 
 
+# --- Read-only asynchronous task-queue summary -------------------------------
+
+#: The three asynchronous task queues covered by the task-queue summary, in
+#: the exact response order, each paired with its ORM model, its stable
+#: creation order, and its four lifecycle states in the response order.
+_TASK_QUEUE_SPECS = (
+    (
+        "content_export",
+        ContentExportJob,
+        _CONTENT_EXPORT_JOB_ORDER,
+        CONTENT_EXPORT_JOB_PENDING,
+        CONTENT_EXPORT_JOB_RUNNING,
+        CONTENT_EXPORT_JOB_SUCCEEDED,
+        CONTENT_EXPORT_JOB_FAILED,
+    ),
+    (
+        "audit_checkpoint",
+        AuditCheckpointJob,
+        _AUDIT_CHECKPOINT_JOB_ORDER,
+        AUDIT_CHECKPOINT_JOB_PENDING,
+        AUDIT_CHECKPOINT_JOB_RUNNING,
+        AUDIT_CHECKPOINT_JOB_SUCCEEDED,
+        AUDIT_CHECKPOINT_JOB_FAILED,
+    ),
+    (
+        "evidence_bundle_export",
+        EvidenceBundleExportJob,
+        _EVIDENCE_BUNDLE_EXPORT_JOB_ORDER,
+        EVIDENCE_BUNDLE_EXPORT_JOB_PENDING,
+        EVIDENCE_BUNDLE_EXPORT_JOB_RUNNING,
+        EVIDENCE_BUNDLE_EXPORT_JOB_SUCCEEDED,
+        EVIDENCE_BUNDLE_EXPORT_JOB_FAILED,
+    ),
+)
+
+
+def _summarize_one_task_queue(
+    session: Session,
+    model: type,
+    order: tuple,
+    pending_state: str,
+    running_state: str,
+    succeeded_state: str,
+    failed_state: str,
+) -> dict:
+    """Return one queue's four counts and its oldest pending/running tasks.
+
+    The counts cover every existing row keyed by the four lifecycle states
+    in ``pending``/``running``/``succeeded``/``failed`` order, each
+    defaulting to zero; settled tasks remain in their succeeded/failed
+    counts. The oldest task of a state is the single first row under the
+    stable creation order (``created_at`` with the monotonic ``seq``
+    tiebreaker, which survives restarts), or ``None`` when that state is
+    empty. Everything is read from the current persisted state at call time
+    -- nothing is frozen, claimed, or settled.
+    """
+    status_rows = session.execute(
+        select(model.status, func.count()).group_by(model.status)
+    ).all()
+    counts = {
+        pending_state: 0,
+        running_state: 0,
+        succeeded_state: 0,
+        failed_state: 0,
+    }
+    for status_value, total in status_rows:
+        # An unknown lifecycle value in anomalous history is ignored for the
+        # four named counters rather than surfacing as a fifth key.
+        if status_value in counts:
+            counts[status_value] = int(total)
+    oldest_pending = session.execute(
+        select(model)
+        .where(model.status == pending_state)
+        .order_by(*order)
+        .limit(1)
+    ).scalar_one_or_none()
+    oldest_running = session.execute(
+        select(model)
+        .where(model.status == running_state)
+        .order_by(*order)
+        .limit(1)
+    ).scalar_one_or_none()
+    return {
+        "counts": counts,
+        "oldest_pending": oldest_pending,
+        "oldest_running": oldest_running,
+    }
+
+
+def get_task_queue_summaries(session: Session) -> dict:
+    """Return the read-only summary of all three asynchronous task queues.
+
+    The result covers, under the fixed keys ``content_export``,
+    ``audit_checkpoint``, and ``evidence_bundle_export``, the four
+    lifecycle-state counts over every existing task and the single oldest
+    ``pending`` and ``running`` task of each queue (stable id plus its UTC
+    creation/start time), both ``None`` when the state is empty. An empty
+    database yields three all-zero queues with null oldest members -- a
+    determined empty state, never a missing-resource error.
+
+    The read is strictly read-only: it only ever issues ``SELECT`` queries
+    inside the session's single read transaction, never commits, and
+    creates, modifies, or deletes no task, resource, or audit event. The
+    same persisted state therefore produces identical counts and oldest
+    members on repeated, concurrent, or post-restart reads. An unreadable
+    database or any internal failure of the summary queries raises
+    :class:`ObservabilityUnavailableError` (``503 service_unavailable``)
+    instead of returning a partial summary; the half-open read transaction
+    is rolled back first.
+    """
+    try:
+        return {
+            key: _summarize_one_task_queue(
+                session,
+                model,
+                order,
+                pending_state,
+                running_state,
+                succeeded_state,
+                failed_state,
+            )
+            for (
+                key,
+                model,
+                order,
+                pending_state,
+                running_state,
+                succeeded_state,
+                failed_state,
+            ) in _TASK_QUEUE_SPECS
+        }
+    except SQLAlchemyError:
+        # An unreadable database (connection, schema, statement failure):
+        # drop any half-open read transaction; a summary failure must leave
+        # no transaction side effect behind. The summary itself never
+        # writes, so rollback cannot discard any application mutation.
+        session.rollback()
+        raise ObservabilityUnavailableError("database_unavailable")
+    except Exception:
+        # Any other internal failure assembling the summary is still a
+        # service unavailability for this read-only route, never a partial
+        # body or a 500, and the read has nothing to commit.
+        session.rollback()
+        raise ObservabilityUnavailableError("internal_error")
+
+
 def get_evidence_bundle_exchange(
     session: Session, evidence_bundle_id: str
 ) -> tuple[EvidenceBundle, Claim, Content, list[Attestation]]:
