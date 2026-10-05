@@ -98,6 +98,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.actors_cursor_secret = secrets.token_bytes(32)
     app.state.contents_cursor_secret = secrets.token_bytes(32)
     app.state.attestation_revocations_cursor_secret = secrets.token_bytes(32)
+    app.state.evidence_bundle_revocations_cursor_secret = (
+        secrets.token_bytes(32)
+    )
     app.state.content_relations_cursor_secret = secrets.token_bytes(32)
     app.state.content_coverage_search_cursor_secret = secrets.token_bytes(32)
     app.state.revocation_impacts_cursor_secret = secrets.token_bytes(32)
