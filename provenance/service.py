@@ -36,6 +36,7 @@ from provenance.errors import (
     AttestationNotFoundError,
     AttestationRevocationNotFoundError,
     AttestationVerificationError,
+    AuthenticationKeyRotationNotFoundError,
     ClaimNotFoundError,
     ClaimSupersessionNotFoundError,
     ClaimSupersessionValidationError,
@@ -2756,6 +2757,27 @@ def list_authentication_key_rotations_for_actor(
         .order_by(*_AUTHENTICATION_KEY_ROTATION_ORDER)
     )
     return list(session.execute(stmt).scalars().all())
+
+
+def get_authentication_key_rotation(
+    session: Session, rotation_id: str
+) -> AuthenticationKeyRotation:
+    """Return one rotation by its stable id or raise
+    :class:`AuthenticationKeyRotationNotFoundError`.
+
+    The id is matched exactly as persisted -- case- and
+    whitespace-sensitive, with no Base64 or format normalization and no
+    lookup via the owning subject. Strictly read-only: no record or audit
+    event is written.
+    """
+    rotation = session.execute(
+        select(AuthenticationKeyRotation).where(
+            AuthenticationKeyRotation.id == rotation_id
+        )
+    ).scalar_one_or_none()
+    if rotation is None:
+        raise AuthenticationKeyRotationNotFoundError(rotation_id)
+    return rotation
 
 
 DEFAULT_AUTHENTICATION_KEYS_LIMIT = 50

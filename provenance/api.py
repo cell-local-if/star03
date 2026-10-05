@@ -7192,6 +7192,38 @@ async def retire_authentication_key_rotation(
     return _rotation_response(rotation)
 
 
+@router.get(
+    "/authentication-key-rotations/{rotation_id}",
+    response_model=AuthenticationKeyRotationResponse,
+)
+async def get_authentication_key_rotation(
+    rotation_id: str, request: Request, session: DbSession
+) -> AuthenticationKeyRotationResponse:
+    # Public read-only retrieval of one rotation record by its stable id.
+    # No X-PA/X-PT/X-PS credentials are required or consulted. The request
+    # takes no body and no query parameters: any non-empty body (including
+    # whitespace or malformed JSON) and any parameter (unknown, blank, or
+    # repeated) is a 422 validation_error, both rejected before the record
+    # is read.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # Strictly read-only: the lookup writes no record and no audit event,
+    # and repeated reads return the same persisted fields. The id is
+    # matched exactly as persisted; an unknown id is the
+    # authentication_key_rotation_not_found 404 with the requested id
+    # echoed in the details. POST/PUT/PATCH/DELETE on this path are the
+    # framework's 405 method_not_allowed.
+    rotation = service.get_authentication_key_rotation(session, rotation_id)
+    return _rotation_response(rotation)
+
+
 _ACTOR_ROTATIONS_PARAMS = frozenset({"limit", "cursor"})
 
 
