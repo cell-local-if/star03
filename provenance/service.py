@@ -4317,6 +4317,132 @@ def get_observability_summary(session: Session) -> dict:
     }
 
 
+# --- Read-only asynchronous task-queue summary -------------------------------
+
+#: The asynchronous task families covered by the task-queues summary, in the
+#: exact response order. Each entry pairs the response key with the ORM model
+#: holding its jobs, the family's pending/running lifecycle literals, and the
+#: jobs' stable creation order (``created_at`` with the monotonic ``seq``
+#: tiebreaker, which survives restarts).
+_OBSERVABILITY_TASK_QUEUE_MODELS = (
+    (
+        "content_export",
+        ContentExportJob,
+        CONTENT_EXPORT_JOB_PENDING,
+        CONTENT_EXPORT_JOB_RUNNING,
+        _CONTENT_EXPORT_JOB_ORDER,
+    ),
+    (
+        "audit_checkpoint",
+        AuditCheckpointJob,
+        AUDIT_CHECKPOINT_JOB_PENDING,
+        AUDIT_CHECKPOINT_JOB_RUNNING,
+        _AUDIT_CHECKPOINT_JOB_ORDER,
+    ),
+    (
+        "evidence_bundle_export",
+        EvidenceBundleExportJob,
+        EVIDENCE_BUNDLE_EXPORT_JOB_PENDING,
+        EVIDENCE_BUNDLE_EXPORT_JOB_RUNNING,
+        _EVIDENCE_BUNDLE_EXPORT_JOB_ORDER,
+    ),
+)
+
+
+def _summarize_task_queue(
+    session: Session, model, pending: str, running: str, order
+) -> dict:
+    """Return one queue's counts and oldest pending/running tasks.
+
+    The four counts cover every existing task keyed by the lifecycle states
+    (``pending``/``running``/``succeeded``/``failed``), each defaulting to
+    zero; settled tasks remain in their ``succeeded``/``failed`` counts. The
+    oldest members are the single oldest ``pending`` and ``running`` tasks
+    under the stable creation order, or ``None`` when the state is empty.
+    """
+    rows = session.execute(
+        select(model.status, func.count()).group_by(model.status)
+    ).all()
+    counts = {
+        state: 0 for state in ("pending", "running", "succeeded", "failed")
+    }
+    for status_value, total in rows:
+        # An unknown lifecycle value in anomalous history is ignored for the
+        # four named counters rather than surfacing as a fifth key.
+        if status_value in counts:
+            counts[status_value] = int(total)
+    oldest_pending = session.execute(
+        select(model).where(model.status == pending).order_by(*order).limit(1)
+    ).scalar_one_or_none()
+    oldest_running = session.execute(
+        select(model).where(model.status == running).order_by(*order).limit(1)
+    ).scalar_one_or_none()
+    return {
+        "pending": counts["pending"],
+        "running": counts["running"],
+        "succeeded": counts["succeeded"],
+        "failed": counts["failed"],
+        "oldest_pending_id": (
+            oldest_pending.id if oldest_pending is not None else None
+        ),
+        "oldest_pending_created_at": (
+            oldest_pending.created_at if oldest_pending is not None else None
+        ),
+        "oldest_running_id": (
+            oldest_running.id if oldest_running is not None else None
+        ),
+        "oldest_running_started_at": (
+            oldest_running.started_at if oldest_running is not None else None
+        ),
+    }
+
+
+def get_observability_task_queues(session: Session) -> dict:
+    """Return the read-only queue summary over the three task families.
+
+    The summary covers the three existing asynchronous task families --
+    content export, audit checkpoint, and evidence bundle export jobs. Each
+    queue reports the four lifecycle counts (non-negative integers covering
+    every existing task) and the oldest ``pending``/``running`` tasks under
+    the stable creation order, with null oldest members for an empty state.
+    An empty database yields three all-zero queues with null oldest members
+    rather than a missing-resource error.
+
+    The read is strictly read-only: it only ever issues ``SELECT`` queries
+    inside the session's single read transaction, never commits, and
+    creates, modifies, or deletes no resource, task, or audit event. The
+    same persisted state therefore produces identical queues on repeated,
+    concurrent, or post-restart reads. An unreadable database or any
+    internal failure of the summary queries raises
+    :class:`ObservabilityUnavailableError` (``503 service_unavailable``)
+    instead of returning a partial summary.
+    """
+    try:
+        task_queues = {
+            name: _summarize_task_queue(
+                session, model, pending, running, order
+            )
+            for name, model, pending, running, order in (
+                _OBSERVABILITY_TASK_QUEUE_MODELS
+            )
+        }
+    except SQLAlchemyError:
+        # An unreadable database (connection, schema, statement failure):
+        # drop any half-open read transaction; a summary failure must leave
+        # no transaction side effect behind. The summary itself never
+        # writes, so rollback cannot discard any application mutation.
+        session.rollback()
+        raise ObservabilityUnavailableError("database_unavailable")
+    except Exception:
+        # Any other internal failure assembling the summary is still a
+        # service unavailability for this read-only route, never a partial
+        # body or a 500, and the read has nothing to commit.
+        session.rollback()
+        raise ObservabilityUnavailableError("internal_error")
+
+    return {"task_queues": task_queues}
+
+
 def get_evidence_bundle_exchange(
     session: Session, evidence_bundle_id: str
 ) -> tuple[EvidenceBundle, Claim, Content, list[Attestation]]:

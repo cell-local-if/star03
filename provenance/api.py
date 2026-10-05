@@ -243,6 +243,7 @@ from provenance.schemas import (
     ExchangeManifestVerificationCreate,
     ExchangeManifestVerificationResponse,
     ObservabilitySummaryResponse,
+    ObservabilityTaskQueuesResponse,
     PrivacyExportClaimItem,
     PrivacyExportEvidenceBundleItem,
     TrustDecisionResponse,
@@ -4086,6 +4087,44 @@ async def get_observability_summary(
     # Compact UTF-8 JSON, UTC timestamps, integral numbers only, terminated
     # by exactly one newline; members appear in the fixed service/database/
     # counts/tasks/audit/checked order.
+    return _render_compact_json(result.model_dump(mode="json"))
+
+
+@router.get("/observability/task-queues")
+async def get_observability_task_queues(
+    request: Request, session: DbSession
+) -> Response:
+    # Read-only queue summary over the three asynchronous task families
+    # (content export, audit checkpoint, evidence bundle export). The
+    # request takes no body and no query parameters: any non-empty body
+    # (including whitespace, arbitrary bytes, or malformed JSON) and any
+    # parameter (unknown, blank, or repeated) is a 422 validation_error,
+    # rejected before any state is read -- an invalid request never produces
+    # a partial summary, and no resource, task, or audit event is created,
+    # modified, or deleted.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+    # The summary only ever reads current persisted state: per family, the
+    # four lifecycle counts and the oldest pending/running tasks under the
+    # stable creation order. An empty database yields three all-zero queues
+    # with null oldest members, never a missing-resource error; an
+    # unreadable database or an internal summary-query failure is the
+    # existing-structure 503 service_unavailable carrying a reason, never a
+    # partial body.
+    summary = service.get_observability_task_queues(session)
+    result = ObservabilityTaskQueuesResponse(
+        task_queues=summary["task_queues"],
+        checked_at=utc_now(),
+    )
+    # Compact UTF-8 JSON, UTC timestamps, integral numbers only, terminated
+    # by exactly one newline; members appear in the fixed
+    # task_queues/checked_at order.
     return _render_compact_json(result.model_dump(mode="json"))
 
 

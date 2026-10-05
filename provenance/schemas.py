@@ -1074,6 +1074,46 @@ class ObservabilitySummaryResponse(BaseModel):
     checked_at: datetime
 
 
+class ObservabilityTaskQueueStatus(BaseModel):
+    """Read-only queue state of one asynchronous task family.
+
+    Exactly eight members: the four per-status counts (covering every
+    existing task, settled ones included), the stable id and UTC creation
+    time of the oldest ``pending`` task, and the stable id and UTC start
+    time of the oldest ``running`` task. A queue with no task in a state
+    reports null for that state's oldest members; a pending task has no
+    start time and a running task's start time is always set. All numbers
+    are integers.
+    """
+
+    pending: int
+    running: int
+    succeeded: int
+    failed: int
+    #: Stable id of the oldest pending task, or null when none is pending.
+    oldest_pending_id: str | None
+    #: UTC creation time of the oldest pending task, or null when none.
+    oldest_pending_created_at: datetime | None
+    #: Stable id of the oldest running task, or null when none is running.
+    oldest_running_id: str | None
+    #: UTC start time of the oldest running task, or null when none.
+    oldest_running_started_at: datetime | None
+
+
+class ObservabilityTaskQueuesResponse(BaseModel):
+    """Read-only queue summary over the three asynchronous task families.
+
+    Exactly two members: ``task_queues`` with the fixed keys
+    ``content_export``, ``audit_checkpoint``, and
+    ``evidence_bundle_export`` (each an eight-member queue status), and the
+    UTC time the summary was generated. Every number is an integer; no raw
+    resource, task payload, or evidence byte appears.
+    """
+
+    task_queues: dict[str, ObservabilityTaskQueueStatus]
+    checked_at: datetime
+
+
 class EvidenceBundleExchangeResponse(BaseModel):
     """An interoperability snapshot of one evidence bundle for external verifiers.
 
