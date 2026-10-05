@@ -181,6 +181,8 @@ from provenance.schemas import (
     ClaimListResponse,
     ClaimPageResponse,
     ClaimResponse,
+    ClaimVerificationCreate,
+    ClaimVerificationResponse,
     ClaimSupersessionCreate,
     ClaimSupersessionListResponse,
     ClaimSupersessionPageResponse,
@@ -1146,6 +1148,38 @@ def create_claim(
 def get_claim(claim_id: str, session: DbSession) -> ClaimResponse:
     claim = service.get_claim(session, claim_id)
     return ClaimResponse.model_validate(claim)
+
+
+@router.post(
+    "/claim-verifications",
+    response_model=ClaimVerificationResponse,
+)
+async def verify_claim(
+    payload: ClaimVerificationCreate, request: Request, session: DbSession
+) -> ClaimVerificationResponse:
+    # The route accepts no query parameters: any (or repeated) parameter is
+    # a 422 validation_error.
+    _reject_any_query_param(request)
+    # Strictly read-only third-party verification. Request-body validation
+    # has already completed before this body runs, so a non-object body, a
+    # missing/undeclared field, a non-string or blank claim_id, a non-object
+    # payload, or a payload carrying a non-finite number never reaches the
+    # claim lookup and no partial result is ever produced. The existing
+    # claim is read once; the offered payload is canonicalized under the
+    # exact same deterministic rules as claim creation (sorted object keys,
+    # minimal separators, unescaped non-ASCII, UTF-8) and its SHA-256
+    # compared to the persisted digest algorithm and value. A mismatch is a
+    # normal {"valid": false} verdict, not a service error; an unknown
+    # claim_id is the existing 404 claim_not_found. The payload is used only
+    # for this comparison: never echoed, persisted, or logged, and no
+    # claim, evidence, task, or audit row is created, updated, or deleted.
+    claim = service.get_claim(session, payload.claim_id)
+    offered_digest_hex = canonical.payload_digest_hex(payload.payload)
+    valid = (
+        claim.payload_digest_algorithm == canonical.CANONICAL_DIGEST_ALGORITHM
+        and claim.payload_digest_hex == offered_digest_hex
+    )
+    return ClaimVerificationResponse(valid=valid)
 
 
 _CLAIMS_PARAMS = frozenset(

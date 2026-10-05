@@ -276,6 +276,54 @@ class ClaimPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ClaimVerificationCreate(BaseModel):
+    """Request body for the read-only ``POST /claim-verifications``.
+
+    Exactly two members: ``claim_id`` names an existing claim and
+    ``payload`` is the JSON object a third party offers for verification.
+    The payload must be canonicalizable under the exact same rules as
+    claim creation (sorted keys, minimal separators, UTF-8): non-finite
+    numbers (NaN/Infinity) have no canonical JSON form and are rejected.
+    Undeclared members are rejected rather than ignored, so structural
+    validation fails before the target claim is ever read.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str = Field(..., min_length=1, max_length=80)
+    #: Must be a JSON object; arrays, scalars, and null are rejected.
+    payload: dict[str, Any]
+
+    @field_validator("claim_id")
+    @classmethod
+    def _claim_id_nonempty(cls, v: str) -> str:
+        return _required_nonempty(v, "claim_id")
+
+    @field_validator("payload")
+    @classmethod
+    def _payload_canonicalizable(cls, v: dict[str, Any]) -> dict[str, Any]:
+        try:
+            canonical_json_bytes(v)
+        except (TypeError, ValueError):
+            # Non-finite numbers (NaN/Infinity) have no canonical JSON form.
+            raise ValueError(
+                "payload must be a JSON object with finite numbers"
+            ) from None
+        return v
+
+
+class ClaimVerificationResponse(BaseModel):
+    """The read-only claim payload verification verdict.
+
+    The body is exactly ``{"valid": true}`` or ``{"valid": false}``: a
+    digest mismatch is a normal ``200`` verdict rather than a service
+    error, and the offered payload -- its fields or raw text -- is never
+    echoed back.
+    """
+
+    valid: bool
+
+
 class ClaimSupersessionCreate(BaseModel):
     # A supersession carries exactly its declared fields; undeclared fields
     # are rejected rather than silently discarded.
