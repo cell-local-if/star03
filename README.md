@@ -27,6 +27,17 @@ PROVENANCE_DATABASE_URL=sqlite:///./x.db python -m provenance
 
 The database location is taken from `--database-url`, then the `PROVENANCE_DATABASE_URL` environment variable, then the default. Tables are created automatically on first startup (parent directories included).
 
+## Disaster recovery
+
+The same entry point provides offline snapshot commands; neither starts the service, runs migrations, or writes audit rows:
+
+```bash
+python -m provenance backup --output /backups/provenance.db [--force]
+python -m provenance restore --input /backups/provenance.db [--force]
+```
+
+`backup` copies the configured database (same `--database-url` / `PROVENANCE_DATABASE_URL` / default resolution) into a transactionally consistent snapshot via SQLite's online backup, verifies it (`integrity_check` plus a `schema_migrations` ledger check), and atomically moves it to `--output`. `restore` verifies `--input` the same way and atomically replaces the configured database with it; the restored ledger is kept verbatim (no migrations are applied). Both accept file-backed SQLite URLs only, refuse to overwrite an existing destination unless `--force` is given, and leave inputs and existing targets untouched on any failure. Success prints one compact JSON line (`operation`, `path`, `schema_version`); failure prints one `{"error":{"code","message","details"}}` line to stderr (`source_unsupported`, `source_not_found`, `input_not_found`, `destination_exists`, `invalid_backup`, `operation_failed`).
+
 ## Initial capability: content identity and source actors
 
 Versioned JSON routes under `/v1`:
