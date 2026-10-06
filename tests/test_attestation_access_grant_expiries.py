@@ -577,7 +577,7 @@ def test_expiry_persists_across_restart(tmp_db_url, file_client):
         assert [r[0] for r in rows] == [created["id"]]
         assert [r[1] for r in rows] == [grant["id"]]
         assert audits == 1
-        assert [v[0] for v in versions] == [1, 2, 3, 4]
+        assert [v[0] for v in versions] == [1, 2, 3, 4, 5]
 
 
 def test_concurrent_identical_expiries_yield_one_record_and_audit(
@@ -718,7 +718,7 @@ def test_legacy_v1_database_gains_the_expiry_table(tmp_path):
     con = _sqlite3.connect(db_path)
     try:
         con.execute("DROP TABLE attestation_access_grant_expiries")
-        con.execute("DELETE FROM schema_migrations WHERE version = 2")
+        con.execute("DELETE FROM schema_migrations WHERE version > 1")
         con.commit()
     finally:
         con.close()
@@ -740,6 +740,6 @@ def test_legacy_v1_database_gains_the_expiry_table(tmp_path):
             for r in con.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
-        ] == [1, 2, 3, 4]
+        ] == [1, 2, 3, 4, 5]
     finally:
         con.close()

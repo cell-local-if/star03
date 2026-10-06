@@ -9,7 +9,15 @@ column: actors broke same-``created_at`` ties on SQLite's implicit
   ``(created_at, display_seq)``, backfilling the explicit order from the
   original insertion order (``rowid``) so same-timestamp rows stay stable,
   and installs an ``AFTER INSERT`` trigger that stamps every later actor with
-  the next position.
+  the next position;
+* versions 2-4 each add one feature table (the attestation-access-grant
+  expiry, the actor-trust-policy revocation, and the evidence-bundle
+  revocation);
+* version 5 creates every remaining current table and index the legacy
+  database is missing (authentication key rotations, subject trust policies,
+  content relations, audit events, the import/export receipts, and the three
+  asynchronous job queues), so an upgraded legacy database reaches exactly
+  the table, index, and trigger structure of a freshly created one.
 
 The runner distinguishes a brand-new database (no ``actors`` table yet) from
 an existing one (an ``actors`` table that predates the ledger). Both paths
@@ -54,6 +62,17 @@ SCHEMA_VERSION_3 = 3
 #: revocations of other kinds, or audit rows.
 SCHEMA_VERSION_4 = 4
 
+#: Fifth schema generation: every remaining table of the current schema.
+#: A database that completed versions 1-4 still predates the authentication
+#: key rotations, subject trust policies, content relations, audit events,
+#: the import/export receipts, and the three asynchronous job queues; this
+#: step creates exactly the tables and indexes the legacy database is
+#: missing, so an upgraded database reaches the same table, index, and
+#: trigger structure as a freshly created one. Existing rows -- actors,
+#: content, claims, evidence, attestations, revocations, grants, and audit
+#: events -- are never touched.
+SCHEMA_VERSION_5 = 5
+
 #: Name of the AFTER INSERT trigger that assigns display_seq to new actors.
 ACTOR_SEQ_TRIGGER = "trg_actors_display_seq"
 
@@ -94,6 +113,13 @@ def _existing_tables(cursor) -> set[str]:
     return {row[0] for row in cursor.fetchall()}
 
 
+def _existing_indexes(cursor) -> set[str]:
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'"
+    )
+    return {row[0] for row in cursor.fetchall()}
+
+
 def _table_has_column(cursor, table: str, column: str) -> bool:
     cursor.execute(f"PRAGMA table_info({table})")
     return any(row[1] == column for row in cursor.fetchall())
@@ -105,6 +131,21 @@ def _create_full_schema(cursor, engine, metadata) -> None:
         cursor.execute(str(CreateTable(table).compile(engine)))
     for table in metadata.sorted_tables:
         for index in table.indexes:
+            cursor.execute(str(CreateIndex(index).compile(engine)))
+
+
+def _create_table_and_indexes(cursor, engine, table) -> None:
+    """Create one metadata table and its indexes, skipping what exists.
+
+    Each piece is checked individually, so a re-run after external
+    intervention (a dropped ledger row, a manually created table) neither
+    fails on an existing object nor duplicates one.
+    """
+    if table.name not in _existing_tables(cursor):
+        cursor.execute(str(CreateTable(table).compile(engine)))
+    existing_indexes = _existing_indexes(cursor)
+    for index in table.indexes:
+        if index.name not in existing_indexes:
             cursor.execute(str(CreateIndex(index).compile(engine)))
 
 
@@ -147,10 +188,7 @@ def _migration_2_up(cursor, engine, metadata) -> None:
     duplicates the table or its indexes.
     """
     table = metadata.tables["attestation_access_grant_expiries"]
-    if table.name not in _existing_tables(cursor):
-        cursor.execute(str(CreateTable(table).compile(engine)))
-    for index in table.indexes:
-        cursor.execute(str(CreateIndex(index).compile(engine)))
+    _create_table_and_indexes(cursor, engine, table)
 
 
 def _migration_3_up(cursor, engine, metadata) -> None:
@@ -166,10 +204,7 @@ def _migration_3_up(cursor, engine, metadata) -> None:
     back to the pre-startup state with the old data intact.
     """
     table = metadata.tables["actor_trust_policy_revocations"]
-    if table.name not in _existing_tables(cursor):
-        cursor.execute(str(CreateTable(table).compile(engine)))
-    for index in table.indexes:
-        cursor.execute(str(CreateIndex(index).compile(engine)))
+    _create_table_and_indexes(cursor, engine, table)
 
 
 def _migration_4_up(cursor, engine, metadata) -> None:
@@ -185,10 +220,27 @@ def _migration_4_up(cursor, engine, metadata) -> None:
     whole batch back to the pre-startup state with the old data intact.
     """
     table = metadata.tables["evidence_bundle_revocations"]
-    if table.name not in _existing_tables(cursor):
-        cursor.execute(str(CreateTable(table).compile(engine)))
-    for index in table.indexes:
-        cursor.execute(str(CreateIndex(index).compile(engine)))
+    _create_table_and_indexes(cursor, engine, table)
+
+
+def _migration_5_up(cursor, engine, metadata) -> None:
+    """Create every current table and index the legacy database is missing.
+
+    Only a database that already shipped version 4 reaches this function; a
+    fresh database is created directly at the latest shape. The pre-existing
+    tables (actors, contents, claims, evidence, attestations, grants,
+    revocations, and the audit trail, with all their rows, identifiers, UTC
+    timestamps, and ordering) are left exactly as they are; only the tables
+    and indexes the database does not yet have -- authentication key
+    rotations, subject trust policies, content relations, the import/export
+    receipts, and the three asynchronous job queues -- are created. The step
+    is individually idempotent in addition to the surrounding transaction,
+    so a re-run after external intervention neither fails nor duplicates a
+    table or index, and any failure rolls the whole batch back to the
+    pre-startup state with the old data intact.
+    """
+    for table in metadata.sorted_tables:
+        _create_table_and_indexes(cursor, engine, table)
 
 
 #: Known versions in application order. A fresh database is baselined past
@@ -198,6 +250,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=SCHEMA_VERSION_2, up=_migration_2_up),
     Migration(version=SCHEMA_VERSION_3, up=_migration_3_up),
     Migration(version=SCHEMA_VERSION_4, up=_migration_4_up),
+    Migration(version=SCHEMA_VERSION_5, up=_migration_5_up),
 )
 
 _CREATE_LEDGER = (
@@ -250,11 +303,13 @@ def run_migrations(engine) -> None:
       trigger -- and every known version is recorded as baselined.
     * Legacy database (an ``actors`` table predating the ledger): pending
       versions are applied in order; version 1 adds the column, backfills the
-      original insertion order, adds the index, and installs the trigger.
+      original insertion order, adds the index, and installs the trigger,
+      and version 5 creates whatever current tables and indexes the
+      database is still missing.
 
-    Already-recorded versions are never re-executed and existing actor
-    identifiers/fields are never changed. Any failure rolls the entire batch
-    back to the pre-startup state.
+    Already-recorded versions are never re-executed and existing rows are
+    never changed. Any failure rolls the entire batch back to the
+    pre-startup state.
     """
     from provenance import models  # noqa: F401  register tables on metadata
     from provenance.database import Base

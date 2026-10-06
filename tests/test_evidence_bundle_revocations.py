@@ -659,7 +659,7 @@ def _downgrade_to_v3(db_path):
     con = sqlite3.connect(db_path)
     try:
         con.execute("DROP TABLE evidence_bundle_revocations")
-        con.execute("DELETE FROM schema_migrations WHERE version = 4")
+        con.execute("DELETE FROM schema_migrations WHERE version > 3")
         con.commit()
     finally:
         con.close()
@@ -700,7 +700,7 @@ def test_legacy_v3_upgrade_preserves_bundles_and_audits(tmp_path):
             assert [
                 row[0]
                 for row in con.execute("SELECT version FROM schema_migrations")
-            ] == [1, 2, 3, 4]
+            ] == [1, 2, 3, 4, 5]
             assert "evidence_bundle_revocations" in {
                 row[0]
                 for row in con.execute(
