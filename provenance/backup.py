@@ -1,6 +1,6 @@
-"""Offline disaster-recovery snapshots: ``backup`` and ``restore``.
+"""Offline disaster-recovery snapshots: ``backup``, ``restore``, ``verify``.
 
-Both operations work on quiescent files only -- they never start the HTTP
+All operations work on quiescent files only -- they never start the HTTP
 service, never run migrations, and never write audit rows:
 
 * ``backup`` copies the configured SQLite database (CLI flag >
@@ -13,6 +13,11 @@ service, never run migrations, and never write audit rows:
   verified copy over the file the configured database URL points at. The
   restored file is byte-for-byte the backup: no migration is applied and no
   row is added, so an older ``schema_migrations`` ledger stays older.
+* ``verify`` applies that same validation to ``--input`` read-only and
+  reports the ledger schema version without copying anything. It resolves
+  no database URL and touches no file other than the input, which is
+  opened read-only and never modified; no temporary or sidecar files are
+  created.
 
 A failure at any step removes the temporary file and leaves both the input
 and any pre-existing destination untouched -- no half-written database is
@@ -24,7 +29,8 @@ is not a regular file.
 The commands emit a single compact JSON line: on success
 ``{"operation","path","schema_version"}`` on stdout, on failure
 ``{"error":{"code","message","details"}}`` on stderr. Neither payload ever
-carries keys, signatures, content, or evidence bytes.
+carries keys, signatures, content, or evidence bytes. ``verify`` is
+deterministic: re-reading the same unchanged file yields the same report.
 """
 
 from __future__ import annotations
@@ -317,5 +323,23 @@ def run_restore(settings: Settings, input_path: str, *, force: bool) -> dict:
     return {
         "operation": "restore",
         "path": str(target),
+        "schema_version": schema_version,
+    }
+
+
+def run_verify(input_path: str) -> dict:
+    """Validate the snapshot at ``input_path`` read-only; return the report.
+
+    Unlike ``backup`` and ``restore`` this resolves no database URL and
+    touches nothing but the input file itself, which ``_validate_snapshot``
+    opens read-only. Nothing is copied, created, or modified.
+    """
+    source = _absolute_file_argument(
+        input_path, missing_code=INPUT_NOT_FOUND, what="verify input"
+    )
+    schema_version = _validate_snapshot(source)
+    return {
+        "operation": "verify",
+        "path": str(source),
         "schema_version": schema_version,
     }

@@ -10,6 +10,7 @@ Disaster recovery (offline; the service is not started)::
 
     python -m provenance backup --output /backups/provenance.db
     python -m provenance restore --input /backups/provenance.db --force
+    python -m provenance verify --input /backups/provenance.db
 """
 
 from __future__ import annotations
@@ -79,6 +80,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Replace an existing database file.",
     )
+
+    verify = subparsers.add_parser(
+        "verify",
+        help="Check a snapshot file read-only and report its schema version.",
+    )
+    verify.add_argument(
+        "--input",
+        required=True,
+        help="Snapshot file to verify (never modified).",
+    )
     return parser.parse_args(argv)
 
 
@@ -124,10 +135,36 @@ def _run_disaster_recovery(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_verify(args: argparse.Namespace) -> int:
+    # Imported lazily so the serve path and its imports stay untouched.
+    # Unlike backup/restore, verify resolves no database URL and builds no
+    # Settings: --input is the only file it ever reads.
+    from provenance.backup import BackupError, run_verify
+
+    try:
+        report = run_verify(args.input)
+    except BackupError as exc:
+        _emit_error(exc)
+        return 1
+    except Exception as exc:  # never leak a traceback to stderr
+        _emit_error(
+            BackupError(
+                "operation_failed",
+                "The operation failed unexpectedly.",
+                {"reason": str(exc)},
+            )
+        )
+        return 1
+    print(json.dumps(report, separators=(",", ":")))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     if args.command in ("backup", "restore"):
         raise SystemExit(_run_disaster_recovery(args))
+    if args.command == "verify":
+        raise SystemExit(_run_verify(args))
 
     import uvicorn
 
