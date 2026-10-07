@@ -63,6 +63,7 @@ EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED = (
 )
 EVENT_CONTENT_EXPORT_JOB_CREATED = "content_export_job.created"
 EVENT_CONTENT_EXPORT_JOB_RUN = "content_export_job.run"
+EVENT_CONTENT_EXPORT_JOB_STALLED_RECOVERY = "content_export_job.stalled_recovery"
 EVENT_ACTOR_TRUST_POLICY_CREATED = "actor_trust_policy.created"
 EVENT_ACTOR_TRUST_POLICY_REVOKED = "actor_trust_policy.revoked"
 EVENT_AUDIT_CHECKPOINT_JOB_CREATED = "audit_checkpoint_job.created"
@@ -87,6 +88,10 @@ CONTENT_EXPORT_JOB_STATES = frozenset(
 )
 # Stable error recorded on a failed export run.
 CONTENT_EXPORT_JOB_FAILED_ERROR = "content_export_failed"
+# Stable error recorded when a stalled ``running`` job is recovered: the
+# process that claimed it never settled it, so recovery settles it as
+# ``failed`` with this code rather than the run-failure code.
+CONTENT_EXPORT_JOB_STALLED_ERROR = "content_export_stalled"
 
 # Audit checkpoint export job lifecycle states. A job is created
 # ``pending``; a run atomically claims it into ``running`` and then settles it

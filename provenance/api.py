@@ -13,6 +13,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from provenance import (
     access_signing,
@@ -196,6 +197,8 @@ from provenance.schemas import (
     ContentExportJobCreate,
     ContentExportJobPageResponse,
     ContentExportJobResponse,
+    ContentExportJobStalledRecoveryCreate,
+    ContentExportJobStalledRecoveryResponse,
     ContentExportJobSummaryResponse,
     ContentExportResponse,
     ContentExportVerificationCreate,
@@ -4242,6 +4245,83 @@ async def get_content_export_jobs_summary(
         + "\n"
     ).encode("utf-8")
     return Response(content=body, media_type="application/json")
+
+
+@router.post("/content-export-jobs/recover-stalled")
+async def recover_stalled_content_export_jobs(
+    request: Request, session: DbSession
+) -> Response:
+    # Registered before "/content-export-jobs/{job_id}" so the literal
+    # "recover-stalled" segment is never captured as a job id. The body is
+    # parsed by hand so an empty body, malformed JSON, invalid UTF-8, a
+    # non-object document, or a repeated field is a uniform 422 before any
+    # job is read; any query parameter (unknown, blank, or repeated) is a
+    # 422 as well. Nothing is selected, settled, or audited on any
+    # validation failure.
+    raw_body = await request.body()
+    try:
+        parsed = json.loads(
+            raw_body.decode("utf-8"),
+            object_pairs_hook=_object_pairs_rejecting_duplicates,
+        )
+    except _DuplicateFieldError as exc:
+        raise LineageValidationError(
+            [
+                {
+                    "loc": ["body", exc.field],
+                    "msg": f"duplicate field: {exc.field}",
+                    "type": "value_error.duplicate",
+                }
+            ]
+        ) from None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise LineageValidationError(
+            [{"loc": ["body"], "msg": "invalid JSON body", "type": "json_error"}]
+        ) from None
+    _reject_any_query_param(request)
+    try:
+        # Exactly the one declared field: a missing or extra field, a
+        # non-integer value, or an integer outside 1..86400 is a 422.
+        payload = ContentExportJobStalledRecoveryCreate.model_validate(parsed)
+    except ValidationError as exc:
+        raise _request_body_validation_error(exc) from None
+
+    # Settle every running job whose started_at is strictly older than now
+    # minus older_than_seconds, in one transaction: each becomes failed with
+    # the recovery instant as finished_at, a null result, and the stable
+    # content_export_stalled error, keeping its id, request_id, content_id,
+    # and started_at, and appending one content_export_job.stalled_recovery
+    # audit event per job. No match is a 200 with an empty items and count
+    # zero; a concurrent change to any selected job rolls the whole pass
+    # back into a 409 content_export_job_recovery_conflict.
+    jobs = service.recover_stalled_content_export_jobs(
+        session, payload.older_than_seconds
+    )
+    result = ContentExportJobStalledRecoveryResponse(
+        items=[_export_job_response(job) for job in jobs],
+        count=len(jobs),
+    )
+    # Compact UTF-8 JSON, UTC timestamps, null literals, terminated by
+    # exactly one newline. Items reuse the single-job public view, which
+    # never carries raw content bytes, private keys, signatures, or claim
+    # payloads.
+    return _render_compact_json(result.model_dump(mode="json"))
+
+
+@router.api_route(
+    "/content-export-jobs/recover-stalled",
+    methods=["GET", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    include_in_schema=False,
+)
+async def recover_stalled_content_export_jobs_method_not_allowed() -> None:
+    # Only POST exists on this literal path. Registered before
+    # "/content-export-jobs/{job_id}" so a non-POST method is the uniform
+    # 405 method_not_allowed rather than a job-id lookup of
+    # "recover-stalled".
+    raise StarletteHTTPException(
+        status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+        detail="Method Not Allowed",
+    )
 
 
 @router.get("/observability/summary")
