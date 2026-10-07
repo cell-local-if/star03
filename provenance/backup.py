@@ -13,6 +13,12 @@ service, never run migrations, and never write audit rows:
   verified copy over the file the configured database URL points at. The
   restored file is byte-for-byte the backup: no migration is applied and no
   row is added, so an older ``schema_migrations`` ledger stays older.
+* ``verify`` exposes the same read-only validation that the other two
+  commands perform internally: it opens ``--input`` read-only, runs
+  ``PRAGMA integrity_check`` and the migration-ledger structure check, and
+  reports the ledger version without copying or replacing anything. It
+  takes no database URL, never starts the service, migrations, or audit
+  writes, and creates no file beside or journal file next to the input.
 
 A failure at any step removes the temporary file and leaves both the input
 and any pre-existing destination untouched -- no half-written database is
@@ -317,5 +323,24 @@ def run_restore(settings: Settings, input_path: str, *, force: bool) -> dict:
     return {
         "operation": "restore",
         "path": str(target),
+        "schema_version": schema_version,
+    }
+
+
+def run_verify(input_path: str) -> dict:
+    """Verify a snapshot file read-only and report its ledger version.
+
+    No database URL is consulted and nothing is copied, replaced, or
+    created: the input is resolved exactly like a restore ``--input`` and
+    passed through the same validation as every internally staged backup.
+    Repeated runs over an unchanged file return an identical report.
+    """
+    source = _absolute_file_argument(
+        input_path, missing_code=INPUT_NOT_FOUND, what="verify input"
+    )
+    schema_version = _validate_snapshot(source)
+    return {
+        "operation": "verify",
+        "path": str(source),
         "schema_version": schema_version,
     }
