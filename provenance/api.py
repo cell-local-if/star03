@@ -176,6 +176,7 @@ from provenance.schemas import (
     AuthenticationKeyRotationCreate,
     AuthenticationKeyRotationPageResponse,
     AuthenticationKeyRotationResponse,
+    AuthenticationKeysAtPageResponse,
     AuthenticationKeySource,
     ClaimCreate,
     ClaimExportItem,
@@ -7631,6 +7632,168 @@ async def list_actor_authentication_keys(
     # echoed.
     return AuthenticationKeyPageResponse(
         actor_id=actor_id,
+        items=[
+            AuthenticationKeyItem(
+                public_key=base64.b64encode(public_key).decode("ascii"),
+                sources=[
+                    AuthenticationKeySource(
+                        source_type=source_type,
+                        source_id=source_id,
+                        created_at=created_at,
+                    )
+                    for source_type, source_id, created_at in sources
+                ],
+            )
+            for public_key, sources in page
+        ],
+        count=total,
+        next_cursor=next_cursor,
+    )
+
+
+_ACTOR_AUTHENTICATION_KEYS_AT_PARAMS = frozenset({"at", "limit", "cursor"})
+
+
+@router.get(
+    "/actors/{actor_id}/authentication-keys/at",
+    response_model=AuthenticationKeysAtPageResponse,
+)
+async def get_actor_authentication_keys_at(
+    actor_id: str,
+    request: Request,
+    session: DbSession,
+    at: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> AuthenticationKeysAtPageResponse:
+    # Public read-only forensic retrieval of one existing subject's
+    # authentication keys as of a historical instant -- the deduplicated key
+    # set an old signature can be re-checked against. The GET request body
+    # must be empty: carrying any bytes (even whitespace or malformed JSON)
+    # is a 422 validated before any parameter or subject is read. Raw
+    # multi-values are inspected deliberately: a repeated scalar is rejected
+    # instead of silently taking the last value, any parameter other than
+    # at/limit/cursor is rejected rather than ignored, a missing/blank or
+    # non-RFC-3339-UTC ``at`` is never coerced, and a blank or non-integer
+    # limit is never coerced to the default. Every such validation failure
+    # is a 422 before the subject lookup, so a malformed request never
+    # renders as an unknown_actor 404.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _ACTOR_AUTHENTICATION_KEYS_AT_PARAMS
+    if unknown:
+        # The collection accepts only at/limit/cursor; a typo never silently
+        # changes the page.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    at_value = _parse_once(raw, "at")
+    if at_value is None:
+        raise _query_validation_error(
+            "at", "Field required", "value_error.missing"
+        )
+    if not at_value.strip():
+        raise _query_validation_error(
+            "at", "at must not be empty", "value_error"
+        )
+    at_dt = parse_rfc3339_utc(at_value)
+    if at_dt is None:
+        raise _query_validation_error(
+            "at",
+            "at must be an RFC 3339 UTC timestamp",
+            "value_error.datetime",
+        )
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_AUTHENTICATION_KEYS_LIMIT,
+        service.MIN_AUTHENTICATION_KEYS_LIMIT,
+        service.MAX_AUTHENTICATION_KEYS_LIMIT,
+    )
+
+    # The cursor binds the resolved instant, not its spelling: equivalent
+    # notations ("Z" vs "+00:00") canonicalize to the same claim.
+    at_claim = at_dt.isoformat()
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.authentication_keys_at_cursor_secret,
+                pagination.AUTHENTICATION_KEYS_AT_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the query that issued it: the origin
+        # subject, the resolved instant, and the effective limit must match
+        # exactly. A cursor from another subject, another instant, another
+        # endpoint's family, or a different limit is a client validation
+        # error, not a new query.
+        if (
+            claims["actor_id"] != actor_id
+            or claims["at"] != at_claim
+            or claims["limit"] != page_limit
+        ):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Parameters and cursor are validated first; a structurally valid
+    # request for an unknown subject is a missing resource (the existing
+    # unknown_actor 404), not an empty collection.
+    entries = service.list_authentication_keys_for_actor_at(
+        session, actor_id, at_dt
+    )
+    total = len(entries)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) result set: the page is empty,
+        # count is unchanged, and no further cursor can be issued.
+        page = []
+    else:
+        page = entries[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.authentication_keys_at_cursor_secret,
+                pagination.AUTHENTICATION_KEYS_AT_CURSOR,
+                {
+                    "actor_id": actor_id,
+                    "at": at_claim,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # Each item is one deduplicated public key with every source that validly
+    # carried it at the requested instant. Only the 32 public-key bytes leave
+    # the service, Base64 on the wire; private keys, raw signatures,
+    # authentication headers, and payloads are never part of the view and so
+    # can never be echoed.
+    return AuthenticationKeysAtPageResponse(
+        actor_id=actor_id,
+        at=at_dt,
         items=[
             AuthenticationKeyItem(
                 public_key=base64.b64encode(public_key).decode("ascii"),

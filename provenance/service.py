@@ -2878,6 +2878,83 @@ def list_authentication_keys_for_actor(
     return entries
 
 
+def list_authentication_keys_for_actor_at(
+    session: Session, actor_id: str, at: datetime
+) -> list[AuthenticationKeyEntry]:
+    """Return one existing subject's authentication keys as of ``at``.
+
+    This is the historical forensic counterpart of
+    :func:`list_authentication_keys_for_actor`: the same deduplicated view,
+    reconstructed for a closed-interval instant so an old signature can be
+    re-checked against the keys that were usable at that moment. A rotation
+    is valid at ``at`` when its ``created_at`` is not later than ``at`` and
+    its ``retired_at`` is null or strictly later than ``at``; an attestation
+    is valid at ``at`` when its own ``created_at`` is not later than ``at``
+    and no revocation with ``created_at`` not later than ``at`` exists. A
+    source created exactly at ``at`` is included; a source retired or
+    revoked exactly at ``at`` is excluded, though the key remains while
+    another source is still valid. Keys are deduplicated by their 32
+    public-key bytes with every valid source merged under one key; entries
+    follow the stable order of each key's first valid source and each key's
+    sources follow that same order (``created_at``, then the unique
+    ``(source_type, source_id)`` pair). The subject must exist; an unknown
+    actor is a missing resource (``unknown_actor`` 404), not an empty
+    collection. The function is strictly read-only: it writes no resource
+    or audit event.
+    """
+    if session.get(Actor, actor_id) is None:
+        raise UnknownActorError(actor_id)
+
+    revoked_by_at = exists().where(
+        AttestationRevocation.attestation_id == Attestation.id,
+        AttestationRevocation.created_at <= at,
+    )
+    attestation_rows = session.execute(
+        select(Attestation.id, Attestation.public_key, Attestation.created_at)
+        .where(
+            Attestation.signer_actor_id == actor_id,
+            Attestation.created_at <= at,
+            ~revoked_by_at,
+        )
+    ).all()
+    rotation_rows = session.execute(
+        select(
+            AuthenticationKeyRotation.id,
+            AuthenticationKeyRotation.public_key,
+            AuthenticationKeyRotation.created_at,
+        ).where(
+            AuthenticationKeyRotation.actor_id == actor_id,
+            AuthenticationKeyRotation.created_at <= at,
+            or_(
+                AuthenticationKeyRotation.retired_at.is_(None),
+                AuthenticationKeyRotation.retired_at > at,
+            ),
+        )
+    ).all()
+
+    # Same deterministic total order and dedup merge as the current-keys
+    # listing: creation time, then the unique (source_type, source_id) pair.
+    rows = [
+        (row.created_at, "attestation", row.id, row.public_key)
+        for row in attestation_rows
+    ] + [
+        (row.created_at, "rotation", row.id, row.public_key)
+        for row in rotation_rows
+    ]
+    rows.sort(key=lambda row: (row[0], row[1], row[2]))
+
+    entries: list[AuthenticationKeyEntry] = []
+    by_key: dict[bytes, AuthenticationKeyEntry] = {}
+    for created_at, source_type, source_id, public_key in rows:
+        entry = by_key.get(public_key)
+        if entry is None:
+            entry = (public_key, [])
+            by_key[public_key] = entry
+            entries.append(entry)
+        entry[1].append((source_type, source_id, created_at))
+    return entries
+
+
 def get_authentication_key_rotation(
     session: Session, rotation_id: str
 ) -> AuthenticationKeyRotation:

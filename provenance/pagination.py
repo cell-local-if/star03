@@ -75,6 +75,10 @@ AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION = "ak1"
 #: authentication public keys.
 AUTHENTICATION_KEYS_CURSOR_VERSION = "au1"
 
+#: Marker for cursors that page through one actor's historical (as-of-``at``)
+#: deduplicated authentication public keys.
+AUTHENTICATION_KEYS_AT_CURSOR_VERSION = "ah1"
+
 #: Marker for cursors that page through one attestation's access grants.
 ATTESTATION_ACCESS_GRANTS_CURSOR_VERSION = "ag1"
 
@@ -609,6 +613,35 @@ AUTHENTICATION_KEYS_CURSOR = CursorKind(
     version=AUTHENTICATION_KEYS_CURSOR_VERSION,
     claim_fields=("actor_id", "limit", "offset"),
     validate=_validate_authentication_keys_claims,
+)
+
+
+def _validate_authentication_keys_at_claims(claims: dict[str, Any]) -> None:
+    # The collection belongs to exactly one subject at exactly one instant:
+    # a non-empty actor_id bound claim and the canonical RFC 3339 UTC
+    # spelling of the resolved ``at``. Matching is case- and
+    # whitespace-sensitive, so the raw path value is bound.
+    if not isinstance(claims["actor_id"], str) or not claims["actor_id"]:
+        raise InvalidCursorError("cursor actor_id is invalid")
+    if not isinstance(claims["at"], str) or parse_rfc3339_utc(
+        claims["at"]
+    ) is None:
+        raise InvalidCursorError("cursor at is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for
+#: ``GET /v1/actors/{actor_id}/authentication-keys/at``.
+AUTHENTICATION_KEYS_AT_CURSOR = CursorKind(
+    version=AUTHENTICATION_KEYS_AT_CURSOR_VERSION,
+    claim_fields=("actor_id", "at", "limit", "offset"),
+    validate=_validate_authentication_keys_at_claims,
 )
 
 
