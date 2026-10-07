@@ -2878,6 +2878,95 @@ def list_authentication_keys_for_actor(
     return entries
 
 
+DEFAULT_AUTHENTICATION_KEYS_AT_LIMIT = 50
+MIN_AUTHENTICATION_KEYS_AT_LIMIT = 1
+MAX_AUTHENTICATION_KEYS_AT_LIMIT = 100
+
+
+def list_authentication_keys_for_actor_at(
+    session: Session, actor_id: str, at: datetime
+) -> list[AuthenticationKeyEntry]:
+    """Return one existing subject's authentication keys valid at instant ``at``.
+
+    This is the historical, read-only counterpart of
+    :func:`list_authentication_keys_for_actor`; it never changes the current
+    view or any other behavior. ``at`` is a closed judgment point:
+
+    * a rotation is a valid source when its ``created_at`` is not later than
+      ``at`` (a rotation created exactly at ``at`` counts) and it is either
+      still active (``retired_at`` null) or retired strictly later than
+      ``at`` (a rotation retired exactly at ``at`` no longer counts);
+    * an attestation is a valid source when its own ``created_at`` is not
+      later than ``at`` (created exactly at ``at`` counts) and it has no
+      revocation whose ``created_at`` is not later than ``at`` (revoked
+      exactly at ``at`` already counts as revoked).
+
+    Keys are deduplicated by their 32 public-key bytes and every valid source
+    of the same key is merged under one item, exactly as in the current view.
+    Entries follow the stable order of each key's first valid source and each
+    key's sources follow that same order: ``created_at`` with the deterministic
+    ``(source_type, source_id)`` pair as the cross-table tiebreaker. A point
+    earlier than every source yields an empty list. The subject must exist; an
+    unknown actor is a missing resource (``unknown_actor`` 404), not an empty
+    collection. The function is strictly read-only: it writes no resource,
+    task, or audit event.
+    """
+    if session.get(Actor, actor_id) is None:
+        raise UnknownActorError(actor_id)
+
+    # A revocation that already exists at the judgment point (closed on the
+    # revocation instant) disqualifies the attestation at that point.
+    revoked_by_at = exists().where(
+        AttestationRevocation.attestation_id == Attestation.id,
+        AttestationRevocation.created_at <= at,
+    )
+    attestation_rows = session.execute(
+        select(Attestation.id, Attestation.public_key, Attestation.created_at)
+        .where(
+            Attestation.signer_actor_id == actor_id,
+            Attestation.created_at <= at,
+            ~revoked_by_at,
+        )
+    ).all()
+    rotation_rows = session.execute(
+        select(
+            AuthenticationKeyRotation.id,
+            AuthenticationKeyRotation.public_key,
+            AuthenticationKeyRotation.created_at,
+        ).where(
+            AuthenticationKeyRotation.actor_id == actor_id,
+            AuthenticationKeyRotation.created_at <= at,
+            or_(
+                AuthenticationKeyRotation.retired_at.is_(None),
+                AuthenticationKeyRotation.retired_at > at,
+            ),
+        )
+    ).all()
+
+    # ``(created_at, source_type, source_id, public_key)`` rows sorted into
+    # the same single deterministic total order the current view uses:
+    # creation time, then the unique (source_type, source_id) tiebreaker.
+    rows = [
+        (row.created_at, "attestation", row.id, row.public_key)
+        for row in attestation_rows
+    ] + [
+        (row.created_at, "rotation", row.id, row.public_key)
+        for row in rotation_rows
+    ]
+    rows.sort(key=lambda row: (row[0], row[1], row[2]))
+
+    entries: list[AuthenticationKeyEntry] = []
+    by_key: dict[bytes, AuthenticationKeyEntry] = {}
+    for created_at, source_type, source_id, public_key in rows:
+        entry = by_key.get(public_key)
+        if entry is None:
+            entry = (public_key, [])
+            by_key[public_key] = entry
+            entries.append(entry)
+        entry[1].append((source_type, source_id, created_at))
+    return entries
+
+
 def get_authentication_key_rotation(
     session: Session, rotation_id: str
 ) -> AuthenticationKeyRotation:

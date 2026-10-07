@@ -172,6 +172,7 @@ from provenance.schemas import (
     AuditReconExchangeAuditVerificationCreate,
     AuditReconExchangeAuditVerificationResponse,
     AuthenticationKeyItem,
+    AuthenticationKeyAtPageResponse,
     AuthenticationKeyPageResponse,
     AuthenticationKeyRotationCreate,
     AuthenticationKeyRotationPageResponse,
@@ -7631,6 +7632,168 @@ async def list_actor_authentication_keys(
     # echoed.
     return AuthenticationKeyPageResponse(
         actor_id=actor_id,
+        items=[
+            AuthenticationKeyItem(
+                public_key=base64.b64encode(public_key).decode("ascii"),
+                sources=[
+                    AuthenticationKeySource(
+                        source_type=source_type,
+                        source_id=source_id,
+                        created_at=created_at,
+                    )
+                    for source_type, source_id, created_at in sources
+                ],
+            )
+            for public_key, sources in page
+        ],
+        count=total,
+        next_cursor=next_cursor,
+    )
+
+
+_ACTOR_AUTHENTICATION_KEYS_AT_PARAMS = frozenset({"at", "limit", "cursor"})
+
+
+@router.get(
+    "/actors/{actor_id}/authentication-keys/at",
+    response_model=AuthenticationKeyAtPageResponse,
+)
+async def list_actor_authentication_keys_at(
+    actor_id: str,
+    request: Request,
+    session: DbSession,
+    at: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> AuthenticationKeyAtPageResponse:
+    # Public read-only historical forensics: which of one existing subject's
+    # authentication public keys were valid at a fixed past instant, so an old
+    # signature can be re-checked against the keys that were live then. This
+    # never changes the current-key view, rotation/retirement, revocation,
+    # signature verification, or protected access. The GET request body must
+    # be empty: carrying any bytes (even whitespace or malformed JSON) is a
+    # 422 validated before any parameter or subject is read. Raw multi-values
+    # are inspected deliberately: a repeated scalar is rejected instead of
+    # silently taking the last value, any parameter other than at/limit/cursor
+    # is rejected rather than ignored, a blank or non-strict-RFC-3339-UTC at
+    # is never defaulted, and a blank or non-integer limit is never coerced to
+    # the default. Every such validation failure is a 422 before the subject
+    # lookup, so a malformed request never renders as an unknown_actor 404.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+
+    raw = request.query_params
+
+    unknown = set(raw) - _ACTOR_AUTHENTICATION_KEYS_AT_PARAMS
+    if unknown:
+        # The historical collection accepts only at/limit/cursor; a typo never
+        # silently changes the judgment point or the page.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    # The closed judgment point is mandatory and strictly RFC 3339 UTC; the
+    # parsed instant (not its spelling) is what the query and cursor bind.
+    raw_at = _parse_once(raw, "at")
+    if raw_at is None:
+        raise _query_validation_error(
+            "at", "Field required", "value_error.missing"
+        )
+    if not raw_at.strip():
+        raise _query_validation_error(
+            "at", "at must not be empty", "value_error"
+        )
+    at_dt = parse_rfc3339_utc(raw_at)
+    if at_dt is None:
+        raise _query_validation_error(
+            "at",
+            "at must be an RFC 3339 UTC timestamp",
+            "value_error.datetime",
+        )
+    at_claim = at_dt.isoformat()
+
+    page_limit = _parse_int_param(
+        raw,
+        "limit",
+        service.DEFAULT_AUTHENTICATION_KEYS_AT_LIMIT,
+        service.MIN_AUTHENTICATION_KEYS_AT_LIMIT,
+        service.MAX_AUTHENTICATION_KEYS_AT_LIMIT,
+    )
+
+    cursor = _parse_once(raw, "cursor")
+    offset = 0
+    if cursor is not None:
+        try:
+            claims = pagination.decode_typed_cursor(
+                request.app.state.authentication_keys_at_cursor_secret,
+                pagination.AUTHENTICATION_KEYS_AT_CURSOR,
+                cursor,
+            )
+        except InvalidCursorError as exc:
+            raise _query_validation_error(
+                "cursor",
+                "cursor is malformed, expired, or invalid",
+                "value_error.cursor",
+            ) from exc
+        # The cursor only resumes the exact historical query that issued it:
+        # the origin subject, the parsed judgment instant, and the effective
+        # limit must all match. A cursor from another subject, another
+        # endpoint's family, another at (a changed historical condition), or
+        # a different limit is a client validation error, not a new query.
+        if (
+            claims["actor_id"] != actor_id
+            or claims["at"] != at_claim
+            or claims["limit"] != page_limit
+        ):
+            raise _query_validation_error(
+                "cursor",
+                "cursor does not match the query parameters",
+                "value_error.cursor",
+            )
+        offset = claims["offset"]
+
+    # Parameters and cursor are validated first; a structurally valid request
+    # for an unknown subject is a missing resource (the existing
+    # unknown_actor 404), not an empty collection.
+    entries = service.list_authentication_keys_for_actor_at(
+        session, actor_id, at_dt
+    )
+    total = len(entries)
+
+    next_cursor: str | None = None
+    if offset >= total:
+        # At or past the end of the (stable) historical result set: the page
+        # is empty, count is unchanged, and no further cursor can be issued.
+        page = []
+    else:
+        page = entries[offset : offset + page_limit]
+        next_offset = offset + len(page)
+        if next_offset < total:
+            next_cursor = pagination.encode_typed_cursor(
+                request.app.state.authentication_keys_at_cursor_secret,
+                pagination.AUTHENTICATION_KEYS_AT_CURSOR,
+                {
+                    "actor_id": actor_id,
+                    "at": at_claim,
+                    "limit": page_limit,
+                    "offset": next_offset,
+                },
+            )
+
+    # The historical view reuses the exact public item/source shapes of the
+    # current view: only the 32 public-key bytes (Base64) and source_type/
+    # source_id/created_at leave the service. Private keys, raw signatures,
+    # authentication headers, payloads, and internal ordering surrogates are
+    # never part of the view and so can never be echoed.
+    return AuthenticationKeyAtPageResponse(
+        actor_id=actor_id,
+        at=at_dt,
         items=[
             AuthenticationKeyItem(
                 public_key=base64.b64encode(public_key).decode("ascii"),

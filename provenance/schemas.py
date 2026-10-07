@@ -4550,3 +4550,18 @@ class AuthenticationKeyPageResponse(BaseModel):
     count: int
     #: Opaque server cursor for the next page, or null on the final page.
     next_cursor: str | None = None
+
+
+class AuthenticationKeyAtPageResponse(BaseModel):
+    """A cursor-paginated page of one subject's keys valid at one instant."""
+
+    #: The subject whose historical keys are listed (echoes the path).
+    actor_id: str
+    #: The closed historical judgment point, as strict RFC 3339 UTC.
+    at: datetime
+    items: list[AuthenticationKeyItem]
+    #: Total number of deduplicated keys valid at ``at``, independent of the
+    #: page; a point earlier than every source yields count 0.
+    count: int
+    #: Opaque server cursor for the next page, or null on the final page.
+    next_cursor: str | None = None

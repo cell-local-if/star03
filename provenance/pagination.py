@@ -75,6 +75,10 @@ AUTHENTICATION_KEY_ROTATIONS_CURSOR_VERSION = "ak1"
 #: authentication public keys.
 AUTHENTICATION_KEYS_CURSOR_VERSION = "au1"
 
+#: Marker for cursors that page through one actor's authentication public
+#: keys valid at one fixed historical instant.
+AUTHENTICATION_KEYS_AT_CURSOR_VERSION = "at1"
+
 #: Marker for cursors that page through one attestation's access grants.
 ATTESTATION_ACCESS_GRANTS_CURSOR_VERSION = "ag1"
 
@@ -609,6 +613,33 @@ AUTHENTICATION_KEYS_CURSOR = CursorKind(
     version=AUTHENTICATION_KEYS_CURSOR_VERSION,
     claim_fields=("actor_id", "limit", "offset"),
     validate=_validate_authentication_keys_claims,
+)
+
+
+def _validate_authentication_keys_at_claims(claims: dict[str, Any]) -> None:
+    # Exactly like the current-keys family, additionally bound to the parsed
+    # judgment instant: the page belongs to one subject at one ``at`` under
+    # one effective limit. Matching is exact on the canonical instant, so a
+    # different point (or a malformed one) can never resume the page.
+    if not isinstance(claims["actor_id"], str) or not claims["actor_id"]:
+        raise InvalidCursorError("cursor actor_id is invalid")
+    if not isinstance(claims["at"], str) or parse_rfc3339_utc(claims["at"]) is None:
+        raise InvalidCursorError("cursor at is invalid")
+    for field in ("limit", "offset"):
+        if not _is_int(claims[field]):
+            raise InvalidCursorError(f"cursor {field} must be an integer")
+    if not (1 <= claims["limit"] <= 100):
+        raise InvalidCursorError("cursor limit is out of range")
+    if claims["offset"] < 1:
+        raise InvalidCursorError("cursor offset must be a positive integer")
+
+
+#: Cursor family for
+#: ``GET /v1/actors/{actor_id}/authentication-keys/at``.
+AUTHENTICATION_KEYS_AT_CURSOR = CursorKind(
+    version=AUTHENTICATION_KEYS_AT_CURSOR_VERSION,
+    claim_fields=("actor_id", "at", "limit", "offset"),
+    validate=_validate_authentication_keys_at_claims,
 )
 
 
