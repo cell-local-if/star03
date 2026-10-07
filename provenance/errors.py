@@ -513,6 +513,26 @@ class ContentExportJobConflictError(DomainError):
         super().__init__(details={"job_id": job_id, "status": status})
 
 
+class ContentExportJobRecoveryConflictError(DomainError):
+    """A stalled-job recovery lost a race for one of its selected jobs.
+
+    The recovery settles its selected ``running`` jobs in a single
+    transaction; if a concurrent recovery or runner changed any selected
+    job after the selection was read, the whole recovery rolls back and is
+    a conflict rather than a partial settlement. The details carry the
+    first contested job id.
+    """
+
+    status_code = 409
+    code = "content_export_job_recovery_conflict"
+    message = (
+        "A selected content export job changed before the recovery settled."
+    )
+
+    def __init__(self, job_id: str):
+        super().__init__(details={"job_id": job_id})
+
+
 class AuditCheckpointJobNotFoundError(DomainError):
     status_code = 404
     code = "audit_checkpoint_job_not_found"

@@ -1105,6 +1105,35 @@ class ContentExportJobSummaryResponse(BaseModel):
     oldest_pending_wait_seconds: int | None
 
 
+class ContentExportJobStalledRecoveryCreate(BaseModel):
+    """A request to settle stalled running content export jobs as failed.
+
+    Exactly one member: ``older_than_seconds``, a decimal integer between 1
+    and 86400. Only jobs still ``running`` whose ``started_at`` is strictly
+    older than the current UTC instant minus this many seconds are
+    recovered. A missing field, any extra field, or a non-integer or
+    out-of-range value is a 422; nothing is coerced or defaulted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    older_than_seconds: StrictInt = Field(..., ge=1, le=86400)
+
+
+class ContentExportJobStalledRecoveryResponse(BaseModel):
+    """The outcome of one stalled-job recovery pass.
+
+    ``items`` carries the existing single-job public view of every job the
+    pass settled as failed, in the order they were processed (``started_at``
+    with the monotonic ``seq`` tiebreaker); ``count`` is the number of
+    recovered jobs. An empty pass is an empty ``items`` array and count 0.
+    """
+
+    items: list[ContentExportJobResponse]
+    #: Number of jobs this pass settled as failed.
+    count: int
+
+
 class ObservabilityAuditStatus(BaseModel):
     """The audit-trail portion of the read-only running-state summary.
 

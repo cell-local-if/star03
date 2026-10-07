@@ -10,7 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 
 from sqlalchemy import exists, func, or_, select, update as sa_update
@@ -43,6 +43,7 @@ from provenance.errors import (
     ClaimSupersessionValidationError,
     ContentExportJobConflictError,
     ContentExportJobNotFoundError,
+    ContentExportJobRecoveryConflictError,
     ContentExportRequestConflictError,
     ContentNotFoundError,
     ContentRelationNotFoundError,
@@ -68,6 +69,7 @@ from provenance.models import (
     CONTENT_EXPORT_JOB_FAILED_ERROR,
     CONTENT_EXPORT_JOB_PENDING,
     CONTENT_EXPORT_JOB_RUNNING,
+    CONTENT_EXPORT_JOB_STALLED_ERROR,
     CONTENT_EXPORT_JOB_STATES,
     CONTENT_EXPORT_JOB_SUCCEEDED,
     AUDIT_CHECKPOINT_JOB_FAILED,
@@ -102,6 +104,7 @@ from provenance.models import (
     EVENT_CONTENT_CREATED,
     EVENT_CONTENT_EXPORT_JOB_CREATED,
     EVENT_CONTENT_EXPORT_JOB_RUN,
+    EVENT_CONTENT_EXPORT_JOB_STALLED_RECOVERY,
     EVENT_CONTENT_RELATION_CREATED,
     EVENT_CSP_CHECKPOINT_IMPORTED,
     EVENT_EVIDENCE_BUNDLE_CREATED,
@@ -3535,6 +3538,104 @@ def _claim_and_run_content_export_job(
     # onto the identity-map object before returning it.
     session.refresh(job)
     return job
+
+
+def recover_stalled_content_export_jobs(
+    session: Session, older_than_seconds: int
+) -> list[ContentExportJob]:
+    """Settle every stalled running export job as failed, in one transaction.
+
+    The strict cutoff is the current UTC instant minus ``older_than_seconds``;
+    only jobs still ``running`` whose ``started_at`` is strictly earlier than
+    the cutoff are selected, ordered by ``started_at`` with the monotonic
+    ``seq`` tiebreaker (a stable order that survives restarts). With no
+    matching job the pass is a no-op and returns an empty list.
+
+    Each selected job is settled by a conditional
+    ``UPDATE ... WHERE status = 'running'`` compare-and-set: status
+    ``failed``, UTC ``finished_at`` stamped with the single recovery
+    instant, ``result`` null, and the stable ``content_export_stalled``
+    error; the job id, ``request_id``, ``content_id``, and ``started_at``
+    are left untouched. Every settlement appends a
+    ``content_export_job.stalled_recovery`` audit event (resource id = job
+    id) in the SAME transaction, so the whole pass commits or nothing does.
+    If a concurrent recovery or runner changed any selected job after the
+    selection was read, its compare-and-set matches zero rows: the entire
+    pass rolls back and raises
+    :class:`ContentExportJobRecoveryConflictError` carrying the first
+    contested job id, leaving every job and the audit trail exactly as
+    before the call.
+    """
+    cutoff = utc_now() - timedelta(seconds=older_than_seconds)
+    stalled = (
+        session.execute(
+            select(ContentExportJob)
+            .where(
+                ContentExportJob.status == CONTENT_EXPORT_JOB_RUNNING,
+                ContentExportJob.started_at < cutoff,
+            )
+            .order_by(
+                ContentExportJob.started_at.asc(), ContentExportJob.seq.asc()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not stalled:
+        # Nothing stalled: zero writes, no audit event.
+        return []
+    return _settle_stalled_content_export_jobs(session, stalled)
+
+
+def _settle_stalled_content_export_jobs(
+    session: Session, stalled: list[ContentExportJob]
+) -> list[ContentExportJob]:
+    """Settle already-selected stalled jobs as failed in one transaction.
+
+    Each job's running->failed flip is a compare-and-set on
+    ``status = 'running'``: exactly one concurrent settler wins, and a loser
+    (the job was settled or otherwise changed after selection) updates zero
+    rows, rolls the whole pass back, and raises
+    :class:`ContentExportJobRecoveryConflictError` for the first contested
+    job. All winning settlements and their
+    ``content_export_job.stalled_recovery`` audit events commit together.
+    """
+    # One recovery instant stamps every job settled by this pass.
+    recovered_at = utc_now()
+    job_ids = [job.id for job in stalled]
+    for job_id in job_ids:
+        settled = session.execute(
+            sa_update(ContentExportJob)
+            .where(
+                ContentExportJob.id == job_id,
+                ContentExportJob.status == CONTENT_EXPORT_JOB_RUNNING,
+            )
+            .values(
+                status=CONTENT_EXPORT_JOB_FAILED,
+                finished_at=recovered_at,
+                result=None,
+                error=CONTENT_EXPORT_JOB_STALLED_ERROR,
+            )
+        )
+        if settled.rowcount != 1:
+            # A concurrent recovery or runner changed this job after the
+            # selection was read: the whole pass is a conflict, not a
+            # partial settlement, so roll back every earlier settlement and
+            # audit event of this pass.
+            session.rollback()
+            raise ContentExportJobRecoveryConflictError(job_id)
+        session.add(
+            AuditEvent(
+                event_type=EVENT_CONTENT_EXPORT_JOB_STALLED_RECOVERY,
+                resource_id=job_id,
+            )
+        )
+    session.commit()
+    # The Core UPDATEs bypassed the ORM unit of work; reload the final state
+    # onto the identity-map objects before returning them in process order.
+    for job in stalled:
+        session.refresh(job)
+    return list(stalled)
 
 
 #: Builds the stored export result for one evidence bundle export job: the

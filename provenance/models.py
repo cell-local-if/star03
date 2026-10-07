@@ -63,6 +63,9 @@ EVENT_REVOCATION_IMPACT_EXCHANGE_IMPORTED = (
 )
 EVENT_CONTENT_EXPORT_JOB_CREATED = "content_export_job.created"
 EVENT_CONTENT_EXPORT_JOB_RUN = "content_export_job.run"
+EVENT_CONTENT_EXPORT_JOB_STALLED_RECOVERY = (
+    "content_export_job.stalled_recovery"
+)
 EVENT_ACTOR_TRUST_POLICY_CREATED = "actor_trust_policy.created"
 EVENT_ACTOR_TRUST_POLICY_REVOKED = "actor_trust_policy.revoked"
 EVENT_AUDIT_CHECKPOINT_JOB_CREATED = "audit_checkpoint_job.created"
@@ -87,6 +90,9 @@ CONTENT_EXPORT_JOB_STATES = frozenset(
 )
 # Stable error recorded on a failed export run.
 CONTENT_EXPORT_JOB_FAILED_ERROR = "content_export_failed"
+# Stable error recorded when a stalled running job is settled as failed by a
+# stalled-job recovery (the process that claimed it never settled it).
+CONTENT_EXPORT_JOB_STALLED_ERROR = "content_export_stalled"
 
 # Audit checkpoint export job lifecycle states. A job is created
 # ``pending``; a run atomically claims it into ``running`` and then settles it
@@ -1385,7 +1391,10 @@ class ContentExportJob(Base):
     as ``succeeded`` -- stamping UTC ``finished_at`` and storing the existing
     read-only content export (``{"content", "claims"}``) as its ``result`` --
     or ``failed`` -- stamping ``finished_at``, leaving ``result`` null and
-    recording the stable ``content_export_failed`` error. The state machine is
+    recording the stable ``content_export_failed`` error. A ``running`` job
+    whose claiming process exited without settling it is recovered as
+    ``failed`` with the stable ``content_export_stalled`` error once its
+    ``started_at`` is older than an operator-chosen age. The state machine is
     monotonic: only a ``pending`` job can be claimed, so a concurrent or
     repeated run is a conflict rather than a second execution.
 
