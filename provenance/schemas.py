@@ -1350,6 +1350,35 @@ class EvidenceBundleExportJobSummaryResponse(BaseModel):
     oldest_pending_wait_seconds: int | None
 
 
+class EvidenceBundleExportJobStalledRecoveryCreate(BaseModel):
+    """A request to settle bundle export jobs stuck ``running`` too long.
+
+    Exactly one member: ``older_than_seconds``, a decimal integer between 1
+    and 86400. Only jobs still ``running`` whose ``started_at`` is strictly
+    earlier than the current UTC instant minus this many seconds are
+    recovered. Undeclared fields, a missing field, and non-integer or
+    out-of-range values are rejected rather than coerced.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    older_than_seconds: StrictInt = Field(..., ge=1, le=86400)
+
+
+class EvidenceBundleExportJobStalledRecoveryResponse(BaseModel):
+    """The outcome of one stalled bundle export job recovery pass.
+
+    ``items`` carries the existing single-job public view of every job the
+    pass settled, in the order they were processed (``started_at`` with the
+    monotonic ``seq`` tiebreaker); ``count`` is the number of recovered
+    jobs. An empty match set yields an empty ``items`` and ``count`` zero.
+    """
+
+    items: list[EvidenceBundleExportJobResponse]
+    #: Number of jobs this recovery pass settled as failed.
+    count: int
+
+
 class ContentRelationCreate(BaseModel):
     content_id: str = Field(..., min_length=1, max_length=80)
     parent_content_id: str = Field(..., min_length=1, max_length=80)

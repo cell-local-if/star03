@@ -69,6 +69,9 @@ EVENT_ACTOR_TRUST_POLICY_REVOKED = "actor_trust_policy.revoked"
 EVENT_AUDIT_CHECKPOINT_JOB_CREATED = "audit_checkpoint_job.created"
 EVENT_AUDIT_CHECKPOINT_JOB_RUN = "audit_checkpoint_job.run"
 EVENT_EVIDENCE_BUNDLE_EXPORT_JOB_CREATED = "evidence_bundle_export_job.created"
+EVENT_EVIDENCE_BUNDLE_EXPORT_JOB_STALLED_RECOVERY = (
+    "evidence_bundle_export_job.stalled_recovery"
+)
 
 # Content export job lifecycle states. A job is created ``pending``; a run
 # atomically claims it into ``running`` and then settles it as
@@ -130,6 +133,10 @@ EVIDENCE_BUNDLE_EXPORT_JOB_STATES = frozenset(
 )
 # Stable error recorded on a failed evidence bundle export run.
 EVIDENCE_BUNDLE_EXPORT_JOB_FAILED_ERROR = "evidence_bundle_export_failed"
+# Stable error recorded when a stalled ``running`` bundle export job is
+# recovered: the process that claimed it never settled it, so recovery
+# settles it as ``failed`` with this code rather than the run-failure code.
+EVIDENCE_BUNDLE_EXPORT_JOB_STALLED_ERROR = "evidence_bundle_export_stalled"
 
 # Renders as INTEGER on SQLite (required for AUTOINCREMENT) and BIGINT elsewhere.
 _surrogate_key = BigInteger().with_variant(Integer, "sqlite")
