@@ -162,6 +162,7 @@ from provenance.schemas import (
     AuditEventPageResponse,
     AuditExchangeImportCreate,
     AuditExchangeImportPageResponse,
+    AuditExchangeImportReconciliationResponse,
     AuditExchangeImportResponse,
     AuditReconExchangeImportCreate,
     AuditReconExchangeImportPageResponse,
@@ -9961,6 +9962,44 @@ def get_audit_exchange(
     # event. An unknown id is an explicit, specific 404.
     record = service.get_audit_exchange_import(session, import_id)
     return _render_compact_json(_audit_exchange_import_response(record))
+
+
+@router.get(
+    "/audit-exchanges/{import_id}/reconciliation",
+    response_model=AuditExchangeImportReconciliationResponse,
+)
+async def reconcile_audit_exchange_import(
+    import_id: str, request: Request, session: DbSession
+) -> Response:
+    # The reconciliation is a read-only empty GET: any body bytes (even
+    # whitespace, arbitrary bytes, or malformed JSON) and any query
+    # parameter (unknown, blank, or repeated) is a 422 validation_error,
+    # rejected here before the receipt is looked up or a single local
+    # event is read. PUT/PATCH/DELETE/POST and every other non-GET method
+    # on this path is the framework's 405 method_not_allowed.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # Strictly read-only: the receipt is resolved by exact import_id (an
+    # unknown id is the existing audit_exchange_import_not_found 404), and
+    # the current complete, unfiltered local audit sequence is read once
+    # in stable creation order and rebuilt through the same public views
+    # as GET /v1/audit-events/checkpoint/package. No original package is
+    # re-presented or required; only the receipt's recorded digest, the
+    # local checkpoint (version, algorithm, event count, events digest),
+    # the rebuilt whole-package digest, and the boolean verdict are
+    # returned -- never the events, the signature, or any private key. An
+    # unreadable database or a rebuild/digest failure is the
+    # existing-structure 503 service_unavailable, never a partial body; no
+    # receipt, audit event, task, or resource is written on any path.
+    result = service.reconcile_audit_exchange_import(session, import_id)
+    return _render_compact_json(result.model_dump(mode="json"))
 
 
 # --- Signed audit checkpoint recon exchange imports -------------------------------

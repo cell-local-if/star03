@@ -49,6 +49,7 @@ from provenance.errors import (
     ContentRelationNotFoundError,
     ContentRelationValidationError,
     CspImportNotFoundError,
+    DomainError,
     EvidenceBundleExchangeImportNotFoundError,
     EvidenceBundleExportJobConflictError,
     EvidenceBundleExportJobNotFoundError,
@@ -153,8 +154,14 @@ from provenance.schemas import (
     AttestationRevocationCreate,
     AuditCheckpointImportCreate,
     AuditCheckpointJobCreate,
+    AuditEventCheckpointPackageResponse,
+    AuditEventCheckpointResponse,
+    AuditEventItem,
     AuditExchangeImportCreate,
+    AuditExchangeImportReconciliationResponse,
     AuditReconExchangeImportCreate,
+    AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
+    AUDIT_CHECKPOINT_VERSION,
     AuthenticationKeyRotationCreate,
     ClaimCreate,
     ClaimSupersessionCreate,
@@ -5436,6 +5443,92 @@ def get_audit_exchange_import(
     if record is None:
         raise AuditExchangeImportNotFoundError(import_id)
     return record
+
+
+def reconcile_audit_exchange_import(
+    session: Session, import_id: str
+) -> AuditExchangeImportReconciliationResponse:
+    """Reconcile one signed audit exchange-import receipt against local state.
+
+    The receipt is read by ``import_id`` (an unknown id is the existing
+    :class:`AuditExchangeImportNotFoundError`, 404
+    ``audit_exchange_import_not_found``); the received package itself is
+    not persisted and need not -- and cannot -- be re-presented. The
+    current local audit sequence is read once, complete and unfiltered, in
+    its stable creation order (``created_at`` with the monotonic ``seq``
+    tiebreaker), and rebuilt through exactly the public wire view served by
+    ``GET /v1/audit-events`` and ``GET /v1/audit-events/checkpoint``: the
+    four-field checkpoint and the whole package
+    (``{"checkpoint", "events"}``) digest identically to
+    ``GET /v1/audit-events/checkpoint/package`` under the package canonical
+    rules. ``matches`` is true only when that rebuilt whole-package digest
+    equals the receipt's recorded ``package_digest_hex`` character for
+    character; an empty local sequence yields the zero-event checkpoint
+    and the empty-array package digest and matches only a receipt for the
+    same empty package.
+
+    The read is strictly read-only: it only issues ``SELECT`` queries,
+    never commits, and creates, modifies, or deletes no receipt, audit
+    event, task, or resource, so the same persisted state produces the
+    identical response on repeated or concurrent reads. An unreadable
+    database or any failure rebuilding or digesting the package raises
+    :class:`ObservabilityUnavailableError` (``503 service_unavailable``)
+    instead of returning a partial response; a not-found receipt still
+    renders as its 404, and the half-open read transaction is rolled back.
+    """
+    try:
+        record = get_audit_exchange_import(session, import_id)
+
+        # Exactly the checkpoint-package route's unfiltered read: one
+        # read-only state read in stable creation order, rendered through
+        # the existing public views, so the package and its checkpoint
+        # cannot disagree and the digests are reproducible offline from
+        # the audit-event listing alone.
+        items = list_audit_events(session)
+        event_views = [AuditEventItem.model_validate(item) for item in items]
+        # mode="json" yields exactly the wire view served by the
+        # checkpoint-package route's events member (UTC datetimes as RFC
+        # 3339 strings), so the checkpoint binds to exactly those events.
+        events = [view.model_dump(mode="json") for view in event_views]
+        local_checkpoint = AuditEventCheckpointResponse(
+            checkpoint_version=AUDIT_CHECKPOINT_VERSION,
+            digest_algorithm=AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
+            event_count=len(events),
+            events_digest_hex=canonical.audit_events_digest_hex(events),
+        )
+        local_package_digest_hex = (
+            canonical.audit_checkpoint_package_digest_hex(
+                AuditEventCheckpointPackageResponse(
+                    checkpoint=local_checkpoint,
+                    events=event_views,
+                ).model_dump(mode="json")
+            )
+        )
+    except DomainError:
+        # A client-facing domain outcome -- above all the 404 unknown
+        # receipt -- is reported as itself, never masked as a 503.
+        raise
+    except SQLAlchemyError:
+        # An unreadable database (connection, schema, statement failure):
+        # drop any half-open read transaction; this read never writes, so
+        # rollback discards no application mutation.
+        session.rollback()
+        raise ObservabilityUnavailableError("database_unavailable")
+    except Exception:
+        # Any other internal failure rebuilding the package or computing
+        # its digests is still a service unavailability for this read-only
+        # route, never a partial body or a 500.
+        session.rollback()
+        raise ObservabilityUnavailableError("internal_error")
+
+    return AuditExchangeImportReconciliationResponse(
+        import_id=record.id,
+        package_digest_hex=record.package_digest_hex,
+        received_at=record.created_at,
+        local_checkpoint=local_checkpoint,
+        local_package_digest_hex=local_package_digest_hex,
+        matches=local_package_digest_hex == record.package_digest_hex,
+    )
 
 
 def _audit_recon_exchange_import_identity_select(

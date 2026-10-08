@@ -3888,6 +3888,38 @@ class AuditExchangeImportPageResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class AuditExchangeImportReconciliationResponse(BaseModel):
+    """A read-only reconciliation of one signed audit exchange-import receipt.
+
+    Exactly six members, in order: the receipt's ``import_id``, the
+    verified whole-package digest recorded on the receipt
+    (``package_digest_hex``), the receipt's UTC ``received_at``,
+    ``local_checkpoint`` -- the four-field checkpoint computed over the
+    complete, unfiltered local audit-event sequence under exactly the
+    existing ``GET /v1/audit-events/checkpoint`` rules -- the
+    ``local_package_digest_hex`` of the complete package rebuilt from that
+    same read under the ``GET /v1/audit-events/checkpoint/package`` rules
+    (root ``checkpoint``/``events`` order, nested keys sorted), and
+    ``matches`` -- true only when that rebuilt whole-package digest equals
+    the receipt's ``package_digest_hex`` character for character.
+
+    The received package is never stored and is never re-presented to this
+    route; the verdict derives solely from the receipt identity and the
+    current local sequence. The response carries digests, counts, and the
+    boolean verdict only -- the events, the original signature, any private
+    key, and every other raw byte are absent. An empty local sequence
+    yields the zero-event checkpoint and the empty-array package digest;
+    it matches only a receipt for the same empty package.
+    """
+
+    import_id: str
+    package_digest_hex: str
+    received_at: datetime
+    local_checkpoint: AuditEventCheckpointResponse
+    local_package_digest_hex: str
+    matches: bool
+
+
 #: Fixed signature-exchange version for signed audit checkpoint recon
 #: packages. The same literal is the first element of the signed JSON
 #: array, so the metadata field and the signature domain-separation
