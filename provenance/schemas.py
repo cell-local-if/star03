@@ -4470,6 +4470,60 @@ class TrustDecisionResponse(BaseModel):
     reason: Literal["threshold_met", "below_threshold", "policy_missing"]
 
 
+class TrustDecisionBatchItem(BaseModel):
+    """One target in a batch authorization decision.
+
+    The item carries exactly its two declared fields; undeclared fields are
+    rejected rather than silently discarded. Types are strict: a number or
+    boolean never stands in for a string. ``target_id`` is matched verbatim
+    (surrounding whitespace is part of the identifier rather than trimmed);
+    only a blank-after-strip value is refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_type: Literal["claim", "evidence_bundle"]
+    target_id: StrictStr
+
+    @field_validator("target_id")
+    @classmethod
+    def _target_id_nonblank(cls, v: str) -> str:
+        # Verbatim matching: only a wholly-blank identifier is rejected;
+        # surrounding whitespace on a non-blank id is never stripped.
+        if not v.strip():
+            raise ValueError("target_id must not be empty")
+        return v
+
+
+class TrustDecisionBatchRequest(BaseModel):
+    """A batch of 1 to 100 authorization decision targets.
+
+    The body carries exactly an ``items`` array; undeclared top-level
+    fields are rejected. Every element is validated exactly as a single
+    decision target before any target is looked up.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[TrustDecisionBatchItem] = Field(
+        ..., min_length=1, max_length=100
+    )
+
+
+class TrustDecisionBatchResponse(BaseModel):
+    """Batch result: one decision per input item, in input order.
+
+    Duplicate targets are never merged: each input item gets its own
+    decision entry. ``count`` equals the number of decided items
+    (``len(items)``). Like the single-target route, the batch is computed
+    live and creates neither a resource, task, nor audit event.
+    """
+
+    items: list[TrustDecisionResponse]
+    #: Number of decision items (== len(items), duplicates retained).
+    count: int
+
+
 class AuthenticationKeyRotationCreate(BaseModel):
     # A rotation carries exactly its declared verification material. There
     # is deliberately no field capable of carrying a private key or a raw

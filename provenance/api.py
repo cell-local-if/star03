@@ -256,6 +256,8 @@ from provenance.schemas import (
     PrivacyExportEvidenceBundleItem,
     TaskQueueSummaryResponse,
     TaskQueuesSummaryResponse,
+    TrustDecisionBatchRequest,
+    TrustDecisionBatchResponse,
     TrustDecisionResponse,
     TrustEvaluationBatchRequest,
     TrustEvaluationBatchResponse,
@@ -8557,6 +8559,73 @@ async def get_trust_decision(
     return _compact_json_response(
         TrustDecisionResponse(**result), status.HTTP_200_OK
     )
+
+
+_TRUST_DECISION_BATCHES_PARAMS = frozenset()
+
+
+@router.post("/trust-decision-batches")
+async def decide_trust_batch(
+    request: Request,
+    session: DbSession,
+) -> Response:
+    # Read-only batch authorization decisions under the calling subject's
+    # current policy: the call creates no resource, task, or audit event,
+    # so repeated batches return identical results for the same state. Any
+    # query parameter is rejected before the body is parsed, exactly as an
+    # undeclared parameter is rejected on the single-target route.
+    unknown = set(request.query_params) - _TRUST_DECISION_BATCHES_PARAMS
+    if unknown:
+        # A typo (e.g. ``?target_type=claim``) never silently changes results.
+        field = sorted(unknown)[0]
+        raise _query_validation_error(
+            field, f"unknown query parameter: {field}", "value_error.unknown"
+        )
+
+    raw_body = await request.body()
+    try:
+        parsed = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # Empty body, invalid UTF-8, malformed JSON, or any non-object
+        # token (bare arrays/strings/numbers) is a 422 before any
+        # credential or target is read; nothing is ever coerced from form
+        # data.
+        raise LineageValidationError(
+            [{"loc": ["body"], "msg": "invalid JSON body", "type": "json_error"}]
+        ) from None
+
+    try:
+        payload = TrustDecisionBatchRequest.model_validate(parsed)
+    except ValidationError as exc:
+        # The whole structure (top level, every item, every field, the
+        # 1..100 cardinality) is validated up front: an empty batch, a
+        # wrong/extra/missing field, a non-object item, a non-literal
+        # target_type, or a blank target_id is a 422, and no credential or
+        # target is ever read.
+        raise _request_body_validation_error(exc) from None
+
+    # Validation precedes authentication, exactly as on the single-target
+    # route. The signature covers the exact bytes on the wire; missing or
+    # unauthenticatable credentials collapse into the same opaque 404 as on
+    # the other protected read routes, and malformed credentials stay 422.
+    actor = await _authenticate_protected(
+        request, session, raw_body, read=True
+    )
+
+    # Strictly read-only: every item is decided under the caller's current
+    # unrevoked policy. Without one, no target is ever looked up; with one,
+    # the first missing or type-mismatched target fails the whole batch
+    # with one type-matched 404 and never a partial result.
+    results = service.decide_trust_batch(session, actor, payload)
+    response = TrustDecisionBatchResponse(
+        items=[TrustDecisionResponse(**item) for item in results],
+        count=len(results),
+    )
+    # Compact UTF-8 JSON terminated by exactly one newline; members appear
+    # as items, count, and each item carries exactly the seven
+    # single-target fields -- never a signature, attestation payload, claim
+    # payload, or content bytes.
+    return _compact_json_response(response, status.HTTP_200_OK)
 
 
 _AUDIT_EVENTS_PARAMS = frozenset(

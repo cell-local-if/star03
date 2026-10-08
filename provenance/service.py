@@ -169,6 +169,7 @@ from provenance.schemas import (
     EvidenceBundleRevocationCreate,
     ImpactReconExchangeImportCreate,
     RevocationImpactImportCreate,
+    TrustDecisionBatchRequest,
     TrustEvaluationBatchRequest,
 )
 from provenance.time_utils import utc_now
@@ -6613,6 +6614,54 @@ def _policy_missing_decision(target_type: str, target_id: str) -> dict:
     }
 
 
+def _current_trust_policy(
+    session: Session, actor_id: str
+) -> ActorTrustPolicy | None:
+    """The subject's effective trust policy: existing and unrevoked.
+
+    A revoked policy no longer participates in any decision -- the revoked
+    row itself, its ``created_at``, and its historical audit events are
+    preserved, only the decision path ignores it -- so it renders exactly
+    as if the subject had never registered one.
+    """
+    policy = session.execute(
+        select(ActorTrustPolicy).where(ActorTrustPolicy.actor_id == actor_id)
+    ).scalar_one_or_none()
+    if policy is None:
+        return None
+    revoked = session.execute(
+        select(ActorTrustPolicyRevocation.seq).where(
+            ActorTrustPolicyRevocation.policy_id == policy.id
+        )
+    ).first()
+    if revoked is not None:
+        return None
+    return policy
+
+
+def _threshold_decision(
+    policy: ActorTrustPolicy,
+    target_type: str,
+    target_id: str,
+    qualified: int,
+) -> dict:
+    """The decision rendered under an effective policy for one target."""
+    met = qualified >= policy.threshold
+    return {
+        "target_type": target_type,
+        "target_id": target_id,
+        "policy_id": policy.id,
+        "threshold": policy.threshold,
+        "qualified_signer_count": qualified,
+        "decision": (
+            TRUST_DECISION_TRUSTED if met else TRUST_DECISION_UNTRUSTED
+        ),
+        "reason": (
+            TRUST_REASON_THRESHOLD_MET if met else TRUST_REASON_BELOW_THRESHOLD
+        ),
+    }
+
+
 def decide_trust(
     session: Session,
     actor_id: str,
@@ -6637,39 +6686,70 @@ def decide_trust(
     actor. The function is strictly read-only: it writes no resource and no
     audit event.
     """
-    policy = session.execute(
-        select(ActorTrustPolicy).where(ActorTrustPolicy.actor_id == actor_id)
-    ).scalar_one_or_none()
+    policy = _current_trust_policy(session, actor_id)
     if policy is None:
-        return _policy_missing_decision(target_type, target_id)
-
-    revoked = session.execute(
-        select(ActorTrustPolicyRevocation.seq).where(
-            ActorTrustPolicyRevocation.policy_id == policy.id
-        )
-    ).first()
-    if revoked is not None:
-        # A revoked policy no longer participates: the decision renders
-        # exactly as if the caller had never registered one, and the target
-        # is never read.
         return _policy_missing_decision(target_type, target_id)
 
     _require_trust_target(session, target_type, target_id)
     qualified = _qualified_signer_count(session, target_type, target_id)
-    met = qualified >= policy.threshold
-    return {
-        "target_type": target_type,
-        "target_id": target_id,
-        "policy_id": policy.id,
-        "threshold": policy.threshold,
-        "qualified_signer_count": qualified,
-        "decision": (
-            TRUST_DECISION_TRUSTED if met else TRUST_DECISION_UNTRUSTED
-        ),
-        "reason": (
-            TRUST_REASON_THRESHOLD_MET if met else TRUST_REASON_BELOW_THRESHOLD
-        ),
-    }
+    return _threshold_decision(policy, target_type, target_id, qualified)
+
+
+def decide_trust_batch(
+    session: Session, actor_id: str, payload: TrustDecisionBatchRequest
+) -> list[dict]:
+    """Decide trust for 1..100 targets under the caller's current policy.
+
+    Every item is structurally validated by the caller before this function
+    runs, and every item is decided under the caller's one effective policy
+    exactly as in :func:`decide_trust`. When the caller has no unrevoked
+    policy, every item renders ``untrusted``/``policy_missing`` with a null
+    policy id and threshold and no target is ever looked up -- existence is
+    neither checked nor revealed, even for a single item.
+
+    With an effective policy, existence is resolved first, strictly in
+    request order: the first target that is missing, or whose declared type
+    does not match an existing resource, fails the whole batch with one
+    type-matched :class:`TrustEvaluationBatchTargetNotFoundError`, and no
+    later target (and no signer count) is read. Once every target exists,
+    each item's qualified signer count is computed exactly as in
+    :func:`decide_trust` -- verified, non-revoked attestations of the exact
+    target, deduplicated by signing actor -- including for repeated items:
+    duplicates are never merged or dropped and results keep the input
+    order. The function is strictly read-only: it writes no resource, task,
+    or audit event, so a repeated batch returns the same results for the
+    same state.
+    """
+    policy = _current_trust_policy(session, actor_id)
+    if policy is None:
+        # No effective policy: the same policy_missing decision for every
+        # item, and no target is ever read.
+        return [
+            _policy_missing_decision(item.target_type, item.target_id)
+            for item in payload.items
+        ]
+
+    for item in payload.items:
+        try:
+            _require_trust_target(session, item.target_type, item.target_id)
+        except (ClaimNotFoundError, EvidenceBundleNotFoundError):
+            # The whole batch is one 404 keyed on the first missing target,
+            # in request order, rather than one 404 per item.
+            raise TrustEvaluationBatchTargetNotFoundError(
+                item.target_type, item.target_id
+            ) from None
+
+    results = []
+    for item in payload.items:
+        qualified = _qualified_signer_count(
+            session, item.target_type, item.target_id
+        )
+        results.append(
+            _threshold_decision(
+                policy, item.target_type, item.target_id, qualified
+            )
+        )
+    return results
 
 
 def get_actor_trust_policy_revocation_impact(
