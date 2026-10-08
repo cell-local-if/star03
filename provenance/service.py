@@ -151,8 +151,11 @@ from provenance.schemas import (
     AttestationAccessGrantRevocationCreate,
     AttestationCreate,
     AttestationRevocationCreate,
+    AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
+    AUDIT_CHECKPOINT_VERSION,
     AuditCheckpointImportCreate,
     AuditCheckpointJobCreate,
+    AuditEventItem,
     AuditExchangeImportCreate,
     AuditReconExchangeImportCreate,
     AuthenticationKeyRotationCreate,
@@ -5436,6 +5439,63 @@ def get_audit_exchange_import(
     if record is None:
         raise AuditExchangeImportNotFoundError(import_id)
     return record
+
+
+def reconcile_audit_exchange_import(
+    session: Session,
+) -> tuple[dict, str]:
+    """Rebuild the local audit checkpoint package for one exchange receipt.
+
+    Strictly read-only: the complete, unfiltered local audit sequence is
+    read once in its stable creation order and rendered through the same
+    public wire view as
+    ``GET /v1/audit-events/checkpoint/package`` (UTC datetimes as RFC
+    3339 strings), then both the checkpoint (fixed version/algorithm,
+    event count, canonical events digest) and the whole-package digest
+    are rebuilt from that single read, so the two can never disagree.
+    Returns ``(checkpoint_dict, local_package_digest_hex)``; the caller
+    compares the package digest with the receipt's stored
+    ``package_digest_hex``. The original signed package and events are
+    not persisted, so nothing besides local public state participates;
+    an empty local sequence yields the zero-event checkpoint, the
+    digest of ``[]``, and the empty-package digest.
+
+    An unreadable database or any failure rebuilding the view or
+    computing a digest raises :class:`ObservabilityUnavailableError`
+    (``503 service_unavailable``) carrying a machine-readable reason
+    instead of returning a partial result, and the half-open read
+    transaction is rolled back.
+    """
+    try:
+        items = list_audit_events(session)
+        events = [
+            AuditEventItem.model_validate(item).model_dump(mode="json")
+            for item in items
+        ]
+        checkpoint = {
+            "checkpoint_version": AUDIT_CHECKPOINT_VERSION,
+            "digest_algorithm": AUDIT_CHECKPOINT_DIGEST_ALGORITHM,
+            "event_count": len(events),
+            "events_digest_hex": canonical.audit_events_digest_hex(events),
+        }
+        local_package_digest_hex = (
+            canonical.audit_checkpoint_package_digest_hex(
+                {"checkpoint": checkpoint, "events": events}
+            )
+        )
+    except SQLAlchemyError:
+        # An unreadable database (connection, schema, statement
+        # failure): drop any half-open read transaction; a read-only
+        # reconciliation failure leaves no transaction side effect.
+        session.rollback()
+        raise ObservabilityUnavailableError("database_unavailable")
+    except Exception:
+        # Any other internal failure rebuilding the package or hashing
+        # is service unavailability for this read-only route, never a
+        # partial body or a 500, and the read has nothing to commit.
+        session.rollback()
+        raise ObservabilityUnavailableError("internal_error")
+    return checkpoint, local_package_digest_hex
 
 
 def _audit_recon_exchange_import_identity_select(

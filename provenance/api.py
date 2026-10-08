@@ -12,6 +12,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -36,6 +37,7 @@ from provenance.errors import (
     ImpactReconExchangeImportValidationError,
     ImpactReconSignatureVerificationError,
     LineageValidationError,
+    ObservabilityUnavailableError,
     ProtectedAccessValidationError,
     ProtectedResourceNotFoundError,
 )
@@ -162,6 +164,7 @@ from provenance.schemas import (
     AuditEventPageResponse,
     AuditExchangeImportCreate,
     AuditExchangeImportPageResponse,
+    AuditExchangeImportReconciliationResponse,
     AuditExchangeImportResponse,
     AuditReconExchangeImportCreate,
     AuditReconExchangeImportPageResponse,
@@ -9961,6 +9964,75 @@ def get_audit_exchange(
     # event. An unknown id is an explicit, specific 404.
     record = service.get_audit_exchange_import(session, import_id)
     return _render_compact_json(_audit_exchange_import_response(record))
+
+
+@router.get("/audit-exchanges/{import_id}/reconciliation")
+async def reconcile_audit_exchange_import(
+    import_id: str, request: Request, session: DbSession
+) -> Response:
+    # The reconciliation is an empty GET only: carrying any body bytes
+    # (even whitespace, arbitrary bytes, or malformed JSON) is a 422
+    # validated before any query parameter, receipt, or local event is
+    # read, and any (or repeated) query parameter is likewise a 422
+    # before the receipt lookup. PUT/PATCH/DELETE and every other
+    # non-GET method on this path is the framework's 405
+    # method_not_allowed.
+    raw_body = await request.body()
+    if raw_body:
+        raise _query_validation_error(
+            "body",
+            "request body must be empty",
+            "value_error.body",
+        )
+    _reject_any_query_param(request)
+
+    # Exact id match against audit_exchange_imports, then rebuild the
+    # local package -- strictly read-only and from a single request
+    # state: the complete, unfiltered local audit sequence is read once
+    # in stable creation order and rendered through the
+    # checkpoint/package public view, and the checkpoint and
+    # whole-package digest are recomputed under the existing
+    # GET /v1/audit-events/checkpoint/package rules. An unknown id is
+    # the existing explicit 404; an unreadable database (receipt read
+    # or event read) or a rebuild/digest failure is a 503
+    # service_unavailable (existing error response), never a partial
+    # result. No resource, receipt, task, or audit event is written.
+    try:
+        record = service.get_audit_exchange_import(session, import_id)
+        local_checkpoint, local_package_digest_hex = (
+            service.reconcile_audit_exchange_import(session)
+        )
+    except ObservabilityUnavailableError:
+        raise
+    except SQLAlchemyError as exc:
+        # Defense in depth at the route boundary: the service maps the
+        # event-read failures itself, but an unreadable database at the
+        # receipt lookup (or any other statement in this path) must
+        # still be the same 503 rather than a 500 or partial body.
+        session.rollback()
+        raise ObservabilityUnavailableError(
+            "database_unavailable"
+        ) from exc
+
+    # matches is solely whole-package digest equality against the
+    # receipt's verified package_digest_hex: the local checkpoint and
+    # count are reported regardless of the verdict, and nothing else
+    # (signature metadata, events, keys) is echoed.
+    result = AuditExchangeImportReconciliationResponse(
+        import_id=record.id,
+        package_digest_hex=record.package_digest_hex,
+        received_at=record.created_at,
+        local_checkpoint=AuditEventCheckpointResponse.model_validate(
+            local_checkpoint
+        ),
+        local_package_digest_hex=local_package_digest_hex,
+        matches=local_package_digest_hex == record.package_digest_hex,
+    )
+    # Compact UTF-8 JSON, null/boolean literals, integral numbers only,
+    # terminated by exactly one newline; members appear import_id,
+    # package_digest_hex, received_at, local_checkpoint,
+    # local_package_digest_hex, matches.
+    return _render_compact_json(result.model_dump(mode="json"))
 
 
 # --- Signed audit checkpoint recon exchange imports -------------------------------
